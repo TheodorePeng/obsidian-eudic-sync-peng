@@ -108,6 +108,82 @@ function getAssignmentDelta(previous: StudylistAssignmentSnapshot, current: Stud
   };
 }
 
+interface StudylistAssignmentDeletionAdjustment {
+  ids: string[];
+  names: string[];
+  preferredSource?: "names" | "ids";
+}
+
+function mapPairedNamesById(snapshot: StudylistAssignmentSnapshot): Map<string, string> {
+  const result = new Map<string, string>();
+  for (let index = 0; index < snapshot.ids.length; index += 1) {
+    const id = snapshot.ids[index];
+    const name = snapshot.names[index];
+    if (id && name && !result.has(id)) {
+      result.set(id, name);
+    }
+  }
+  return result;
+}
+
+function mapPairedIdsByName(snapshot: StudylistAssignmentSnapshot): Map<string, string> {
+  const result = new Map<string, string>();
+  for (let index = 0; index < snapshot.names.length; index += 1) {
+    const name = snapshot.names[index];
+    const id = snapshot.ids[index];
+    if (name && id && !result.has(name)) {
+      result.set(name, id);
+    }
+  }
+  return result;
+}
+
+function applyPairDeletionDelta(
+  current: StudylistAssignmentSnapshot,
+  previous: StudylistAssignmentSnapshot | undefined,
+): StudylistAssignmentDeletionAdjustment {
+  if (!previous) {
+    return { ids: current.ids, names: current.names };
+  }
+
+  const delta = getAssignmentDelta(previous, current);
+  if (delta.removedIds.length === 0 && delta.removedNames.length === 0) {
+    return { ids: current.ids, names: current.names };
+  }
+
+  let ids = current.ids;
+  let names = current.names;
+
+  if (delta.removedIds.length > 0) {
+    const namesById = mapPairedNamesById(previous);
+    const staleNames = new Set(delta.removedIds.map((id) => namesById.get(id)).filter((name): name is string => !!name));
+    if (staleNames.size > 0) {
+      names = names.filter((name) => !staleNames.has(name));
+    }
+  }
+
+  if (delta.removedNames.length > 0) {
+    const idsByName = mapPairedIdsByName(previous);
+    const staleIds = new Set(delta.removedNames.map((name) => idsByName.get(name)).filter((id): id is string => !!id));
+    if (staleIds.size > 0) {
+      ids = ids.filter((id) => !staleIds.has(id));
+    }
+  }
+
+  if (delta.removedIds.length > 0 && delta.removedNames.length === 0) {
+    return { ids, names, preferredSource: "ids" };
+  }
+  if (delta.removedNames.length > 0 && delta.removedIds.length === 0) {
+    return { ids, names, preferredSource: "names" };
+  }
+
+  return {
+    ids,
+    names,
+    preferredSource: delta.idsChanged && !delta.namesChanged ? "ids" : "names",
+  };
+}
+
 function getPreferredSourceFromDelta(delta: StudylistAssignmentDelta): "names" | "ids" | null {
   if (!delta.idsChanged && !delta.namesChanged) {
     return null;
@@ -335,22 +411,30 @@ export async function analyzeStudylistWordModify(
   const namesFromMarkdown = readYamlStringArray(markdown, FRONTMATTER_KEYS.studylistNames);
   const idsFromCurrentMarkdown = uniqueNormalized(idsFromMarkdown ?? state.ids);
   const namesFromCurrentMarkdown = uniqueNormalized(namesFromMarkdown ?? state.names);
+  const deletionAdjustedAssignment = applyPairDeletionDelta(
+    { ids: idsFromCurrentMarkdown, names: namesFromCurrentMarkdown },
+    previousRawSnapshot ?? previousSnapshot,
+  );
+  const idsForResolution = deletionAdjustedAssignment.ids;
+  const namesForResolution = deletionAdjustedAssignment.names;
   const statusFromCurrentMarkdown = readStudylistStatusFromMarkdown(markdown, state.status);
   const lastErrorFromMarkdown = readYamlStringValue(markdown, FRONTMATTER_KEYS.studylistLastError);
   const lastErrorFromCurrentMarkdown = lastErrorFromMarkdown === undefined ? null : lastErrorFromMarkdown || null;
-  const preferredSource = getPreferredSource(
-    idsFromCurrentMarkdown,
-    namesFromCurrentMarkdown,
-    previousSnapshot,
-    previousRawSnapshot,
-    expectedCanonicalAssignment,
-    activeIntent,
-  );
+  const preferredSource =
+    deletionAdjustedAssignment.preferredSource ??
+    getPreferredSource(
+      idsForResolution,
+      namesForResolution,
+      previousSnapshot,
+      previousRawSnapshot,
+      expectedCanonicalAssignment,
+      activeIntent,
+    );
   const resolved = await options.resolveAssignment(
     state.language,
     {
-      ids: idsFromCurrentMarkdown,
-      names: namesFromCurrentMarkdown,
+      ids: idsForResolution,
+      names: namesForResolution,
       preferredSource,
     },
     { refreshOnUnknown },
@@ -378,8 +462,8 @@ export async function analyzeStudylistWordModify(
     ids: normalizedIds,
     names,
     preferredSource,
-    sourceIds: idsFromCurrentMarkdown,
-    sourceNames: namesFromCurrentMarkdown,
+    sourceIds: idsForResolution,
+    sourceNames: namesForResolution,
     isResolved,
     shouldDirty,
     shouldWrite,

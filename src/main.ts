@@ -101,6 +101,8 @@ interface StudylistReconcileState {
   activeIntent?: StudylistAssignmentIntent;
 }
 
+type StudylistFileReconcileSource = "file" | "metadata";
+
 const AUTO_SYNC_AFTER_LEAVE_DELAY_MS = 2000;
 const EDITOR_CHANGE_DEBOUNCE_MS = 150;
 const STUDYLIST_EDITOR_CHANGE_DEBOUNCE_MS = 40;
@@ -809,7 +811,7 @@ export default class EudicSyncPlugin extends Plugin {
       }
 
       const dirtyDecision = this.getWordDirtySignatureDecision(normalizedPath, nextWordSyncSignature);
-      this.requestStudylistAssignmentReconcile(file);
+      this.requestStudylistAssignmentReconcile(file, "file");
 
       if (isOpenWord) {
         this.updateOpenWordBodyDirtyState(file, dirtyDecision);
@@ -848,7 +850,7 @@ export default class EudicSyncPlugin extends Plugin {
 
     if (this.pathScope.isWordPath(file.path)) {
       this.releaseWordStatusOverridesIfMetadataCaughtUp(file);
-      this.requestStudylistAssignmentReconcile(file);
+      this.requestStudylistAssignmentReconcile(file, "metadata");
       this.refreshUi();
       return;
     }
@@ -2085,14 +2087,8 @@ export default class EudicSyncPlugin extends Plugin {
     this.studylistReconcileStates.delete(normalizedPath);
   }
 
-  private requestStudylistAssignmentReconcile(file: TFile): void {
+  private requestStudylistAssignmentReconcile(file: TFile, source: StudylistFileReconcileSource = "file"): void {
     if (this.isUnloaded || !this.syncService.canSyncFile(file)) {
-      return;
-    }
-
-    const view = this.getOpenMarkdownViewForFile(file);
-    if (view) {
-      this.requestOpenStudylistAssignmentReconcile(file, view.editor);
       return;
     }
 
@@ -2109,7 +2105,7 @@ export default class EudicSyncPlugin extends Plugin {
 
     state.timer = window.setTimeout(() => {
       state.timer = undefined;
-      void this.perf.measure("studylist.reconcileMetadata", () => this.reconcileStudylistAssignmentFromFile(file));
+      void this.perf.measure(`studylist.reconcile.${source}`, () => this.reconcileStudylistAssignmentFromFile(file, source));
     }, STUDYLIST_RECONCILE_DEBOUNCE_MS);
   }
 
@@ -2137,14 +2133,9 @@ export default class EudicSyncPlugin extends Plugin {
     this.studylistEditorChangeTimers.set(normalizedPath, timer);
   }
 
-  private async reconcileStudylistAssignmentFromFile(file: TFile): Promise<void> {
+  private async reconcileStudylistAssignmentFromFile(file: TFile, _source: StudylistFileReconcileSource = "file"): Promise<void> {
     const normalizedPath = normalizePath(file.path);
     const state = this.getStudylistReconcileState(normalizedPath);
-    const view = this.getOpenMarkdownViewForFile(file);
-    if (view) {
-      this.requestOpenStudylistAssignmentReconcile(file, view.editor);
-      return;
-    }
     if (state.inFlight || !this.syncService.canSyncFile(file)) {
       state.rerunRequested = true;
       return;
@@ -2251,7 +2242,7 @@ export default class EudicSyncPlugin extends Plugin {
           if (view) {
             this.requestOpenStudylistAssignmentReconcile(file, view.editor);
           } else {
-            this.requestStudylistAssignmentReconcile(file);
+            this.requestStudylistAssignmentReconcile(file, "metadata");
           }
         } catch (error) {
           console.error(`${PLUGIN_NAME}: failed to refresh Eudic studylist catalog after an unknown local assignment`, error);
@@ -2592,6 +2583,8 @@ export default class EudicSyncPlugin extends Plugin {
         if (changed) {
           this.suppressPath(file.path);
           await view.save();
+        } else {
+          await this.writeFrontmatter(file, mutate);
         }
       } catch (error) {
         this.clearSuppression(file.path);

@@ -1640,6 +1640,76 @@ assert.deepEqual(studylistServiceFrontmatterByPath.get(studylistServiceFile.path
   "略｜我的生词本",
 ]);
 
+studylistServiceFrontmatterByPath.set(studylistServiceFile.path, {
+  word: "abdicate",
+  lang: "en",
+  eudic_studylist_ids: ["0", "134223429171042864"],
+  eudic_studylist_names: ["略｜我的生词本", "Obsidian Sync"],
+  studylist_sync_status: "dirty",
+});
+studylistService.captureAllLocalSnapshots();
+studylistServiceMarkdownByPath.set(
+  studylistServiceFile.path,
+  [
+    "---",
+    "word: abdicate",
+    "lang: en",
+    "eudic_studylist_ids:",
+    "  - 0",
+    "eudic_studylist_names:",
+    "  - 略｜我的生词本",
+    "  - Obsidian Sync",
+    "studylist_sync_status: dirty",
+    "---",
+    "",
+    "Body.",
+  ].join("\n"),
+);
+const propertyPanelIdDeleteReconcile = await studylistService.reconcileWordAssignment(
+  studylistServiceFile,
+  studylistServiceMarkdownByPath.get(studylistServiceFile.path) ?? "",
+);
+assert.equal(propertyPanelIdDeleteReconcile?.preferredSource, "ids");
+assert.deepEqual(studylistServiceFrontmatterByPath.get(studylistServiceFile.path)?.eudic_studylist_ids, ["0"]);
+assert.deepEqual(studylistServiceFrontmatterByPath.get(studylistServiceFile.path)?.eudic_studylist_names, [
+  "略｜我的生词本",
+]);
+
+studylistServiceFrontmatterByPath.set(studylistServiceFile.path, {
+  word: "abdicate",
+  lang: "en",
+  eudic_studylist_ids: ["0", "134223429171042864"],
+  eudic_studylist_names: ["略｜我的生词本", "Obsidian Sync"],
+  studylist_sync_status: "dirty",
+});
+studylistService.captureAllLocalSnapshots();
+studylistServiceMarkdownByPath.set(
+  studylistServiceFile.path,
+  [
+    "---",
+    "word: abdicate",
+    "lang: en",
+    "eudic_studylist_ids:",
+    "  - 0",
+    "  - 134223429171042864",
+    "eudic_studylist_names:",
+    "  - 略｜我的生词本",
+    "studylist_sync_status: dirty",
+    "---",
+    "",
+    "Body.",
+  ].join("\n"),
+);
+const propertyPanelNameDeleteReconcile = await studylistService.reconcileWordAssignment(
+  studylistServiceFile,
+  studylistServiceMarkdownByPath.get(studylistServiceFile.path) ?? "",
+);
+assert.equal(propertyPanelNameDeleteReconcile?.preferredSource, "names");
+assert.deepEqual(studylistServiceFrontmatterByPath.get(studylistServiceFile.path)?.eudic_studylist_ids, ["0"]);
+assert.deepEqual(studylistServiceFrontmatterByPath.get(studylistServiceFile.path)?.eudic_studylist_names, [
+  "略｜我的生词本",
+]);
+
 const registryFiles = [
   mockFile("Eudic/Words/abound.md"),
   mockFile("Eudic/References/ref-1.md"),

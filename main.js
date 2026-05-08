@@ -4562,6 +4562,64 @@ function getAssignmentDelta(previous, current) {
     removedNames: getDiff(previous.names, current.names)
   };
 }
+function mapPairedNamesById(snapshot) {
+  const result = /* @__PURE__ */ new Map();
+  for (let index = 0; index < snapshot.ids.length; index += 1) {
+    const id = snapshot.ids[index];
+    const name = snapshot.names[index];
+    if (id && name && !result.has(id)) {
+      result.set(id, name);
+    }
+  }
+  return result;
+}
+function mapPairedIdsByName(snapshot) {
+  const result = /* @__PURE__ */ new Map();
+  for (let index = 0; index < snapshot.names.length; index += 1) {
+    const name = snapshot.names[index];
+    const id = snapshot.ids[index];
+    if (name && id && !result.has(name)) {
+      result.set(name, id);
+    }
+  }
+  return result;
+}
+function applyPairDeletionDelta(current, previous) {
+  if (!previous) {
+    return { ids: current.ids, names: current.names };
+  }
+  const delta = getAssignmentDelta(previous, current);
+  if (delta.removedIds.length === 0 && delta.removedNames.length === 0) {
+    return { ids: current.ids, names: current.names };
+  }
+  let ids = current.ids;
+  let names = current.names;
+  if (delta.removedIds.length > 0) {
+    const namesById = mapPairedNamesById(previous);
+    const staleNames = new Set(delta.removedIds.map((id) => namesById.get(id)).filter((name) => !!name));
+    if (staleNames.size > 0) {
+      names = names.filter((name) => !staleNames.has(name));
+    }
+  }
+  if (delta.removedNames.length > 0) {
+    const idsByName = mapPairedIdsByName(previous);
+    const staleIds = new Set(delta.removedNames.map((name) => idsByName.get(name)).filter((id) => !!id));
+    if (staleIds.size > 0) {
+      ids = ids.filter((id) => !staleIds.has(id));
+    }
+  }
+  if (delta.removedIds.length > 0 && delta.removedNames.length === 0) {
+    return { ids, names, preferredSource: "ids" };
+  }
+  if (delta.removedNames.length > 0 && delta.removedIds.length === 0) {
+    return { ids, names, preferredSource: "names" };
+  }
+  return {
+    ids,
+    names,
+    preferredSource: delta.idsChanged && !delta.namesChanged ? "ids" : "names"
+  };
+}
 function getPreferredSourceFromDelta(delta) {
   if (!delta.idsChanged && !delta.namesChanged) {
     return null;
@@ -4739,12 +4797,18 @@ async function analyzeStudylistWordModify(options) {
   const namesFromMarkdown = readYamlStringArray(markdown, FRONTMATTER_KEYS.studylistNames);
   const idsFromCurrentMarkdown = uniqueNormalized2(idsFromMarkdown ?? state.ids);
   const namesFromCurrentMarkdown = uniqueNormalized2(namesFromMarkdown ?? state.names);
+  const deletionAdjustedAssignment = applyPairDeletionDelta(
+    { ids: idsFromCurrentMarkdown, names: namesFromCurrentMarkdown },
+    previousRawSnapshot ?? previousSnapshot
+  );
+  const idsForResolution = deletionAdjustedAssignment.ids;
+  const namesForResolution = deletionAdjustedAssignment.names;
   const statusFromCurrentMarkdown = readStudylistStatusFromMarkdown(markdown, state.status);
   const lastErrorFromMarkdown = readYamlStringValue(markdown, FRONTMATTER_KEYS.studylistLastError);
   const lastErrorFromCurrentMarkdown = lastErrorFromMarkdown === void 0 ? null : lastErrorFromMarkdown || null;
-  const preferredSource = getPreferredSource(
-    idsFromCurrentMarkdown,
-    namesFromCurrentMarkdown,
+  const preferredSource = deletionAdjustedAssignment.preferredSource ?? getPreferredSource(
+    idsForResolution,
+    namesForResolution,
     previousSnapshot,
     previousRawSnapshot,
     expectedCanonicalAssignment,
@@ -4753,8 +4817,8 @@ async function analyzeStudylistWordModify(options) {
   const resolved = await options.resolveAssignment(
     state.language,
     {
-      ids: idsFromCurrentMarkdown,
-      names: namesFromCurrentMarkdown,
+      ids: idsForResolution,
+      names: namesForResolution,
       preferredSource
     },
     { refreshOnUnknown }
@@ -4773,8 +4837,8 @@ async function analyzeStudylistWordModify(options) {
     ids: normalizedIds,
     names,
     preferredSource,
-    sourceIds: idsFromCurrentMarkdown,
-    sourceNames: namesFromCurrentMarkdown,
+    sourceIds: idsForResolution,
+    sourceNames: namesForResolution,
     isResolved,
     shouldDirty,
     shouldWrite,
@@ -8412,7 +8476,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
         return;
       }
       const dirtyDecision = this.getWordDirtySignatureDecision(normalizedPath, nextWordSyncSignature);
-      this.requestStudylistAssignmentReconcile(file);
+      this.requestStudylistAssignmentReconcile(file, "file");
       if (isOpenWord) {
         this.updateOpenWordBodyDirtyState(file, dirtyDecision);
         this.wordSyncSignatures.set(normalizedPath, nextWordSyncSignature);
@@ -8445,7 +8509,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     }
     if (this.pathScope.isWordPath(file.path)) {
       this.releaseWordStatusOverridesIfMetadataCaughtUp(file);
-      this.requestStudylistAssignmentReconcile(file);
+      this.requestStudylistAssignmentReconcile(file, "metadata");
       this.refreshUi();
       return;
     }
@@ -9480,13 +9544,8 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     }
     this.studylistReconcileStates.delete(normalizedPath);
   }
-  requestStudylistAssignmentReconcile(file) {
+  requestStudylistAssignmentReconcile(file, source = "file") {
     if (this.isUnloaded || !this.syncService.canSyncFile(file)) {
-      return;
-    }
-    const view = this.getOpenMarkdownViewForFile(file);
-    if (view) {
-      this.requestOpenStudylistAssignmentReconcile(file, view.editor);
       return;
     }
     const normalizedPath = (0, import_obsidian16.normalizePath)(file.path);
@@ -9500,7 +9559,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     }
     state.timer = window.setTimeout(() => {
       state.timer = void 0;
-      void this.perf.measure("studylist.reconcileMetadata", () => this.reconcileStudylistAssignmentFromFile(file));
+      void this.perf.measure(`studylist.reconcile.${source}`, () => this.reconcileStudylistAssignmentFromFile(file, source));
     }, STUDYLIST_RECONCILE_DEBOUNCE_MS);
   }
   requestOpenStudylistAssignmentReconcile(file, editor) {
@@ -9523,14 +9582,9 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     }, STUDYLIST_EDITOR_CHANGE_DEBOUNCE_MS);
     this.studylistEditorChangeTimers.set(normalizedPath, timer);
   }
-  async reconcileStudylistAssignmentFromFile(file) {
+  async reconcileStudylistAssignmentFromFile(file, _source = "file") {
     const normalizedPath = (0, import_obsidian16.normalizePath)(file.path);
     const state = this.getStudylistReconcileState(normalizedPath);
-    const view = this.getOpenMarkdownViewForFile(file);
-    if (view) {
-      this.requestOpenStudylistAssignmentReconcile(file, view.editor);
-      return;
-    }
     if (state.inFlight || !this.syncService.canSyncFile(file)) {
       state.rerunRequested = true;
       return;
@@ -9623,7 +9677,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
           if (view) {
             this.requestOpenStudylistAssignmentReconcile(file, view.editor);
           } else {
-            this.requestStudylistAssignmentReconcile(file);
+            this.requestStudylistAssignmentReconcile(file, "metadata");
           }
         } catch (error) {
           console.error(`${PLUGIN_NAME}: failed to refresh Eudic studylist catalog after an unknown local assignment`, error);
@@ -9914,6 +9968,8 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
         if (changed) {
           this.suppressPath(file.path);
           await view.save();
+        } else {
+          await this.writeFrontmatter(file, mutate);
         }
       } catch (error) {
         this.clearSuppression(file.path);
