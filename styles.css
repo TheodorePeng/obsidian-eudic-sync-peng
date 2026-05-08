@@ -1,0 +1,121 @@
+.eudic-sync-status-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  cursor: pointer;
+}
+
+.eudic-sync-status-bar.is-hidden {
+  display: none;
+}
+
+.eudic-sync-status-bar[data-status="dirty"],
+.eudic-sync-header-action[data-status="dirty"] {
+  color: var(--text-accent);
+}
+
+.eudic-sync-status-bar[data-status="synced"],
+.eudic-sync-header-action[data-status="synced"] {
+  color: var(--text-success);
+}
+
+.eudic-sync-status-bar-icon {
+  display: inline-flex;
+  align-items: center;
+}
+
+.eudic-sync-settings-intro {
+  color: var(--text-muted);
+  margin: 0.25rem 0 1rem;
+}
+
+.eudic-sync-settings-section {
+  border-top: 1px solid var(--background-modifier-border);
+  margin-top: 1.25rem;
+  padding-top: 1rem;
+}
+
+.eudic-sync-settings-section h3 {
+  margin: 0 0 0.25rem;
+}
+
+.eudic-sync-settings-section-description {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  margin-bottom: 0.35rem;
+}
+
+.eudic-sync-block-preview {
+  margin-block: 0.15rem;
+}
+
+.eudic-sync-block-preview > :first-child {
+  margin-top: 0;
+}
+
+.eudic-sync-block-preview > :last-child {
+  margin-bottom: 0;
+}
+
+.eudic-sync-block-preview > p {
+  margin-block: 0.2rem;
+}
+
+.eudic-sync-block-preview ul,
+.eudic-sync-block-preview ol {
+  margin-block: 0.08rem 0;
+  padding-inline-start: 1.05em;
+}
+
+.eudic-sync-block-preview ol {
+  padding-inline-start: 1.15em;
+}
+
+.eudic-sync-block-preview li {
+  margin-block: 0.03rem;
+  padding-inline-start: 0;
+}
+
+.eudic-sync-block-preview li > p {
+  margin-block: 0.04rem;
+}
+
+.eudic-sync-block-preview li > ul,
+.eudic-sync-block-preview li > ol {
+  margin-block: 0.04rem 0;
+  padding-inline-start: 0.95em;
+}
+
+.eudic-sync-block-preview li > ol {
+  padding-inline-start: 1.05em;
+}
+
+.eudic-sync-block-preview ul.contains-task-list,
+.eudic-sync-block-preview ul.task-list {
+  padding-inline-start: 0.9em;
+}
+
+.eudic-sync-block-preview li.task-list-item {
+  margin-inline-start: 0;
+  padding-inline-start: 0;
+}
+
+.eudic-sync-block-preview input.task-list-item-checkbox {
+  margin-inline: 0 0.25em;
+}
+
+.eudic-sync-block-embed {
+  margin-block: 0.2rem;
+}
+
+.eudic-sync-block-embed .markdown-embed-content,
+.eudic-sync-block-embed .markdown-preview-view,
+.eudic-sync-block-embed .markdown-rendered {
+  padding-top: 0;
+}
+
+.eudic-sync-block-embed .markdown-embed-content > :first-child,
+.eudic-sync-block-embed .markdown-preview-view > :first-child,
+.eudic-sync-block-embed .markdown-rendered > :first-child {
+  margin-top: 0;
+}
