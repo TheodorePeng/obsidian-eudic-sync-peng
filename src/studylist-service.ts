@@ -18,7 +18,6 @@ import {
 } from "./studylist-sync-status";
 import {
   analyzeStudylistWordModify,
-  type StudylistAssignmentIntent,
   type StudylistAssignmentSnapshot,
   type StudylistWordModifyAnalysis,
 } from "./studylist-word-modify-analysis";
@@ -59,8 +58,6 @@ export interface StudylistRepairSummary {
 }
 
 export type { StudylistWordModifyAnalysis } from "./studylist-word-modify-analysis";
-
-export type { StudylistAssignmentIntent } from "./studylist-word-modify-analysis";
 
 interface WordStudylistState {
   file: TFile;
@@ -244,18 +241,13 @@ export class StudylistService {
   async reconcileWordAssignment(
     file: TFile,
     markdown: string,
-    options: {
-      activeIntent?: StudylistAssignmentIntent;
-      previousRawSnapshot?: StudylistAssignmentSnapshot;
-      expectedCanonicalAssignment?: StudylistAssignmentSnapshot;
-    } = {},
   ): Promise<StudylistWordModifyAnalysis | null> {
     if (!this.options.pathScope.isWordPath(file.path)) {
       return null;
     }
 
     await this.ensureWordStudylistFrontmatter(file);
-    const analysis = await this.analyzeWordModify(file, markdown, options);
+    const analysis = await this.analyzeWordModify(file, markdown);
     if (!analysis || analysis.disabled) {
       return analysis;
     }
@@ -268,9 +260,6 @@ export class StudylistService {
     file: TFile,
     markdown: string,
     options: {
-      activeIntent?: StudylistAssignmentIntent;
-      previousRawSnapshot?: StudylistAssignmentSnapshot;
-      expectedCanonicalAssignment?: StudylistAssignmentSnapshot;
       refreshOnUnknown?: boolean;
     } = {},
   ): Promise<StudylistWordModifyAnalysis | null> {
@@ -287,8 +276,6 @@ export class StudylistService {
         ids: [],
         names: [],
         preferredSource: "names",
-        sourceIds: [],
-        sourceNames: [],
         isResolved: true,
         shouldDirty: false,
         shouldWrite: false,
@@ -301,9 +288,6 @@ export class StudylistService {
     return analyzeStudylistWordModify({
       state: frontmatterState,
       previousSnapshot,
-      previousRawSnapshot: options.previousRawSnapshot,
-      expectedCanonicalAssignment: options.expectedCanonicalAssignment,
-      activeIntent: options.activeIntent,
       markdown,
       refreshOnUnknown: options.refreshOnUnknown,
       resolveAssignment: (language, assignment, resolveOptions) =>

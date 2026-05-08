@@ -4644,20 +4644,8 @@ function getPreferredSourceFromDelta(delta) {
   }
   return null;
 }
-function getPreferredSource(ids, names, previousSnapshot, previousRawSnapshot, expectedCanonicalAssignment, activeIntent) {
+function getPreferredSource(ids, names, previousSnapshot) {
   const currentSnapshot = { ids, names };
-  if (previousRawSnapshot) {
-    const preferredSourceFromRawDelta = getPreferredSourceFromDelta(getAssignmentDelta(previousRawSnapshot, currentSnapshot));
-    if (preferredSourceFromRawDelta) {
-      return preferredSourceFromRawDelta;
-    }
-  }
-  if (expectedCanonicalAssignment && activeIntent && arraysEqual(expectedCanonicalAssignment.ids, ids) && arraysEqual(expectedCanonicalAssignment.names, names)) {
-    return activeIntent.preferredSource;
-  }
-  if (activeIntent && arraysEqual(activeIntent.sourceIds, ids) && arraysEqual(activeIntent.sourceNames, names)) {
-    return activeIntent.preferredSource;
-  }
   if (!previousSnapshot) {
     return names.length > 0 ? "names" : "ids";
   }
@@ -4727,12 +4715,6 @@ function readYamlStringArray(markdown, key) {
   }
   return null;
 }
-function readStudylistAssignmentFromMarkdown(markdown) {
-  return {
-    ids: uniqueNormalized2(readYamlStringArray(markdown, FRONTMATTER_KEYS.studylistIds) ?? []),
-    names: uniqueNormalized2(readYamlStringArray(markdown, FRONTMATTER_KEYS.studylistNames) ?? [])
-  };
-}
 function readYamlStringValue(markdown, key) {
   const yaml = readYamlFrontmatter(markdown);
   if (!yaml) {
@@ -4771,9 +4753,6 @@ async function analyzeStudylistWordModify(options) {
   const {
     state,
     previousSnapshot,
-    previousRawSnapshot,
-    expectedCanonicalAssignment,
-    activeIntent,
     markdown,
     refreshOnUnknown = true
   } = options;
@@ -4784,8 +4763,6 @@ async function analyzeStudylistWordModify(options) {
       ids: [],
       names: [],
       preferredSource: "names",
-      sourceIds: [],
-      sourceNames: [],
       isResolved: true,
       shouldDirty: false,
       shouldWrite: false,
@@ -4799,7 +4776,7 @@ async function analyzeStudylistWordModify(options) {
   const namesFromCurrentMarkdown = uniqueNormalized2(namesFromMarkdown ?? state.names);
   const deletionAdjustedAssignment = applyPairDeletionDelta(
     { ids: idsFromCurrentMarkdown, names: namesFromCurrentMarkdown },
-    previousRawSnapshot ?? previousSnapshot
+    previousSnapshot
   );
   const idsForResolution = deletionAdjustedAssignment.ids;
   const namesForResolution = deletionAdjustedAssignment.names;
@@ -4809,10 +4786,7 @@ async function analyzeStudylistWordModify(options) {
   const preferredSource = deletionAdjustedAssignment.preferredSource ?? getPreferredSource(
     idsForResolution,
     namesForResolution,
-    previousSnapshot,
-    previousRawSnapshot,
-    expectedCanonicalAssignment,
-    activeIntent
+    previousSnapshot
   );
   const resolved = await options.resolveAssignment(
     state.language,
@@ -4837,8 +4811,6 @@ async function analyzeStudylistWordModify(options) {
     ids: normalizedIds,
     names,
     preferredSource,
-    sourceIds: idsForResolution,
-    sourceNames: namesForResolution,
     isResolved,
     shouldDirty,
     shouldWrite,
@@ -4981,12 +4953,12 @@ var StudylistService = class {
   async handleWordModify(file, markdown) {
     await this.reconcileWordAssignment(file, markdown);
   }
-  async reconcileWordAssignment(file, markdown, options = {}) {
+  async reconcileWordAssignment(file, markdown) {
     if (!this.options.pathScope.isWordPath(file.path)) {
       return null;
     }
     await this.ensureWordStudylistFrontmatter(file);
-    const analysis = await this.analyzeWordModify(file, markdown, options);
+    const analysis = await this.analyzeWordModify(file, markdown);
     if (!analysis || analysis.disabled) {
       return analysis;
     }
@@ -5006,8 +4978,6 @@ var StudylistService = class {
         ids: [],
         names: [],
         preferredSource: "names",
-        sourceIds: [],
-        sourceNames: [],
         isResolved: true,
         shouldDirty: false,
         shouldWrite: false,
@@ -5019,9 +4989,6 @@ var StudylistService = class {
     return analyzeStudylistWordModify({
       state: frontmatterState,
       previousSnapshot,
-      previousRawSnapshot: options.previousRawSnapshot,
-      expectedCanonicalAssignment: options.expectedCanonicalAssignment,
-      activeIntent: options.activeIntent,
       markdown,
       refreshOnUnknown: options.refreshOnUnknown,
       resolveAssignment: (language, assignment, resolveOptions) => this.catalog.resolveAssignment(language, assignment, resolveOptions)
@@ -5448,7 +5415,7 @@ var StudylistService = class {
   }
 };
 
-// src/studylist-frontmatter-patch.ts
+// src/sync-status-frontmatter-patch.ts
 function getLineBreak(markdown) {
   return markdown.includes("\r\n") ? "\r\n" : "\n";
 }
@@ -5469,144 +5436,13 @@ function findYamlFrontmatterEndLine(lines) {
   }
   return null;
 }
-function escapeYamlString(value) {
-  return JSON.stringify(value);
-}
-function buildArrayField(key, values) {
-  if (values.length === 0) {
-    return [`${key}: []`];
-  }
-  return [`${key}:`, ...values.map((value) => `  - ${escapeYamlString(value)}`)];
-}
-function buildStudylistLines(data) {
-  const lines = [
-    ...buildArrayField(FRONTMATTER_KEYS.studylistIds, data.ids),
-    ...buildArrayField(FRONTMATTER_KEYS.studylistNames, data.names),
-    `${FRONTMATTER_KEYS.studylistSyncStatus}: ${data.status}`
-  ];
-  if (data.syncedAt) {
-    lines.push(`${FRONTMATTER_KEYS.studylistSyncedAt}: ${escapeYamlString(data.syncedAt)}`);
-  }
-  if (data.lastError) {
-    lines.push(`${FRONTMATTER_KEYS.studylistLastError}: ${escapeYamlString(data.lastError)}`);
-  }
-  return lines;
-}
-function isStudylistKeyLine(line) {
-  const key = line.match(/^(\s*)([^:#]+)\s*:/)?.[2]?.trim();
-  return key === FRONTMATTER_KEYS.studylistIds || key === FRONTMATTER_KEYS.studylistNames || key === FRONTMATTER_KEYS.studylistSyncStatus || key === FRONTMATTER_KEYS.studylistSyncedAt || key === FRONTMATTER_KEYS.studylistLastError;
-}
-function findStudylistFieldRanges(lines, frontmatterEndLine) {
-  const ranges = [];
-  for (let index = 1; index < frontmatterEndLine; index += 1) {
-    const line = stripTrailingCarriageReturn(lines[index] ?? "");
-    if (!isStudylistKeyLine(line)) {
-      continue;
-    }
-    let end = index + 1;
-    while (end < frontmatterEndLine) {
-      const nextLine = stripTrailingCarriageReturn(lines[end] ?? "");
-      if (/^\S/.test(nextLine) && nextLine.includes(":")) {
-        break;
-      }
-      end += 1;
-    }
-    ranges.push({ start: index, end });
-    index = end - 1;
-  }
-  return ranges;
-}
-function arraysEqual3(left, right) {
-  if (left.length !== right.length) {
-    return false;
-  }
-  for (let index = 0; index < left.length; index += 1) {
-    if (left[index] !== right[index]) {
-      return false;
-    }
-  }
-  return true;
-}
-function buildPatchedFrontmatterLines(lines, frontmatterEndLine, replacementLines) {
-  const ranges = findStudylistFieldRanges(lines, frontmatterEndLine);
-  const nextLines = [];
-  if (ranges.length === 0) {
-    return [
-      ...lines.slice(1, frontmatterEndLine).map(stripTrailingCarriageReturn),
-      ...replacementLines
-    ];
-  }
-  let cursor = 1;
-  for (let rangeIndex = 0; rangeIndex < ranges.length; rangeIndex += 1) {
-    const range = ranges[rangeIndex];
-    nextLines.push(...lines.slice(cursor, range.start).map(stripTrailingCarriageReturn));
-    if (rangeIndex === 0) {
-      nextLines.push(...replacementLines);
-    }
-    cursor = range.end;
-  }
-  nextLines.push(...lines.slice(cursor, frontmatterEndLine).map(stripTrailingCarriageReturn));
-  return nextLines;
-}
-function buildStudylistFrontmatterPatch(markdown, data) {
-  const lines = markdown.split("\n");
-  const frontmatterEndLine = findYamlFrontmatterEndLine(lines);
-  const lineBreak = getLineBreak(markdown);
-  const replacementLines = buildStudylistLines(data);
-  if (frontmatterEndLine === null) {
-    return {
-      changed: true,
-      from: { line: 0, ch: 0 },
-      replacement: ["---", ...replacementLines, "---", ""].join(lineBreak) + lineBreak
-    };
-  }
-  const currentFrontmatterLines = lines.slice(1, frontmatterEndLine).map(stripTrailingCarriageReturn);
-  const nextFrontmatterLines = buildPatchedFrontmatterLines(lines, frontmatterEndLine, replacementLines);
-  const replacement = nextFrontmatterLines.length > 0 ? nextFrontmatterLines.join(lineBreak) + lineBreak : "";
-  return {
-    changed: !arraysEqual3(currentFrontmatterLines, nextFrontmatterLines),
-    from: { line: 1, ch: 0 },
-    to: { line: frontmatterEndLine, ch: 0 },
-    replacement
-  };
-}
-function applyStudylistFrontmatterPatchToEditor(editor, data) {
-  const patch = buildStudylistFrontmatterPatch(editor.getValue(), data);
-  if (!patch.changed) {
-    return false;
-  }
-  editor.replaceRange(patch.replacement, patch.from, patch.to, "eudic-sync");
-  return true;
-}
-
-// src/sync-status-frontmatter-patch.ts
-function getLineBreak2(markdown) {
-  return markdown.includes("\r\n") ? "\r\n" : "\n";
-}
-function stripTrailingCarriageReturn2(line) {
-  return line.endsWith("\r") ? line.slice(0, -1) : line;
-}
-function isFrontmatterFence2(line) {
-  return stripTrailingCarriageReturn2(line).trim() === "---";
-}
-function findYamlFrontmatterEndLine2(lines) {
-  if (!isFrontmatterFence2(lines[0] ?? "")) {
-    return null;
-  }
-  for (let index = 1; index < lines.length; index += 1) {
-    if (isFrontmatterFence2(lines[index] ?? "")) {
-      return index;
-    }
-  }
-  return null;
-}
 function buildSyncStatusLine(status, indent = "") {
   return `${indent}${FRONTMATTER_KEYS.syncStatus}: ${status}`;
 }
 function buildSyncStatusPatch(markdown, status) {
   const lines = markdown.split("\n");
-  const frontmatterEndLine = findYamlFrontmatterEndLine2(lines);
-  const lineBreak = getLineBreak2(markdown);
+  const frontmatterEndLine = findYamlFrontmatterEndLine(lines);
+  const lineBreak = getLineBreak(markdown);
   if (frontmatterEndLine === null) {
     return {
       changed: true,
@@ -5616,7 +5452,7 @@ function buildSyncStatusPatch(markdown, status) {
   }
   const syncStatusPattern = new RegExp(`^(\\s*)${FRONTMATTER_KEYS.syncStatus}\\s*:\\s*(.*?)\\s*$`);
   for (let lineIndex = 1; lineIndex < frontmatterEndLine; lineIndex += 1) {
-    const line = stripTrailingCarriageReturn2(lines[lineIndex] ?? "");
+    const line = stripTrailingCarriageReturn(lines[lineIndex] ?? "");
     const match = line.match(syncStatusPattern);
     if (!match) {
       continue;
@@ -5646,27 +5482,27 @@ function applySyncStatusPatchToEditor(editor, status) {
 }
 
 // src/word-sync-frontmatter-patch.ts
-function getLineBreak3(markdown) {
+function getLineBreak2(markdown) {
   return markdown.includes("\r\n") ? "\r\n" : "\n";
 }
-function stripTrailingCarriageReturn3(line) {
+function stripTrailingCarriageReturn2(line) {
   return line.endsWith("\r") ? line.slice(0, -1) : line;
 }
-function isFrontmatterFence3(line) {
-  return stripTrailingCarriageReturn3(line).trim() === "---";
+function isFrontmatterFence2(line) {
+  return stripTrailingCarriageReturn2(line).trim() === "---";
 }
-function findYamlFrontmatterEndLine3(lines) {
-  if (!isFrontmatterFence3(lines[0] ?? "")) {
+function findYamlFrontmatterEndLine2(lines) {
+  if (!isFrontmatterFence2(lines[0] ?? "")) {
     return null;
   }
   for (let index = 1; index < lines.length; index += 1) {
-    if (isFrontmatterFence3(lines[index] ?? "")) {
+    if (isFrontmatterFence2(lines[index] ?? "")) {
       return index;
     }
   }
   return null;
 }
-function arraysEqual4(left, right) {
+function arraysEqual3(left, right) {
   if (left.length !== right.length) {
     return false;
   }
@@ -5678,7 +5514,7 @@ function arraysEqual4(left, right) {
   return true;
 }
 function getTopLevelKey(line) {
-  const normalized = stripTrailingCarriageReturn3(line);
+  const normalized = stripTrailingCarriageReturn2(line);
   if (/^\s/.test(normalized)) {
     return null;
   }
@@ -5706,13 +5542,13 @@ function buildReplacementLines(data) {
 function buildFieldLine(field) {
   return `${field.key}: ${formatYamlScalar(field.value, field.bare)}`;
 }
-function buildPatchedFrontmatterLines2(lines, frontmatterEndLine, data) {
+function buildPatchedFrontmatterLines(lines, frontmatterEndLine, data) {
   const providedFields = buildFields(data).filter((field) => field.value !== void 0);
   const fieldByKey = new Map(providedFields.map((field) => [field.key, field]));
   const writtenKeys = /* @__PURE__ */ new Set();
   const nextLines = [];
   for (let index = 1; index < frontmatterEndLine; index += 1) {
-    const line = stripTrailingCarriageReturn3(lines[index] ?? "");
+    const line = stripTrailingCarriageReturn2(lines[index] ?? "");
     const key = getTopLevelKey(line);
     const field = key ? fieldByKey.get(key) : void 0;
     if (!field) {
@@ -5766,8 +5602,8 @@ function applyWordSyncFrontmatterToObject(frontmatter, data) {
 }
 function buildWordSyncFrontmatterPatch(markdown, data) {
   const lines = markdown.split("\n");
-  const frontmatterEndLine = findYamlFrontmatterEndLine3(lines);
-  const lineBreak = getLineBreak3(markdown);
+  const frontmatterEndLine = findYamlFrontmatterEndLine2(lines);
+  const lineBreak = getLineBreak2(markdown);
   const replacementLines = buildReplacementLines(data);
   const hasWritableFields = buildFields(data).some((field) => field.value !== void 0 && field.value !== null);
   if (frontmatterEndLine === null) {
@@ -5784,11 +5620,11 @@ function buildWordSyncFrontmatterPatch(markdown, data) {
       replacement: ["---", ...replacementLines, "---", ""].join(lineBreak) + lineBreak
     };
   }
-  const currentFrontmatterLines = lines.slice(1, frontmatterEndLine).map(stripTrailingCarriageReturn3);
-  const nextFrontmatterLines = buildPatchedFrontmatterLines2(lines, frontmatterEndLine, data);
+  const currentFrontmatterLines = lines.slice(1, frontmatterEndLine).map(stripTrailingCarriageReturn2);
+  const nextFrontmatterLines = buildPatchedFrontmatterLines(lines, frontmatterEndLine, data);
   const replacement = nextFrontmatterLines.length > 0 ? nextFrontmatterLines.join(lineBreak) + lineBreak : "";
   return {
-    changed: !arraysEqual4(currentFrontmatterLines, nextFrontmatterLines),
+    changed: !arraysEqual3(currentFrontmatterLines, nextFrontmatterLines),
     from: { line: 1, ch: 0 },
     to: { line: frontmatterEndLine, ch: 0 },
     replacement
@@ -7858,10 +7694,6 @@ ${stripYamlFrontmatter(markdown)}`;
 // src/main.ts
 var AUTO_SYNC_AFTER_LEAVE_DELAY_MS = 2e3;
 var EDITOR_CHANGE_DEBOUNCE_MS = 150;
-var STUDYLIST_EDITOR_CHANGE_DEBOUNCE_MS = 40;
-var STUDYLIST_RECONCILE_DEBOUNCE_MS = 60;
-var STUDYLIST_ACTIVE_INTENT_TTL_MS = 1200;
-var STUDYLIST_CATALOG_REFRESH_RETRY_DEBOUNCE_MS = 500;
 function isMarkdownFile3(file) {
   return file instanceof import_obsidian16.TFile && file.extension === "md";
 }
@@ -7873,17 +7705,6 @@ function toErrorMessage7(error) {
 }
 function hasYamlFrontmatter2(markdown) {
   return /^---\s*\n[\s\S]*?\n---(?:\s*\n|$)/.test(markdown);
-}
-function arraysEqual5(left, right) {
-  if (left.length !== right.length) {
-    return false;
-  }
-  for (let index = 0; index < left.length; index += 1) {
-    if (left[index] !== right[index]) {
-      return false;
-    }
-  }
-  return true;
 }
 function prependReferenceFrontmatter(markdown, linkId) {
   const body = markdown.replace(/^\uFEFF/, "");
@@ -7955,9 +7776,6 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     this.pendingOpenWordStatusWrites = /* @__PURE__ */ new Map();
     this.flushingOpenWordStatusWritePaths = /* @__PURE__ */ new Set();
     this.editorChangeTimers = /* @__PURE__ */ new Map();
-    this.studylistEditorChangeTimers = /* @__PURE__ */ new Map();
-    this.studylistCatalogRefreshTimers = /* @__PURE__ */ new Map();
-    this.studylistReconcileStates = /* @__PURE__ */ new Map();
     this.autoBodyDirtyPaths = /* @__PURE__ */ new Set();
     this.restorableEditorBodyDirtyPaths = /* @__PURE__ */ new Set();
     this.nonRestorableBodyDirtyPaths = /* @__PURE__ */ new Set();
@@ -8031,7 +7849,6 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
       isUnloaded: () => this.isUnloaded,
       onLayoutReady: () => {
         this.lastActiveWordPath = this.getActiveWordPath();
-        this.primeOpenStudylistRawSnapshots();
         this.scheduleStartupKnownPathClear();
       },
       onEditorChange: (file, markdown, editor) => this.handleEditorChange(file, markdown, editor),
@@ -8096,7 +7913,6 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     await this.perf.measure("startup.captureWordSyncSignatures", () => this.captureWordSyncSignatures());
     await this.perf.measure("startup.rebuildReferenceIndex", () => this.rebuildReferenceIndex());
     this.lastActiveWordPath = this.getActiveWordPath();
-    this.primeOpenStudylistRawSnapshots();
     this.refreshUi();
     this.registerVaultEventsOnLayoutReady();
     for (const message of this.startupNotices) {
@@ -8108,7 +7924,6 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     this.clearStartupKnownPathTimer();
     this.clearAutoSyncTimers();
     this.clearEditorChangeTimers();
-    this.clearStudylistReconcileTimers();
     this.vaultEventController.clear();
     this.uiController.clearHeaderActions();
     this.saveHookController.restore();
@@ -8363,9 +8178,6 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     this.setWordBodyStatusOverride(file, "synced", null);
   }
   handleEditorChange(file, _markdown, editor) {
-    if (this.pathScope.isWordPath(file.path)) {
-      this.requestOpenStudylistAssignmentReconcile(file, editor);
-    }
     const normalizedPath = (0, import_obsidian16.normalizePath)(file.path);
     const existingTimer = this.editorChangeTimers.get(normalizedPath);
     if (existingTimer !== void 0) {
@@ -8466,6 +8278,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
       const normalizedPath = (0, import_obsidian16.normalizePath)(file.path);
       const isOpenWord = this.isMarkdownFileOpen(file);
       const nextWordSyncSignature = getWordSyncSignature(markdown);
+      await this.studylistService.handleWordModify(file, markdown);
       const result = await this.referenceIndex.updateWord(file, markdown);
       this.scheduleReferenceUsageRefresh(result.affectedReferencePaths);
       if (result.disabled) {
@@ -8476,7 +8289,6 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
         return;
       }
       const dirtyDecision = this.getWordDirtySignatureDecision(normalizedPath, nextWordSyncSignature);
-      this.requestStudylistAssignmentReconcile(file, "file");
       if (isOpenWord) {
         this.updateOpenWordBodyDirtyState(file, dirtyDecision);
         this.wordSyncSignatures.set(normalizedPath, nextWordSyncSignature);
@@ -8509,7 +8321,6 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     }
     if (this.pathScope.isWordPath(file.path)) {
       this.releaseWordStatusOverridesIfMetadataCaughtUp(file);
-      this.requestStudylistAssignmentReconcile(file, "metadata");
       this.refreshUi();
       return;
     }
@@ -8567,7 +8378,6 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     this.wordSyncSignatures.delete(normalizedPath);
     this.wordCleanSyncSignatures.delete(normalizedPath);
     this.clearPendingOpenWordStatusWrite(normalizedPath);
-    this.clearStudylistReconcileState(normalizedPath);
     if (this.pathScope.isReferencePath(normalizedPath)) {
       const lookup = await this.referenceIndex.findWordsReferencingWithFallback(normalizedPath);
       await this.markWordsDirtyByPaths(lookup.wordPaths);
@@ -9270,29 +9080,6 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     }
     return (0, import_obsidian16.normalizePath)(file.path);
   }
-  primeOpenStudylistRawSnapshots() {
-    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
-      const view = leaf.view;
-      if (!(view instanceof import_obsidian16.MarkdownView) || !view.file || !this.pathScope.isWordPath(view.file.path)) {
-        continue;
-      }
-      this.captureStudylistRawSnapshot(view.file, view.editor);
-    }
-  }
-  captureStudylistRawSnapshot(file, editor, options = {}) {
-    if (!this.pathScope.isWordPath(file.path) || !this.syncService.canSyncFile(file)) {
-      return;
-    }
-    const state = this.getStudylistReconcileState(file.path);
-    if (!options.overwrite && state.previousRawAssignment) {
-      return;
-    }
-    state.previousRawAssignment = readStudylistAssignmentFromMarkdown(editor.getValue());
-  }
-  updateStudylistRawSnapshotFromAnalysis(file, editor, analysis) {
-    const state = this.getStudylistReconcileState(file.path);
-    state.previousRawAssignment = analysis.shouldWrite ? { ids: analysis.ids, names: analysis.names } : readStudylistAssignmentFromMarkdown(editor.getValue());
-  }
   handleActiveWordChanged() {
     const nextActiveWordPath = this.getActiveWordPath();
     if (nextActiveWordPath) {
@@ -9305,7 +9092,6 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
       });
     }
     this.lastActiveWordPath = nextActiveWordPath;
-    this.primeOpenStudylistRawSnapshots();
     void this.flushPendingOpenWordStatusWrites();
   }
   getOpenMarkdownFilePaths() {
@@ -9464,13 +9250,6 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     this.nonRestorableBodyDirtyPaths.delete(normalizedPath);
     this.wordStatusOverrides.clear(normalizedPath);
   }
-  applyClosedWordStudylistAnalysis(file, analysis) {
-    if (analysis.nextStatus === "dirty") {
-      this.setWordStudylistStatusOverride(file, "dirty", analysis.nextLastError);
-      return;
-    }
-    this.wordStatusOverrides.clearStudylist(file.path);
-  }
   async markWordDirtyWithAutomaticDeferral(file) {
     if (this.pathScope.isWordPath(file.path) && this.isMarkdownFileOpen(file)) {
       return this.markOpenWordBodyDirty(file, null);
@@ -9514,213 +9293,6 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
       window.clearTimeout(timer);
     }
     this.editorChangeTimers.clear();
-    for (const timer of this.studylistEditorChangeTimers.values()) {
-      window.clearTimeout(timer);
-    }
-    this.studylistEditorChangeTimers.clear();
-  }
-  clearStudylistReconcileTimers() {
-    for (const state of this.studylistReconcileStates.values()) {
-      if (state.timer !== void 0) {
-        window.clearTimeout(state.timer);
-      }
-    }
-    this.studylistReconcileStates.clear();
-    for (const timer of this.studylistCatalogRefreshTimers.values()) {
-      window.clearTimeout(timer);
-    }
-    this.studylistCatalogRefreshTimers.clear();
-  }
-  clearStudylistReconcileState(path) {
-    const normalizedPath = (0, import_obsidian16.normalizePath)(path);
-    const state = this.studylistReconcileStates.get(normalizedPath);
-    if (state?.timer !== void 0) {
-      window.clearTimeout(state.timer);
-    }
-    const editorTimer = this.studylistEditorChangeTimers.get(normalizedPath);
-    if (editorTimer !== void 0) {
-      window.clearTimeout(editorTimer);
-      this.studylistEditorChangeTimers.delete(normalizedPath);
-    }
-    this.studylistReconcileStates.delete(normalizedPath);
-  }
-  requestStudylistAssignmentReconcile(file, source = "file") {
-    if (this.isUnloaded || !this.syncService.canSyncFile(file)) {
-      return;
-    }
-    const normalizedPath = (0, import_obsidian16.normalizePath)(file.path);
-    const state = this.getStudylistReconcileState(normalizedPath);
-    if (state.inFlight) {
-      state.rerunRequested = true;
-      return;
-    }
-    if (state.timer !== void 0) {
-      window.clearTimeout(state.timer);
-    }
-    state.timer = window.setTimeout(() => {
-      state.timer = void 0;
-      void this.perf.measure(`studylist.reconcile.${source}`, () => this.reconcileStudylistAssignmentFromFile(file, source));
-    }, STUDYLIST_RECONCILE_DEBOUNCE_MS);
-  }
-  requestOpenStudylistAssignmentReconcile(file, editor) {
-    if (this.isUnloaded || !this.syncService.canSyncFile(file)) {
-      return;
-    }
-    const normalizedPath = (0, import_obsidian16.normalizePath)(file.path);
-    const state = this.getStudylistReconcileState(normalizedPath);
-    if (state.inFlight) {
-      state.rerunRequested = true;
-      return;
-    }
-    const existingTimer = this.studylistEditorChangeTimers.get(normalizedPath);
-    if (existingTimer !== void 0) {
-      window.clearTimeout(existingTimer);
-    }
-    const timer = window.setTimeout(() => {
-      this.studylistEditorChangeTimers.delete(normalizedPath);
-      void this.perf.measure("studylist.reconcileEditor", () => this.reconcileStudylistAssignmentFromEditor(file, editor));
-    }, STUDYLIST_EDITOR_CHANGE_DEBOUNCE_MS);
-    this.studylistEditorChangeTimers.set(normalizedPath, timer);
-  }
-  async reconcileStudylistAssignmentFromFile(file, _source = "file") {
-    const normalizedPath = (0, import_obsidian16.normalizePath)(file.path);
-    const state = this.getStudylistReconcileState(normalizedPath);
-    if (state.inFlight || !this.syncService.canSyncFile(file)) {
-      state.rerunRequested = true;
-      return;
-    }
-    state.inFlight = true;
-    try {
-      do {
-        state.rerunRequested = false;
-        await this.runStudylistAssignmentReconcile(file, state);
-      } while (state.rerunRequested && !this.isUnloaded);
-    } finally {
-      state.inFlight = false;
-      this.refreshUi();
-    }
-  }
-  async reconcileStudylistAssignmentFromEditor(file, editor) {
-    const normalizedPath = (0, import_obsidian16.normalizePath)(file.path);
-    const state = this.getStudylistReconcileState(normalizedPath);
-    if (state.inFlight || !this.syncService.canSyncFile(file)) {
-      state.rerunRequested = true;
-      return;
-    }
-    state.inFlight = true;
-    try {
-      do {
-        state.rerunRequested = false;
-        await this.runOpenStudylistAssignmentReconcile(file, editor, state);
-      } while (state.rerunRequested && !this.isUnloaded);
-    } finally {
-      state.inFlight = false;
-      this.refreshUi();
-    }
-  }
-  async runStudylistAssignmentReconcile(file, state) {
-    const markdown = await this.app.vault.cachedRead(file);
-    const analysis = await this.studylistService.reconcileWordAssignment(file, markdown, {
-      activeIntent: this.getActiveStudylistIntent(state),
-      previousRawSnapshot: state.previousRawAssignment,
-      expectedCanonicalAssignment: state.expectedAssignment
-    });
-    if (!analysis || analysis.disabled) {
-      return;
-    }
-    state.previousRawAssignment = { ids: analysis.ids, names: analysis.names };
-    this.recordStudylistReconcileResult(state, analysis);
-    this.applyClosedWordStudylistAnalysis(file, analysis);
-  }
-  async runOpenStudylistAssignmentReconcile(file, editor, state) {
-    const analysis = await this.studylistService.analyzeWordModify(file, editor.getValue(), {
-      activeIntent: this.getActiveStudylistIntent(state),
-      previousRawSnapshot: state.previousRawAssignment,
-      expectedCanonicalAssignment: state.expectedAssignment,
-      refreshOnUnknown: false
-    });
-    if (!analysis || analysis.disabled) {
-      return;
-    }
-    if (analysis.shouldWrite) {
-      try {
-        applyStudylistFrontmatterPatchToEditor(editor, {
-          ids: analysis.ids,
-          names: analysis.names,
-          status: analysis.nextStatus,
-          lastError: analysis.nextLastError
-        });
-      } catch (error) {
-        console.error(`${PLUGIN_NAME}: failed to patch studylist properties in the open editor`, error);
-        return;
-      }
-    }
-    this.updateStudylistRawSnapshotFromAnalysis(file, editor, analysis);
-    this.studylistService.captureWordModifyAnalysisSnapshot(file, analysis);
-    this.recordStudylistReconcileResult(state, analysis);
-    this.applyClosedWordStudylistAnalysis(file, analysis);
-    if (!analysis.isResolved) {
-      this.scheduleStudylistCatalogRefreshRetry(file, analysis.language);
-    }
-  }
-  scheduleStudylistCatalogRefreshRetry(file, language) {
-    const normalizedLanguage = language.trim().toLocaleLowerCase() || "en";
-    if (this.studylistCatalogRefreshTimers.has(normalizedLanguage)) {
-      return;
-    }
-    const timer = window.setTimeout(() => {
-      this.studylistCatalogRefreshTimers.delete(normalizedLanguage);
-      void this.perf.measure("studylist.refreshCatalogRetry", async () => {
-        try {
-          await this.studylistService.refreshStudylistCatalogForLanguage(normalizedLanguage);
-          const view = this.getOpenMarkdownViewForFile(file);
-          if (view) {
-            this.requestOpenStudylistAssignmentReconcile(file, view.editor);
-          } else {
-            this.requestStudylistAssignmentReconcile(file, "metadata");
-          }
-        } catch (error) {
-          console.error(`${PLUGIN_NAME}: failed to refresh Eudic studylist catalog after an unknown local assignment`, error);
-        }
-      });
-    }, STUDYLIST_CATALOG_REFRESH_RETRY_DEBOUNCE_MS);
-    this.studylistCatalogRefreshTimers.set(normalizedLanguage, timer);
-  }
-  getStudylistReconcileState(path) {
-    const normalizedPath = (0, import_obsidian16.normalizePath)(path);
-    let state = this.studylistReconcileStates.get(normalizedPath);
-    if (!state) {
-      state = {
-        inFlight: false,
-        rerunRequested: false
-      };
-      this.studylistReconcileStates.set(normalizedPath, state);
-    }
-    return state;
-  }
-  getActiveStudylistIntent(state) {
-    if (!state.activeIntent || !state.intentExpiresAt || state.intentExpiresAt < Date.now()) {
-      delete state.activeIntent;
-      delete state.intentExpiresAt;
-      return void 0;
-    }
-    return state.activeIntent;
-  }
-  recordStudylistReconcileResult(state, analysis) {
-    state.activeIntent = {
-      preferredSource: analysis.preferredSource,
-      sourceIds: analysis.sourceIds,
-      sourceNames: analysis.sourceNames
-    };
-    state.intentExpiresAt = Date.now() + STUDYLIST_ACTIVE_INTENT_TTL_MS;
-    if (analysis.isResolved) {
-      if (!state.expectedAssignment || !arraysEqual5(state.expectedAssignment.ids, analysis.ids) || !arraysEqual5(state.expectedAssignment.names, analysis.names)) {
-        state.expectedAssignment = {
-          ids: analysis.ids,
-          names: analysis.names
-        };
-      }
-    }
   }
   async flushPendingOpenWordStatusWrites() {
     const openPaths = this.getOpenMarkdownFilePaths();
@@ -9943,41 +9515,6 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     }
   }
   async writeStudylistFrontmatter(file, mutate) {
-    const view = this.getOpenMarkdownViewForFile(file);
-    if (view && this.pathScope.isWordPath(file.path)) {
-      const nextFrontmatter = {
-        ...getFrontmatter(this.app, file)
-      };
-      const currentAssignment = readStudylistAssignmentFromMarkdown(view.editor.getValue());
-      nextFrontmatter[FRONTMATTER_KEYS.studylistIds] = currentAssignment.ids;
-      nextFrontmatter[FRONTMATTER_KEYS.studylistNames] = currentAssignment.names;
-      mutate(nextFrontmatter);
-      const status = readStudylistSyncStatus(nextFrontmatter);
-      const lastError = readNullableString(nextFrontmatter[FRONTMATTER_KEYS.studylistLastError]);
-      const syncedAt = readNullableString(nextFrontmatter[FRONTMATTER_KEYS.studylistSyncedAt]);
-      const ids = readStringArray(nextFrontmatter[FRONTMATTER_KEYS.studylistIds]);
-      const names = readStringArray(nextFrontmatter[FRONTMATTER_KEYS.studylistNames]);
-      try {
-        const changed = applyStudylistFrontmatterPatchToEditor(view.editor, {
-          ids,
-          names,
-          status,
-          lastError,
-          syncedAt
-        });
-        if (changed) {
-          this.suppressPath(file.path);
-          await view.save();
-        } else {
-          await this.writeFrontmatter(file, mutate);
-        }
-      } catch (error) {
-        this.clearSuppression(file.path);
-        throw error;
-      }
-      this.setWordStudylistStatusOverride(file, status, status === "dirty" ? lastError : null);
-      return;
-    }
     await this.writeFrontmatter(file, mutate);
   }
   async ensureManagedWordProperties(file) {

@@ -36,7 +36,7 @@ import {
 import { ReferenceNoteService, hasPendingReferenceBlocks } from "./reference-note-service";
 import { formatBoldMarkersInMarkdown } from "./markdown-bold-markers";
 import { ManagedFileRegistry } from "./managed-file-registry";
-import { getFrontmatter, readNullableString, readStringArray } from "./note-metadata";
+import { getFrontmatter } from "./note-metadata";
 import { PathScope } from "./path-scope";
 import { PerformanceMonitor } from "./performance-monitor";
 import { ReferenceGraphService } from "./reference-index-service";
@@ -46,10 +46,7 @@ import type { SemanticBlockTransformOptions } from "./semantic-block-transform";
 import { EudicSyncSettingTab } from "./settings";
 import { migrateLoadedSettings } from "./settings-data";
 import { EudicSyncSaveHookController } from "./save-hook-controller";
-import { StudylistService, type StudylistAssignmentIntent, type StudylistWordModifyAnalysis } from "./studylist-service";
-import { applyStudylistFrontmatterPatchToEditor } from "./studylist-frontmatter-patch";
-import { readStudylistSyncStatus } from "./studylist-sync-status";
-import { readStudylistAssignmentFromMarkdown, type StudylistAssignmentSnapshot } from "./studylist-word-modify-analysis";
+import { StudylistService } from "./studylist-service";
 import { applySyncStatusPatchToEditor, buildSyncStatusPatch } from "./sync-status-frontmatter-patch";
 import {
   applyWordSyncFrontmatterPatchToEditor,
@@ -88,27 +85,8 @@ interface PendingOpenWordStatusWrite {
   bodyError?: string | null;
 }
 
-interface StudylistReconcileState {
-  timer?: number;
-  inFlight: boolean;
-  rerunRequested: boolean;
-  intentExpiresAt?: number;
-  previousRawAssignment?: StudylistAssignmentSnapshot;
-  expectedAssignment?: {
-    ids: string[];
-    names: string[];
-  };
-  activeIntent?: StudylistAssignmentIntent;
-}
-
-type StudylistFileReconcileSource = "file" | "metadata";
-
 const AUTO_SYNC_AFTER_LEAVE_DELAY_MS = 2000;
 const EDITOR_CHANGE_DEBOUNCE_MS = 150;
-const STUDYLIST_EDITOR_CHANGE_DEBOUNCE_MS = 40;
-const STUDYLIST_RECONCILE_DEBOUNCE_MS = 60;
-const STUDYLIST_ACTIVE_INTENT_TTL_MS = 1200;
-const STUDYLIST_CATALOG_REFRESH_RETRY_DEBOUNCE_MS = 500;
 
 interface BoldMarkerNoteFormatResult {
   changed: boolean;
@@ -129,19 +107,6 @@ function toErrorMessage(error: unknown): string {
 
 function hasYamlFrontmatter(markdown: string): boolean {
   return /^---\s*\n[\s\S]*?\n---(?:\s*\n|$)/.test(markdown);
-}
-
-function arraysEqual(left: string[], right: string[]): boolean {
-  if (left.length !== right.length) {
-    return false;
-  }
-
-  for (let index = 0; index < left.length; index += 1) {
-    if (left[index] !== right[index]) {
-      return false;
-    }
-  }
-  return true;
 }
 
 function prependReferenceFrontmatter(markdown: string, linkId: string): string {
@@ -215,9 +180,6 @@ export default class EudicSyncPlugin extends Plugin {
   private readonly pendingOpenWordStatusWrites = new Map<string, PendingOpenWordStatusWrite>();
   private readonly flushingOpenWordStatusWritePaths = new Set<string>();
   private readonly editorChangeTimers = new Map<string, number>();
-  private readonly studylistEditorChangeTimers = new Map<string, number>();
-  private readonly studylistCatalogRefreshTimers = new Map<string, number>();
-  private readonly studylistReconcileStates = new Map<string, StudylistReconcileState>();
   private readonly autoBodyDirtyPaths = new Set<string>();
   private readonly restorableEditorBodyDirtyPaths = new Set<string>();
   private readonly nonRestorableBodyDirtyPaths = new Set<string>();
@@ -300,7 +262,6 @@ export default class EudicSyncPlugin extends Plugin {
       isUnloaded: () => this.isUnloaded,
       onLayoutReady: () => {
         this.lastActiveWordPath = this.getActiveWordPath();
-        this.primeOpenStudylistRawSnapshots();
         this.scheduleStartupKnownPathClear();
       },
       onEditorChange: (file, markdown, editor) => this.handleEditorChange(file, markdown, editor),
@@ -367,7 +328,6 @@ export default class EudicSyncPlugin extends Plugin {
     await this.perf.measure("startup.captureWordSyncSignatures", () => this.captureWordSyncSignatures());
     await this.perf.measure("startup.rebuildReferenceIndex", () => this.rebuildReferenceIndex());
     this.lastActiveWordPath = this.getActiveWordPath();
-    this.primeOpenStudylistRawSnapshots();
     this.refreshUi();
     this.registerVaultEventsOnLayoutReady();
 
@@ -381,7 +341,6 @@ export default class EudicSyncPlugin extends Plugin {
     this.clearStartupKnownPathTimer();
     this.clearAutoSyncTimers();
     this.clearEditorChangeTimers();
-    this.clearStudylistReconcileTimers();
     this.vaultEventController.clear();
     this.uiController.clearHeaderActions();
     this.saveHookController.restore();
@@ -677,10 +636,6 @@ export default class EudicSyncPlugin extends Plugin {
   }
 
   private handleEditorChange(file: TFile, _markdown: string, editor: Editor): void {
-    if (this.pathScope.isWordPath(file.path)) {
-      this.requestOpenStudylistAssignmentReconcile(file, editor);
-    }
-
     const normalizedPath = normalizePath(file.path);
     const existingTimer = this.editorChangeTimers.get(normalizedPath);
     if (existingTimer !== undefined) {
@@ -799,6 +754,7 @@ export default class EudicSyncPlugin extends Plugin {
       const normalizedPath = normalizePath(file.path);
       const isOpenWord = this.isMarkdownFileOpen(file);
       const nextWordSyncSignature = getWordSyncSignature(markdown);
+      await this.studylistService.handleWordModify(file, markdown);
       const result = await this.referenceIndex.updateWord(file, markdown);
       this.scheduleReferenceUsageRefresh(result.affectedReferencePaths);
 
@@ -811,7 +767,6 @@ export default class EudicSyncPlugin extends Plugin {
       }
 
       const dirtyDecision = this.getWordDirtySignatureDecision(normalizedPath, nextWordSyncSignature);
-      this.requestStudylistAssignmentReconcile(file, "file");
 
       if (isOpenWord) {
         this.updateOpenWordBodyDirtyState(file, dirtyDecision);
@@ -850,7 +805,6 @@ export default class EudicSyncPlugin extends Plugin {
 
     if (this.pathScope.isWordPath(file.path)) {
       this.releaseWordStatusOverridesIfMetadataCaughtUp(file);
-      this.requestStudylistAssignmentReconcile(file, "metadata");
       this.refreshUi();
       return;
     }
@@ -918,7 +872,6 @@ export default class EudicSyncPlugin extends Plugin {
     this.wordSyncSignatures.delete(normalizedPath);
     this.wordCleanSyncSignatures.delete(normalizedPath);
     this.clearPendingOpenWordStatusWrite(normalizedPath);
-    this.clearStudylistReconcileState(normalizedPath);
 
     if (this.pathScope.isReferencePath(normalizedPath)) {
       const lookup = await this.referenceIndex.findWordsReferencingWithFallback(normalizedPath);
@@ -1736,41 +1689,6 @@ export default class EudicSyncPlugin extends Plugin {
     return normalizePath(file.path);
   }
 
-  private primeOpenStudylistRawSnapshots(): void {
-    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
-      const view = leaf.view;
-      if (!(view instanceof MarkdownView) || !view.file || !this.pathScope.isWordPath(view.file.path)) {
-        continue;
-      }
-
-      this.captureStudylistRawSnapshot(view.file, view.editor);
-    }
-  }
-
-  private captureStudylistRawSnapshot(file: TFile, editor: Editor, options: { overwrite?: boolean } = {}): void {
-    if (!this.pathScope.isWordPath(file.path) || !this.syncService.canSyncFile(file)) {
-      return;
-    }
-
-    const state = this.getStudylistReconcileState(file.path);
-    if (!options.overwrite && state.previousRawAssignment) {
-      return;
-    }
-
-    state.previousRawAssignment = readStudylistAssignmentFromMarkdown(editor.getValue());
-  }
-
-  private updateStudylistRawSnapshotFromAnalysis(
-    file: TFile,
-    editor: Editor,
-    analysis: StudylistWordModifyAnalysis,
-  ): void {
-    const state = this.getStudylistReconcileState(file.path);
-    state.previousRawAssignment = analysis.shouldWrite
-      ? { ids: analysis.ids, names: analysis.names }
-      : readStudylistAssignmentFromMarkdown(editor.getValue());
-  }
-
   private handleActiveWordChanged(): void {
     const nextActiveWordPath = this.getActiveWordPath();
     if (nextActiveWordPath) {
@@ -1785,7 +1703,6 @@ export default class EudicSyncPlugin extends Plugin {
     }
 
     this.lastActiveWordPath = nextActiveWordPath;
-    this.primeOpenStudylistRawSnapshots();
     void this.flushPendingOpenWordStatusWrites();
   }
 
@@ -1994,15 +1911,6 @@ export default class EudicSyncPlugin extends Plugin {
     this.wordStatusOverrides.clear(normalizedPath);
   }
 
-  private applyClosedWordStudylistAnalysis(file: TFile, analysis: StudylistWordModifyAnalysis): void {
-    if (analysis.nextStatus === "dirty") {
-      this.setWordStudylistStatusOverride(file, "dirty", analysis.nextLastError);
-      return;
-    }
-
-    this.wordStatusOverrides.clearStudylist(file.path);
-  }
-
   private async markWordDirtyWithAutomaticDeferral(file: TFile): Promise<boolean> {
     if (this.pathScope.isWordPath(file.path) && this.isMarkdownFileOpen(file)) {
       return this.markOpenWordBodyDirty(file, null);
@@ -2052,250 +1960,6 @@ export default class EudicSyncPlugin extends Plugin {
       window.clearTimeout(timer);
     }
     this.editorChangeTimers.clear();
-
-    for (const timer of this.studylistEditorChangeTimers.values()) {
-      window.clearTimeout(timer);
-    }
-    this.studylistEditorChangeTimers.clear();
-  }
-
-  private clearStudylistReconcileTimers(): void {
-    for (const state of this.studylistReconcileStates.values()) {
-      if (state.timer !== undefined) {
-        window.clearTimeout(state.timer);
-      }
-    }
-    this.studylistReconcileStates.clear();
-
-    for (const timer of this.studylistCatalogRefreshTimers.values()) {
-      window.clearTimeout(timer);
-    }
-    this.studylistCatalogRefreshTimers.clear();
-  }
-
-  private clearStudylistReconcileState(path: string): void {
-    const normalizedPath = normalizePath(path);
-    const state = this.studylistReconcileStates.get(normalizedPath);
-    if (state?.timer !== undefined) {
-      window.clearTimeout(state.timer);
-    }
-    const editorTimer = this.studylistEditorChangeTimers.get(normalizedPath);
-    if (editorTimer !== undefined) {
-      window.clearTimeout(editorTimer);
-      this.studylistEditorChangeTimers.delete(normalizedPath);
-    }
-    this.studylistReconcileStates.delete(normalizedPath);
-  }
-
-  private requestStudylistAssignmentReconcile(file: TFile, source: StudylistFileReconcileSource = "file"): void {
-    if (this.isUnloaded || !this.syncService.canSyncFile(file)) {
-      return;
-    }
-
-    const normalizedPath = normalizePath(file.path);
-    const state = this.getStudylistReconcileState(normalizedPath);
-    if (state.inFlight) {
-      state.rerunRequested = true;
-      return;
-    }
-
-    if (state.timer !== undefined) {
-      window.clearTimeout(state.timer);
-    }
-
-    state.timer = window.setTimeout(() => {
-      state.timer = undefined;
-      void this.perf.measure(`studylist.reconcile.${source}`, () => this.reconcileStudylistAssignmentFromFile(file, source));
-    }, STUDYLIST_RECONCILE_DEBOUNCE_MS);
-  }
-
-  private requestOpenStudylistAssignmentReconcile(file: TFile, editor: Editor): void {
-    if (this.isUnloaded || !this.syncService.canSyncFile(file)) {
-      return;
-    }
-
-    const normalizedPath = normalizePath(file.path);
-    const state = this.getStudylistReconcileState(normalizedPath);
-    if (state.inFlight) {
-      state.rerunRequested = true;
-      return;
-    }
-
-    const existingTimer = this.studylistEditorChangeTimers.get(normalizedPath);
-    if (existingTimer !== undefined) {
-      window.clearTimeout(existingTimer);
-    }
-
-    const timer = window.setTimeout(() => {
-      this.studylistEditorChangeTimers.delete(normalizedPath);
-      void this.perf.measure("studylist.reconcileEditor", () => this.reconcileStudylistAssignmentFromEditor(file, editor));
-    }, STUDYLIST_EDITOR_CHANGE_DEBOUNCE_MS);
-    this.studylistEditorChangeTimers.set(normalizedPath, timer);
-  }
-
-  private async reconcileStudylistAssignmentFromFile(file: TFile, _source: StudylistFileReconcileSource = "file"): Promise<void> {
-    const normalizedPath = normalizePath(file.path);
-    const state = this.getStudylistReconcileState(normalizedPath);
-    if (state.inFlight || !this.syncService.canSyncFile(file)) {
-      state.rerunRequested = true;
-      return;
-    }
-
-    state.inFlight = true;
-    try {
-      do {
-        state.rerunRequested = false;
-        await this.runStudylistAssignmentReconcile(file, state);
-      } while (state.rerunRequested && !this.isUnloaded);
-    } finally {
-      state.inFlight = false;
-      this.refreshUi();
-    }
-  }
-
-  private async reconcileStudylistAssignmentFromEditor(file: TFile, editor: Editor): Promise<void> {
-    const normalizedPath = normalizePath(file.path);
-    const state = this.getStudylistReconcileState(normalizedPath);
-    if (state.inFlight || !this.syncService.canSyncFile(file)) {
-      state.rerunRequested = true;
-      return;
-    }
-
-    state.inFlight = true;
-    try {
-      do {
-        state.rerunRequested = false;
-        await this.runOpenStudylistAssignmentReconcile(file, editor, state);
-      } while (state.rerunRequested && !this.isUnloaded);
-    } finally {
-      state.inFlight = false;
-      this.refreshUi();
-    }
-  }
-
-  private async runStudylistAssignmentReconcile(file: TFile, state: StudylistReconcileState): Promise<void> {
-    const markdown = await this.app.vault.cachedRead(file);
-    const analysis = await this.studylistService.reconcileWordAssignment(file, markdown, {
-      activeIntent: this.getActiveStudylistIntent(state),
-      previousRawSnapshot: state.previousRawAssignment,
-      expectedCanonicalAssignment: state.expectedAssignment,
-    });
-    if (!analysis || analysis.disabled) {
-      return;
-    }
-
-    state.previousRawAssignment = { ids: analysis.ids, names: analysis.names };
-    this.recordStudylistReconcileResult(state, analysis);
-    this.applyClosedWordStudylistAnalysis(file, analysis);
-  }
-
-  private async runOpenStudylistAssignmentReconcile(
-    file: TFile,
-    editor: Editor,
-    state: StudylistReconcileState,
-  ): Promise<void> {
-    const analysis = await this.studylistService.analyzeWordModify(file, editor.getValue(), {
-      activeIntent: this.getActiveStudylistIntent(state),
-      previousRawSnapshot: state.previousRawAssignment,
-      expectedCanonicalAssignment: state.expectedAssignment,
-      refreshOnUnknown: false,
-    });
-    if (!analysis || analysis.disabled) {
-      return;
-    }
-
-    if (analysis.shouldWrite) {
-      try {
-        applyStudylistFrontmatterPatchToEditor(editor, {
-          ids: analysis.ids,
-          names: analysis.names,
-          status: analysis.nextStatus,
-          lastError: analysis.nextLastError,
-        });
-      } catch (error) {
-        console.error(`${PLUGIN_NAME}: failed to patch studylist properties in the open editor`, error);
-        return;
-      }
-    }
-
-    this.updateStudylistRawSnapshotFromAnalysis(file, editor, analysis);
-    this.studylistService.captureWordModifyAnalysisSnapshot(file, analysis);
-    this.recordStudylistReconcileResult(state, analysis);
-    this.applyClosedWordStudylistAnalysis(file, analysis);
-    if (!analysis.isResolved) {
-      this.scheduleStudylistCatalogRefreshRetry(file, analysis.language);
-    }
-  }
-
-  private scheduleStudylistCatalogRefreshRetry(file: TFile, language: string): void {
-    const normalizedLanguage = language.trim().toLocaleLowerCase() || "en";
-    if (this.studylistCatalogRefreshTimers.has(normalizedLanguage)) {
-      return;
-    }
-
-    const timer = window.setTimeout(() => {
-      this.studylistCatalogRefreshTimers.delete(normalizedLanguage);
-      void this.perf.measure("studylist.refreshCatalogRetry", async () => {
-        try {
-          await this.studylistService.refreshStudylistCatalogForLanguage(normalizedLanguage);
-          const view = this.getOpenMarkdownViewForFile(file);
-          if (view) {
-            this.requestOpenStudylistAssignmentReconcile(file, view.editor);
-          } else {
-            this.requestStudylistAssignmentReconcile(file, "metadata");
-          }
-        } catch (error) {
-          console.error(`${PLUGIN_NAME}: failed to refresh Eudic studylist catalog after an unknown local assignment`, error);
-        }
-      });
-    }, STUDYLIST_CATALOG_REFRESH_RETRY_DEBOUNCE_MS);
-    this.studylistCatalogRefreshTimers.set(normalizedLanguage, timer);
-  }
-
-  private getStudylistReconcileState(path: string): StudylistReconcileState {
-    const normalizedPath = normalizePath(path);
-    let state = this.studylistReconcileStates.get(normalizedPath);
-    if (!state) {
-      state = {
-        inFlight: false,
-        rerunRequested: false,
-      };
-      this.studylistReconcileStates.set(normalizedPath, state);
-    }
-    return state;
-  }
-
-  private getActiveStudylistIntent(state: StudylistReconcileState): StudylistAssignmentIntent | undefined {
-    if (!state.activeIntent || !state.intentExpiresAt || state.intentExpiresAt < Date.now()) {
-      delete state.activeIntent;
-      delete state.intentExpiresAt;
-      return undefined;
-    }
-    return state.activeIntent;
-  }
-
-  private recordStudylistReconcileResult(
-    state: StudylistReconcileState,
-    analysis: StudylistWordModifyAnalysis,
-  ): void {
-    state.activeIntent = {
-      preferredSource: analysis.preferredSource,
-      sourceIds: analysis.sourceIds,
-      sourceNames: analysis.sourceNames,
-    };
-    state.intentExpiresAt = Date.now() + STUDYLIST_ACTIVE_INTENT_TTL_MS;
-    if (analysis.isResolved) {
-      if (
-        !state.expectedAssignment ||
-        !arraysEqual(state.expectedAssignment.ids, analysis.ids) ||
-        !arraysEqual(state.expectedAssignment.names, analysis.names)
-      ) {
-        state.expectedAssignment = {
-          ids: analysis.ids,
-          names: analysis.names,
-        };
-      }
-    }
   }
 
   private async flushPendingOpenWordStatusWrites(): Promise<void> {
@@ -2556,45 +2220,6 @@ export default class EudicSyncPlugin extends Plugin {
   }
 
   private async writeStudylistFrontmatter(file: TFile, mutate: FrontmatterMutator): Promise<void> {
-    const view = this.getOpenMarkdownViewForFile(file);
-    if (view && this.pathScope.isWordPath(file.path)) {
-      const nextFrontmatter = {
-        ...getFrontmatter(this.app, file),
-      };
-      const currentAssignment = readStudylistAssignmentFromMarkdown(view.editor.getValue());
-      nextFrontmatter[FRONTMATTER_KEYS.studylistIds] = currentAssignment.ids;
-      nextFrontmatter[FRONTMATTER_KEYS.studylistNames] = currentAssignment.names;
-      mutate(nextFrontmatter);
-
-      const status = readStudylistSyncStatus(nextFrontmatter);
-      const lastError = readNullableString(nextFrontmatter[FRONTMATTER_KEYS.studylistLastError]);
-      const syncedAt = readNullableString(nextFrontmatter[FRONTMATTER_KEYS.studylistSyncedAt]);
-      const ids = readStringArray(nextFrontmatter[FRONTMATTER_KEYS.studylistIds]);
-      const names = readStringArray(nextFrontmatter[FRONTMATTER_KEYS.studylistNames]);
-
-      try {
-        const changed = applyStudylistFrontmatterPatchToEditor(view.editor, {
-          ids,
-          names,
-          status,
-          lastError,
-          syncedAt,
-        });
-        if (changed) {
-          this.suppressPath(file.path);
-          await view.save();
-        } else {
-          await this.writeFrontmatter(file, mutate);
-        }
-      } catch (error) {
-        this.clearSuppression(file.path);
-        throw error;
-      }
-
-      this.setWordStudylistStatusOverride(file, status, status === "dirty" ? lastError : null);
-      return;
-    }
-
     await this.writeFrontmatter(file, mutate);
   }
 

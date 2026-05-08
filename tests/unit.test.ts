@@ -729,11 +729,6 @@ const analyzeStudylist = (
   markdown: string,
   stateOverrides: Partial<Parameters<typeof analyzeStudylistWordModify>[0]["state"]> = {},
   previousSnapshot = { ids: ["1"], names: ["Alpha"] },
-  activeIntent: Parameters<typeof analyzeStudylistWordModify>[0]["activeIntent"] = undefined,
-  analysisOptions: Pick<
-    Parameters<typeof analyzeStudylistWordModify>[0],
-    "previousRawSnapshot" | "expectedCanonicalAssignment"
-  > = {},
 ) =>
   analyzeStudylistWordModify({
     state: {
@@ -746,8 +741,6 @@ const analyzeStudylist = (
       ...stateOverrides,
     },
     previousSnapshot,
-    activeIntent,
-    ...analysisOptions,
     markdown,
     resolveAssignment: async (_language, assignment) => {
       const idsByName = new Map(Array.from(studylistNamesById.entries()).map(([id, name]) => [name, id]));
@@ -943,35 +936,6 @@ assert.deepEqual(removedIdStudylistAnalysis.ids, ["1"]);
 assert.deepEqual(removedIdStudylistAnalysis.names, ["Alpha"]);
 assert.equal(removedIdStudylistAnalysis.nextStatus, "dirty");
 
-const staleIdsAfterNameRemovalAnalysis = await analyzeStudylist(
-  [
-    "---",
-    "eudic_studylist_ids:",
-    "  - 0",
-    "  - 134223429171042864",
-    "eudic_studylist_names:",
-    "  - Obsidian Sync",
-    "studylist_sync_status: dirty",
-    "---",
-    "",
-    "A stale event must not restore a just-deleted name from old ids.",
-  ].join("\n"),
-  {
-    ids: ["0", "134223429171042864"],
-    names: ["Obsidian Sync"],
-    status: "dirty",
-  },
-  { ids: ["134223429171042864"], names: ["Obsidian Sync"] },
-  {
-    preferredSource: "names",
-    sourceIds: ["0", "134223429171042864"],
-    sourceNames: ["Obsidian Sync"],
-  },
-);
-assert.equal(staleIdsAfterNameRemovalAnalysis.preferredSource, "names");
-assert.deepEqual(staleIdsAfterNameRemovalAnalysis.ids, ["134223429171042864"]);
-assert.deepEqual(staleIdsAfterNameRemovalAnalysis.names, ["Obsidian Sync"]);
-
 const removedIdAfterNameIntentAnalysis = await analyzeStudylist(
   [
     "---",
@@ -991,11 +955,6 @@ const removedIdAfterNameIntentAnalysis = await analyzeStudylist(
     status: "dirty",
   },
   { ids: ["0", "134223429171042864"], names: ["略｜我的生词本", "Obsidian Sync"] },
-  {
-    preferredSource: "names",
-    sourceIds: ["0", "134223429171042864"],
-    sourceNames: ["略｜我的生词本", "Obsidian Sync"],
-  },
 );
 assert.equal(removedIdAfterNameIntentAnalysis.preferredSource, "ids");
 assert.deepEqual(removedIdAfterNameIntentAnalysis.ids, ["134223429171042864"]);
@@ -1020,14 +979,6 @@ const removedIdFromNamesPatchEchoAnalysis = await analyzeStudylist(
     status: "dirty",
   },
   { ids: ["0", "134223429171042864"], names: ["略｜我的生词本", "Obsidian Sync"] },
-  {
-    preferredSource: "names",
-    sourceIds: ["0"],
-    sourceNames: ["略｜我的生词本", "Obsidian Sync"],
-  },
-  {
-    previousRawSnapshot: { ids: ["0", "134223429171042864"], names: ["略｜我的生词本", "Obsidian Sync"] },
-  },
 );
 assert.equal(removedIdFromNamesPatchEchoAnalysis.preferredSource, "ids");
 assert.deepEqual(removedIdFromNamesPatchEchoAnalysis.ids, ["0"]);
@@ -1052,14 +1003,6 @@ const removedNameFromIdsPatchEchoAnalysis = await analyzeStudylist(
     status: "dirty",
   },
   { ids: ["0", "134223429171042864"], names: ["略｜我的生词本", "Obsidian Sync"] },
-  {
-    preferredSource: "ids",
-    sourceIds: ["0", "134223429171042864"],
-    sourceNames: ["略｜我的生词本"],
-  },
-  {
-    previousRawSnapshot: { ids: ["0", "134223429171042864"], names: ["略｜我的生词本", "Obsidian Sync"] },
-  },
 );
 assert.equal(removedNameFromIdsPatchEchoAnalysis.preferredSource, "names");
 assert.deepEqual(removedNameFromIdsPatchEchoAnalysis.ids, ["0"]);
@@ -1130,14 +1073,6 @@ const removedOnlyObsidianIdFromRawPairAnalysis = await analyzeStudylist(
     status: "dirty",
   },
   { ids: ["134223429171042864"], names: ["Obsidian Sync"] },
-  {
-    preferredSource: "names",
-    sourceIds: [],
-    sourceNames: ["Obsidian Sync"],
-  },
-  {
-    previousRawSnapshot: { ids: ["134223429171042864"], names: ["Obsidian Sync"] },
-  },
 );
 assert.equal(removedOnlyObsidianIdFromRawPairAnalysis.preferredSource, "ids");
 assert.deepEqual(removedOnlyObsidianIdFromRawPairAnalysis.ids, []);
@@ -1160,14 +1095,6 @@ const removedOnlyObsidianNameFromRawPairAnalysis = await analyzeStudylist(
     status: "dirty",
   },
   { ids: ["134223429171042864"], names: ["Obsidian Sync"] },
-  {
-    preferredSource: "ids",
-    sourceIds: ["134223429171042864"],
-    sourceNames: [],
-  },
-  {
-    previousRawSnapshot: { ids: ["134223429171042864"], names: ["Obsidian Sync"] },
-  },
 );
 assert.equal(removedOnlyObsidianNameFromRawPairAnalysis.preferredSource, "names");
 assert.deepEqual(removedOnlyObsidianNameFromRawPairAnalysis.ids, []);
@@ -1191,14 +1118,6 @@ const abdicateInconsistentDeleteIdAnalysis = await analyzeStudylist(
     status: "dirty",
   },
   { ids: ["134223429171042864"], names: ["Obsidian Sync", "略｜我的生词本"] },
-  {
-    preferredSource: "names",
-    sourceIds: [],
-    sourceNames: ["Obsidian Sync", "略｜我的生词本"],
-  },
-  {
-    previousRawSnapshot: { ids: ["134223429171042864"], names: ["Obsidian Sync", "略｜我的生词本"] },
-  },
 );
 assert.equal(abdicateInconsistentDeleteIdAnalysis.preferredSource, "ids");
 assert.deepEqual(abdicateInconsistentDeleteIdAnalysis.ids, []);
@@ -1222,14 +1141,6 @@ const abdicateInconsistentDeleteNameAnalysis = await analyzeStudylist(
     status: "dirty",
   },
   { ids: ["134223429171042864"], names: ["Obsidian Sync", "略｜我的生词本"] },
-  {
-    preferredSource: "ids",
-    sourceIds: ["134223429171042864"],
-    sourceNames: ["略｜我的生词本"],
-  },
-  {
-    previousRawSnapshot: { ids: ["134223429171042864"], names: ["Obsidian Sync", "略｜我的生词本"] },
-  },
 );
 assert.equal(abdicateInconsistentDeleteNameAnalysis.preferredSource, "names");
 assert.deepEqual(abdicateInconsistentDeleteNameAnalysis.ids, ["0"]);
@@ -1254,11 +1165,6 @@ const rapidNextNameEditAnalysis = await analyzeStudylist(
     status: "dirty",
   },
   { ids: ["134223429171042864"], names: ["Obsidian Sync"] },
-  {
-    preferredSource: "names",
-    sourceIds: ["0", "134223429171042864"],
-    sourceNames: ["Obsidian Sync"],
-  },
 );
 assert.equal(rapidNextNameEditAnalysis.preferredSource, "names");
 assert.deepEqual(rapidNextNameEditAnalysis.ids, ["0", "134223429171042864"]);
@@ -1590,25 +1496,27 @@ studylistServiceMarkdownByPath.set(
     "Body.",
   ].join("\n"),
 );
-const staleServiceReconcile = await studylistService.reconcileWordAssignment(
+const directIdServiceReconcile = await studylistService.reconcileWordAssignment(
   studylistServiceFile,
   studylistServiceMarkdownByPath.get(studylistServiceFile.path) ?? "",
-  {
-    activeIntent: {
-      preferredSource: "names",
-      sourceIds: ["0", "134223429171042864"],
-      sourceNames: ["Obsidian Sync"],
-    },
-  },
 );
-assert.equal(staleServiceReconcile?.preferredSource, "names");
+assert.equal(directIdServiceReconcile?.preferredSource, "ids");
 assert.deepEqual(studylistServiceFrontmatterByPath.get(studylistServiceFile.path)?.eudic_studylist_ids, [
+  "0",
   "134223429171042864",
 ]);
 assert.deepEqual(studylistServiceFrontmatterByPath.get(studylistServiceFile.path)?.eudic_studylist_names, [
+  "略｜我的生词本",
   "Obsidian Sync",
 ]);
 
+studylistServiceFrontmatterByPath.set(studylistServiceFile.path, {
+  ...(studylistServiceFrontmatterByPath.get(studylistServiceFile.path) ?? {}),
+  eudic_studylist_ids: ["134223429171042864"],
+  eudic_studylist_names: ["Obsidian Sync"],
+  studylist_sync_status: "dirty",
+});
+studylistService.captureAllLocalSnapshots();
 studylistServiceFrontmatterByPath.set(studylistServiceFile.path, {
   ...(studylistServiceFrontmatterByPath.get(studylistServiceFile.path) ?? {}),
   eudic_studylist_ids: ["0"],

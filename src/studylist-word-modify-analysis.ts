@@ -15,20 +15,12 @@ export interface StudylistAssignmentSnapshot {
   names: string[];
 }
 
-export interface StudylistAssignmentIntent {
-  preferredSource: "names" | "ids";
-  sourceIds: string[];
-  sourceNames: string[];
-}
-
 export interface StudylistWordModifyAnalysis {
   disabled: boolean;
   language: string;
   ids: string[];
   names: string[];
   preferredSource: "names" | "ids";
-  sourceIds: string[];
-  sourceNames: string[];
   isResolved: boolean;
   shouldDirty: boolean;
   shouldWrite: boolean;
@@ -39,9 +31,6 @@ export interface StudylistWordModifyAnalysis {
 interface AnalyzeStudylistWordModifyOptions {
   state: StudylistWordModifyState;
   previousSnapshot?: StudylistAssignmentSnapshot;
-  previousRawSnapshot?: StudylistAssignmentSnapshot;
-  expectedCanonicalAssignment?: StudylistAssignmentSnapshot;
-  activeIntent?: StudylistAssignmentIntent;
   markdown: string;
   refreshOnUnknown?: boolean;
   resolveAssignment: (
@@ -216,35 +205,8 @@ function getPreferredSource(
   ids: string[],
   names: string[],
   previousSnapshot: StudylistAssignmentSnapshot | undefined,
-  previousRawSnapshot: StudylistAssignmentSnapshot | undefined,
-  expectedCanonicalAssignment: StudylistAssignmentSnapshot | undefined,
-  activeIntent: StudylistAssignmentIntent | undefined,
 ): "names" | "ids" {
   const currentSnapshot = { ids, names };
-  if (previousRawSnapshot) {
-    const preferredSourceFromRawDelta = getPreferredSourceFromDelta(getAssignmentDelta(previousRawSnapshot, currentSnapshot));
-    if (preferredSourceFromRawDelta) {
-      return preferredSourceFromRawDelta;
-    }
-  }
-
-  if (
-    expectedCanonicalAssignment &&
-    activeIntent &&
-    arraysEqual(expectedCanonicalAssignment.ids, ids) &&
-    arraysEqual(expectedCanonicalAssignment.names, names)
-  ) {
-    return activeIntent.preferredSource;
-  }
-
-  if (
-    activeIntent &&
-    arraysEqual(activeIntent.sourceIds, ids) &&
-    arraysEqual(activeIntent.sourceNames, names)
-  ) {
-    return activeIntent.preferredSource;
-  }
-
   if (!previousSnapshot) {
     return names.length > 0 ? "names" : "ids";
   }
@@ -384,9 +346,6 @@ export async function analyzeStudylistWordModify(
   const {
     state,
     previousSnapshot,
-    previousRawSnapshot,
-    expectedCanonicalAssignment,
-    activeIntent,
     markdown,
     refreshOnUnknown = true,
   } = options;
@@ -397,8 +356,6 @@ export async function analyzeStudylistWordModify(
       ids: [],
       names: [],
       preferredSource: "names",
-      sourceIds: [],
-      sourceNames: [],
       isResolved: true,
       shouldDirty: false,
       shouldWrite: false,
@@ -413,7 +370,7 @@ export async function analyzeStudylistWordModify(
   const namesFromCurrentMarkdown = uniqueNormalized(namesFromMarkdown ?? state.names);
   const deletionAdjustedAssignment = applyPairDeletionDelta(
     { ids: idsFromCurrentMarkdown, names: namesFromCurrentMarkdown },
-    previousRawSnapshot ?? previousSnapshot,
+    previousSnapshot,
   );
   const idsForResolution = deletionAdjustedAssignment.ids;
   const namesForResolution = deletionAdjustedAssignment.names;
@@ -426,9 +383,6 @@ export async function analyzeStudylistWordModify(
       idsForResolution,
       namesForResolution,
       previousSnapshot,
-      previousRawSnapshot,
-      expectedCanonicalAssignment,
-      activeIntent,
     );
   const resolved = await options.resolveAssignment(
     state.language,
@@ -462,8 +416,6 @@ export async function analyzeStudylistWordModify(
     ids: normalizedIds,
     names,
     preferredSource,
-    sourceIds: idsForResolution,
-    sourceNames: namesForResolution,
     isResolved,
     shouldDirty,
     shouldWrite,
