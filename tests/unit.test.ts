@@ -15,7 +15,7 @@ import {
   mergeSemanticBlockLinkTargets,
 } from "../src/semantic-block-transform";
 import { serializeNoteOutputBlocks } from "../src/note-output/serializer";
-import { isAllowedNoteOutputImageSrc } from "../src/note-output/dom-parser";
+import { isAllowedNoteOutputImageSrc, resolveManagedInternalLinkHref } from "../src/note-output/dom-parser";
 import { resolveManagedReferencePath } from "../src/reference-links";
 import {
   collectReferenceUsageWordPaths,
@@ -639,6 +639,143 @@ assert.equal(
   ),
   "<b>1.</b> <b>aged</b> a. 年迈的；\n<b>2.</b> aging a. 老化的；",
 );
+
+const managedLinkWordFile = mockFile("Words/whisper.md");
+const managedLinkPeerFile = mockFile("Words/peer.md");
+const managedLinkDisabledFile = mockFile("Words/disabled.md");
+const managedLinkMissingIdFile = mockFile("Words/missing-id.md");
+const managedLinkReferenceFile = mockFile("References/ref-render.md");
+const managedLinkMaterialFile = mockFile("Material/2012 Text 1.md");
+const managedLinkFiles = [
+  managedLinkWordFile,
+  managedLinkPeerFile,
+  managedLinkDisabledFile,
+  managedLinkMissingIdFile,
+  managedLinkReferenceFile,
+  managedLinkMaterialFile,
+];
+const managedLinkFrontmatterByPath = new Map<string, Record<string, unknown>>([
+  [
+    managedLinkWordFile.path,
+    {
+      sync_eudic_enabled: true,
+      eudic_link_id: "w-whisper",
+    },
+  ],
+  [
+    managedLinkPeerFile.path,
+    {
+      sync_eudic_enabled: true,
+      eudic_link_id: "w-peer",
+    },
+  ],
+  [
+    managedLinkDisabledFile.path,
+    {
+      sync_eudic_enabled: false,
+      eudic_link_id: "w-disabled",
+    },
+  ],
+  [
+    managedLinkMissingIdFile.path,
+    {
+      sync_eudic_enabled: true,
+    },
+  ],
+  [
+    managedLinkReferenceFile.path,
+    {
+      eudic_link_id: "r-render",
+    },
+  ],
+  [
+    managedLinkMaterialFile.path,
+    {
+      eudic_link_id: "r-material",
+    },
+  ],
+]);
+const managedLinkApp = {
+  vault: {
+    getName: () => "English Peng",
+    getMarkdownFiles: () => managedLinkFiles,
+    getFileByPath: (path: string) => managedLinkFiles.find((file) => file.path === path) ?? null,
+  },
+  metadataCache: {
+    getFileCache: (file: TFile) => ({ frontmatter: managedLinkFrontmatterByPath.get(file.path) ?? {} }),
+    getFirstLinkpathDest: (linkpath: string) => {
+      const normalized = linkpath.replace(/\.md$/i, "").replace(/^\/+/, "");
+      if (normalized === "whisper" || normalized === "Words/whisper") {
+        return managedLinkWordFile;
+      }
+      if (normalized === "peer" || normalized === "Words/peer") {
+        return managedLinkPeerFile;
+      }
+      if (normalized === "disabled") {
+        return managedLinkDisabledFile;
+      }
+      if (normalized === "missing-id") {
+        return managedLinkMissingIdFile;
+      }
+      if (normalized === "ref-render" || normalized === "References/ref-render") {
+        return managedLinkReferenceFile;
+      }
+      if (normalized === "2012 Text 1" || normalized === "Material/2012 Text 1") {
+        return managedLinkMaterialFile;
+      }
+      return null;
+    },
+  },
+} as unknown as App;
+const managedLinkPathScope = {
+  isWordPath: (path: string) => path.startsWith("Words/"),
+  isReferencePath: (path: string) => path.startsWith("References/"),
+} as never;
+const managedLinkResolver = {
+  app: managedLinkApp,
+  pathScope: managedLinkPathScope,
+  sourcePath: managedLinkWordFile.path,
+};
+assert.equal(
+  resolveManagedInternalLinkHref("whisper", managedLinkResolver),
+  "obsidian://eudic-sync?vault=English%20Peng&kind=word&id=w-whisper&word=whisper",
+);
+assert.equal(
+  resolveManagedInternalLinkHref("peer", managedLinkResolver),
+  "obsidian://eudic-sync?vault=English%20Peng&kind=word&id=w-peer&word=peer",
+);
+assert.equal(
+  resolveManagedInternalLinkHref("Words/peer.md#meaning", managedLinkResolver),
+  "obsidian://eudic-sync?vault=English%20Peng&kind=word&id=w-peer&word=peer",
+);
+assert.equal(
+  resolveManagedInternalLinkHref("References/ref-render", managedLinkResolver),
+  "obsidian://eudic-sync?vault=English%20Peng&kind=reference&id=r-render&name=ref-render",
+);
+assert.equal(
+  resolveManagedInternalLinkHref("peer", managedLinkResolver) && serializeNoteOutputBlocks(
+    [
+      {
+        type: "paragraph",
+        inlines: [
+          {
+            type: "link",
+            href: resolveManagedInternalLinkHref("peer", managedLinkResolver) ?? "",
+            children: [{ type: "text", text: "classmate" }],
+          },
+        ],
+      },
+    ],
+    "minimal",
+  ),
+  '<a href="obsidian://eudic-sync?vault=English%20Peng&amp;kind=word&amp;id=w-peer&amp;word=peer">classmate</a>',
+);
+assert.equal(resolveManagedInternalLinkHref("missing", managedLinkResolver), null);
+assert.equal(resolveManagedInternalLinkHref("disabled", managedLinkResolver), null);
+assert.equal(resolveManagedInternalLinkHref("missing-id", managedLinkResolver), null);
+assert.equal(resolveManagedInternalLinkHref("Material/2012 Text 1", managedLinkResolver), null);
+assert.equal(resolveManagedInternalLinkHref("https://example.com", managedLinkResolver), null);
+assert.equal(resolveManagedInternalLinkHref("%E0%A4%A", managedLinkResolver), null);
 
 assert.equal(
   serializeNoteOutputBlocks(

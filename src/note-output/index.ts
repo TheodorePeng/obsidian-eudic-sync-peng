@@ -1,10 +1,14 @@
 import type { EudicNoteOutputMode } from "../types";
-import { buildNoteOutputBlocks } from "./dom-parser";
+import { buildNoteOutputBlocks, type NoteOutputLinkResolverContext } from "./dom-parser";
 import type { NoteOutputBlock, NoteOutputInline } from "./model";
 import { serializeNoteOutputBlocks } from "./serializer";
 
-export function buildFinalNoteHtml(renderedHtml: string, mode: EudicNoteOutputMode): string {
-  const blocks = buildNoteOutputBlocks(renderedHtml);
+export function buildFinalNoteHtml(
+  renderedHtml: string,
+  mode: EudicNoteOutputMode,
+  linkResolver?: NoteOutputLinkResolverContext,
+): string {
+  const blocks = buildNoteOutputBlocks(renderedHtml, linkResolver);
   return serializeNoteOutputBlocks(blocks, mode);
 }
 
@@ -35,7 +39,8 @@ export function buildFinalWordNoteHtml(
   mode: EudicNoteOutputMode,
   word: string,
   href: string,
+  linkResolver?: NoteOutputLinkResolverContext,
 ): string {
-  const blocks = buildNoteOutputBlocks(renderedHtml);
+  const blocks = buildNoteOutputBlocks(renderedHtml, linkResolver);
   return serializeNoteOutputBlocks([buildLinkedWordHeadingBlock(word, href), ...blocks], mode);
 }

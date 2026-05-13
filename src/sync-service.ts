@@ -455,7 +455,12 @@ export class SyncService {
     const renderedHtml = await this.renderer.renderMarkdown(syncBodyMarkdown, file.path, (sourcePath, embeddedFromPath) =>
       this.getSemanticBlockTransformOptionsForSourcePath(sourcePath, embeddedFromPath, file, context.word, wordLinkId),
     );
-    const finalNoteBodyHtml = buildFinalNoteHtml(renderedHtml, settings.noteOutputMode);
+    const linkResolver = {
+      app: this.options.app,
+      pathScope: this.options.pathScope,
+      sourcePath: file.path,
+    };
+    const finalNoteBodyHtml = buildFinalNoteHtml(renderedHtml, settings.noteOutputMode, linkResolver);
     if (!finalNoteBodyHtml.trim()) {
       throw new Error(EMPTY_WORD_BODY_SYNC_ERROR);
     }
@@ -466,6 +471,7 @@ export class SyncService {
         settings.noteOutputMode,
         context.word,
         buildEudicProtocolUrl(this.options.app, "word", wordLinkId, context.word),
+        linkResolver,
       ),
     };
   }

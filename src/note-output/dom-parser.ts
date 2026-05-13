@@ -1,3 +1,8 @@
+import type { App, TFile } from "obsidian";
+import { buildManagedFileProtocolUrl } from "../eudic-link";
+import { getFrontmatter, isWordSyncDisabledFrontmatter, readNullableString } from "../note-metadata";
+import type { PathScope } from "../path-scope";
+import { FRONTMATTER_KEYS } from "../constants";
 import type { NoteOutputBlock, NoteOutputInline, NoteOutputListItem } from "./model";
 
 const BLOCK_TAGS = new Set([
@@ -76,6 +81,16 @@ function shouldStripElement(element: Element): boolean {
 const BLOCKED_HREF_SCHEMES = new Set(["data", "javascript", "vbscript"]);
 const ALLOWED_IMAGE_SCHEMES = new Set(["http", "https"]);
 
+export interface NoteOutputLinkResolverContext {
+  app: App;
+  pathScope: PathScope;
+  sourcePath: string;
+}
+
+interface NoteOutputParseContext {
+  linkResolver?: NoteOutputLinkResolverContext;
+}
+
 function getHrefScheme(href: string): string | null {
   const match = href.match(/^([A-Za-z][A-Za-z0-9+.-]*):/);
   return match?.[1]?.toLowerCase() ?? null;
@@ -97,6 +112,89 @@ function isAllowedHref(href: string | null): href is string {
   }
 
   return true;
+}
+
+function normalizeInternalTarget(value: string | null): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmedValue = value.trim();
+  if (!trimmedValue || trimmedValue.startsWith("#") || getHrefScheme(trimmedValue)) {
+    return null;
+  }
+
+  const hashIndex = trimmedValue.indexOf("#");
+  const withoutSubpath = hashIndex >= 0 ? trimmedValue.slice(0, hashIndex) : trimmedValue;
+  const withoutMarkdownExtension = withoutSubpath.replace(/\.md$/i, "");
+  try {
+    return decodeURIComponent(withoutMarkdownExtension).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function getInternalLinkTarget(element: Element): string | null {
+  const dataHrefTarget = normalizeInternalTarget(element.getAttribute("data-href"));
+  if (element.classList.contains("internal-link") || dataHrefTarget) {
+    return dataHrefTarget ?? normalizeInternalTarget(element.getAttribute("href"));
+  }
+
+  return normalizeInternalTarget(element.getAttribute("href"));
+}
+
+export function resolveManagedInternalLinkHref(
+  target: string | null,
+  linkResolver?: NoteOutputLinkResolverContext,
+): string | null {
+  if (!linkResolver) {
+    return null;
+  }
+
+  const normalizedTarget = normalizeInternalTarget(target);
+  if (!normalizedTarget) {
+    return null;
+  }
+
+  try {
+    const file = linkResolver.app.metadataCache.getFirstLinkpathDest(normalizedTarget, linkResolver.sourcePath);
+    if (!file || file.extension !== "md") {
+      return null;
+    }
+
+    const kind = linkResolver.pathScope.isWordPath(file.path)
+      ? "word"
+      : linkResolver.pathScope.isReferencePath(file.path)
+        ? "reference"
+        : null;
+    if (!kind) {
+      return null;
+    }
+
+    const frontmatter = getFrontmatter(linkResolver.app, file);
+    if (kind === "word" && isWordSyncDisabledFrontmatter(frontmatter)) {
+      return null;
+    }
+
+    const linkId = readNullableString(frontmatter[FRONTMATTER_KEYS.eudicLinkId]);
+    if (!linkId) {
+      return null;
+    }
+
+    return buildManagedFileProtocolUrl(linkResolver.app, linkResolver.pathScope, file as TFile, linkId);
+  } catch {
+    return null;
+  }
+}
+
+function buildManagedInternalLinkHref(element: Element, context: NoteOutputParseContext): string | null {
+  const resolver = context.linkResolver;
+  if (!resolver) {
+    return null;
+  }
+
+  const target = getInternalLinkTarget(element);
+  return resolveManagedInternalLinkHref(target, resolver);
 }
 
 export function isAllowedNoteOutputImageSrc(src: string | null): src is string {
@@ -164,17 +262,20 @@ function hasMeaningfulInline(inlines: NoteOutputInline[]): boolean {
   });
 }
 
-function collectInlineFromChildren(childNodes: NodeListOf<ChildNode> | ChildNode[]): NoteOutputInline[] {
+function collectInlineFromChildren(
+  childNodes: NodeListOf<ChildNode> | ChildNode[],
+  context: NoteOutputParseContext,
+): NoteOutputInline[] {
   const parts: NoteOutputInline[] = [];
 
   for (const child of Array.from(childNodes)) {
-    parts.push(...collectInlineFromNode(child));
+    parts.push(...collectInlineFromNode(child, context));
   }
 
   return parts;
 }
 
-function collectInlineFromNode(node: ChildNode): NoteOutputInline[] {
+function collectInlineFromNode(node: ChildNode, context: NoteOutputParseContext): NoteOutputInline[] {
   if (node.nodeType === Node.COMMENT_NODE) {
     return [];
   }
@@ -200,30 +301,32 @@ function collectInlineFromNode(node: ChildNode): NoteOutputInline[] {
   }
 
   if (tagName === "strong" || tagName === "b") {
-    const children = collectInlineFromChildren(element.childNodes);
+    const children = collectInlineFromChildren(element.childNodes, context);
     return hasMeaningfulInline(children) ? [{ type: "bold", children }] : [];
   }
 
   if (tagName === "a") {
     const href = element.getAttribute("href");
+    const managedInternalHref = buildManagedInternalLinkHref(element, context);
     const directImageChildren = Array.from(element.childNodes)
       .filter((child): child is Element => child.nodeType === Node.ELEMENT_NODE && (child as Element).tagName.toLowerCase() === "img");
 
-    if (isAllowedHref(href)) {
+    if (managedInternalHref || isAllowedHref(href)) {
+      const resolvedHref = managedInternalHref ?? href!.trim();
       const imageChildren = directImageChildren
-        .flatMap((imageElement) => createImageInline(imageElement, href.trim()))
+        .flatMap((imageElement) => createImageInline(imageElement, resolvedHref))
         .filter((inline): inline is NoteOutputInline => !!inline);
       if (imageChildren.length > 0) {
         const nonImageChildren = Array.from(element.childNodes)
           .filter((child) => !directImageChildren.includes(child as Element));
-        return [...imageChildren, ...collectInlineFromChildren(nonImageChildren)];
+        return [...imageChildren, ...collectInlineFromChildren(nonImageChildren, context)];
       }
 
-      const children = collectInlineFromChildren(element.childNodes);
-      return [{ type: "link", href: href.trim(), children }];
+      const children = collectInlineFromChildren(element.childNodes, context);
+      return [{ type: "link", href: resolvedHref, children }];
     }
 
-    const children = collectInlineFromChildren(element.childNodes);
+    const children = collectInlineFromChildren(element.childNodes, context);
     return children;
   }
 
@@ -232,7 +335,7 @@ function collectInlineFromNode(node: ChildNode): NoteOutputInline[] {
     return image ? [image] : [];
   }
 
-  return collectInlineFromChildren(element.childNodes);
+  return collectInlineFromChildren(element.childNodes, context);
 }
 
 function createTextInline(text: string): NoteOutputInline {
@@ -276,13 +379,17 @@ function prependPrefixToFirstParagraphBlock(blocks: NoteOutputBlock[], prefixInl
   return prefixedBlocks;
 }
 
-function collectPrefixedBlocksFromListItem(element: Element, prefixInlines: NoteOutputInline[]): NoteOutputBlock[] {
+function collectPrefixedBlocksFromListItem(
+  element: Element,
+  prefixInlines: NoteOutputInline[],
+  context: NoteOutputParseContext,
+): NoteOutputBlock[] {
   const blocks: NoteOutputBlock[] = [];
   let pendingInlineNodes: ChildNode[] = [];
   let hasPrefixedParagraph = false;
 
   const flushPendingInlineNodes = (): void => {
-    const paragraphBlocks = createParagraph(collectInlineFromChildren(pendingInlineNodes), hasPrefixedParagraph ? [] : prefixInlines);
+    const paragraphBlocks = createParagraph(collectInlineFromChildren(pendingInlineNodes, context), hasPrefixedParagraph ? [] : prefixInlines);
     pendingInlineNodes = [];
     if (paragraphBlocks.length === 0) {
       return;
@@ -315,7 +422,7 @@ function collectPrefixedBlocksFromListItem(element: Element, prefixInlines: Note
 
     flushPendingInlineNodes();
 
-    let childBlocks = collectBlocksFromNode(child);
+    let childBlocks = collectBlocksFromNode(child, context);
     if (!hasPrefixedParagraph) {
       childBlocks = prependPrefixToFirstParagraphBlock(childBlocks, prefixInlines);
       hasPrefixedParagraph = childBlocks.some((block) => block.type === "paragraph");
@@ -328,12 +435,12 @@ function collectPrefixedBlocksFromListItem(element: Element, prefixInlines: Note
   return blocks;
 }
 
-function collectStructuredListItem(element: Element): NoteOutputListItem | null {
+function collectStructuredListItem(element: Element, context: NoteOutputParseContext): NoteOutputListItem | null {
   const blocks: NoteOutputBlock[] = [];
   let pendingInlineNodes: ChildNode[] = [];
 
   const flushPendingInlineNodes = (): void => {
-    const paragraphBlocks = createParagraph(collectInlineFromChildren(pendingInlineNodes));
+    const paragraphBlocks = createParagraph(collectInlineFromChildren(pendingInlineNodes, context));
     pendingInlineNodes = [];
     if (paragraphBlocks.length === 0) {
       return;
@@ -364,7 +471,7 @@ function collectStructuredListItem(element: Element): NoteOutputListItem | null 
     }
 
     flushPendingInlineNodes();
-    blocks.push(...collectBlocksFromNode(child));
+    blocks.push(...collectBlocksFromNode(child, context));
   }
 
   flushPendingInlineNodes();
@@ -386,7 +493,7 @@ function readIntegerAttribute(element: Element, attributeName: string): number |
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function collectOrderedListBlocks(element: Element): NoteOutputBlock[] {
+function collectOrderedListBlocks(element: Element, context: NoteOutputParseContext): NoteOutputBlock[] {
   const blocks: NoteOutputBlock[] = [];
   let nextIndex = readIntegerAttribute(element, "start") ?? 1;
 
@@ -396,7 +503,7 @@ function collectOrderedListBlocks(element: Element): NoteOutputBlock[] {
     }
 
     if (child.nodeType !== Node.ELEMENT_NODE) {
-      blocks.push(...collectBlocksFromNode(child));
+      blocks.push(...collectBlocksFromNode(child, context));
       continue;
     }
 
@@ -406,20 +513,20 @@ function collectOrderedListBlocks(element: Element): NoteOutputBlock[] {
     }
 
     if (childElement.tagName.toLowerCase() !== "li") {
-      blocks.push(...collectBlocksFromNode(child));
+      blocks.push(...collectBlocksFromNode(child, context));
       continue;
     }
 
     const explicitIndex = readIntegerAttribute(childElement, "value");
     const currentIndex = explicitIndex ?? nextIndex;
-    blocks.push(...collectPrefixedBlocksFromListItem(childElement, createOrderedListPrefixInlines(currentIndex)));
+    blocks.push(...collectPrefixedBlocksFromListItem(childElement, createOrderedListPrefixInlines(currentIndex), context));
     nextIndex = currentIndex + 1;
   }
 
   return blocks;
 }
 
-function collectUnorderedListBlocks(element: Element): NoteOutputBlock[] {
+function collectUnorderedListBlocks(element: Element, context: NoteOutputParseContext): NoteOutputBlock[] {
   const blocks: NoteOutputBlock[] = [];
   const items: NoteOutputListItem[] = [];
 
@@ -429,7 +536,7 @@ function collectUnorderedListBlocks(element: Element): NoteOutputBlock[] {
     }
 
     if (child.nodeType !== Node.ELEMENT_NODE) {
-      const textBlocks = collectBlocksFromNode(child);
+      const textBlocks = collectBlocksFromNode(child, context);
       if (textBlocks.length > 0) {
         if (items.length > 0) {
           blocks.push({ type: "unorderedList", items: [...items] });
@@ -450,11 +557,11 @@ function collectUnorderedListBlocks(element: Element): NoteOutputBlock[] {
         blocks.push({ type: "unorderedList", items: [...items] });
         items.length = 0;
       }
-      blocks.push(...collectBlocksFromNode(child));
+      blocks.push(...collectBlocksFromNode(child, context));
       continue;
     }
 
-    const item = collectStructuredListItem(childElement);
+    const item = collectStructuredListItem(childElement, context);
     if (item) {
       items.push(item);
     }
@@ -467,17 +574,20 @@ function collectUnorderedListBlocks(element: Element): NoteOutputBlock[] {
   return blocks;
 }
 
-function collectBlocksFromChildren(childNodes: NodeListOf<ChildNode> | ChildNode[]): NoteOutputBlock[] {
+function collectBlocksFromChildren(
+  childNodes: NodeListOf<ChildNode> | ChildNode[],
+  context: NoteOutputParseContext,
+): NoteOutputBlock[] {
   const blocks: NoteOutputBlock[] = [];
 
   for (const child of Array.from(childNodes)) {
-    blocks.push(...collectBlocksFromNode(child));
+    blocks.push(...collectBlocksFromNode(child, context));
   }
 
   return blocks;
 }
 
-function collectBlocksFromNode(node: ChildNode): NoteOutputBlock[] {
+function collectBlocksFromNode(node: ChildNode, context: NoteOutputParseContext): NoteOutputBlock[] {
   if (node.nodeType === Node.COMMENT_NODE) {
     return [];
   }
@@ -503,27 +613,27 @@ function collectBlocksFromNode(node: ChildNode): NoteOutputBlock[] {
   }
 
   if (tagName === "ol") {
-    return collectOrderedListBlocks(element);
+    return collectOrderedListBlocks(element, context);
   }
 
   if (tagName === "ul") {
-    return collectUnorderedListBlocks(element);
+    return collectUnorderedListBlocks(element, context);
   }
 
   if (PARAGRAPH_TAGS.has(tagName)) {
-    return createParagraph(collectInlineFromChildren(element.childNodes));
+    return createParagraph(collectInlineFromChildren(element.childNodes, context));
   }
 
   if (tagName === "li") {
-    const item = collectStructuredListItem(element);
+    const item = collectStructuredListItem(element, context);
     return item ? item.blocks : [];
   }
 
   if (hasDirectBlockChildren(element)) {
-    return collectBlocksFromChildren(element.childNodes);
+    return collectBlocksFromChildren(element.childNodes, context);
   }
 
-  return createParagraph(collectInlineFromChildren(element.childNodes));
+  return createParagraph(collectInlineFromChildren(element.childNodes, context));
 }
 
 function normalizeBlocks(blocks: NoteOutputBlock[]): NoteOutputBlock[] {
@@ -548,7 +658,10 @@ function normalizeBlocks(blocks: NoteOutputBlock[]): NoteOutputBlock[] {
   return normalized;
 }
 
-export function buildNoteOutputBlocks(renderedHtml: string): NoteOutputBlock[] {
+export function buildNoteOutputBlocks(
+  renderedHtml: string,
+  linkResolver?: NoteOutputLinkResolverContext,
+): NoteOutputBlock[] {
   const documentRoot = new DOMParser().parseFromString(`<body>${renderedHtml}</body>`, "text/html");
-  return normalizeBlocks(collectBlocksFromChildren(documentRoot.body.childNodes));
+  return normalizeBlocks(collectBlocksFromChildren(documentRoot.body.childNodes, { linkResolver }));
 }

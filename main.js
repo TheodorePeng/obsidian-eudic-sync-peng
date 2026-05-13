@@ -6285,6 +6285,68 @@ function isAllowedHref(href) {
   }
   return true;
 }
+function normalizeInternalTarget(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmedValue = value.trim();
+  if (!trimmedValue || trimmedValue.startsWith("#") || getHrefScheme(trimmedValue)) {
+    return null;
+  }
+  const hashIndex = trimmedValue.indexOf("#");
+  const withoutSubpath = hashIndex >= 0 ? trimmedValue.slice(0, hashIndex) : trimmedValue;
+  const withoutMarkdownExtension = withoutSubpath.replace(/\.md$/i, "");
+  try {
+    return decodeURIComponent(withoutMarkdownExtension).trim() || null;
+  } catch {
+    return null;
+  }
+}
+function getInternalLinkTarget(element) {
+  const dataHrefTarget = normalizeInternalTarget(element.getAttribute("data-href"));
+  if (element.classList.contains("internal-link") || dataHrefTarget) {
+    return dataHrefTarget ?? normalizeInternalTarget(element.getAttribute("href"));
+  }
+  return normalizeInternalTarget(element.getAttribute("href"));
+}
+function resolveManagedInternalLinkHref(target, linkResolver) {
+  if (!linkResolver) {
+    return null;
+  }
+  const normalizedTarget = normalizeInternalTarget(target);
+  if (!normalizedTarget) {
+    return null;
+  }
+  try {
+    const file = linkResolver.app.metadataCache.getFirstLinkpathDest(normalizedTarget, linkResolver.sourcePath);
+    if (!file || file.extension !== "md") {
+      return null;
+    }
+    const kind = linkResolver.pathScope.isWordPath(file.path) ? "word" : linkResolver.pathScope.isReferencePath(file.path) ? "reference" : null;
+    if (!kind) {
+      return null;
+    }
+    const frontmatter = getFrontmatter(linkResolver.app, file);
+    if (kind === "word" && isWordSyncDisabledFrontmatter(frontmatter)) {
+      return null;
+    }
+    const linkId = readNullableString(frontmatter[FRONTMATTER_KEYS.eudicLinkId]);
+    if (!linkId) {
+      return null;
+    }
+    return buildManagedFileProtocolUrl(linkResolver.app, linkResolver.pathScope, file, linkId);
+  } catch {
+    return null;
+  }
+}
+function buildManagedInternalLinkHref(element, context) {
+  const resolver = context.linkResolver;
+  if (!resolver) {
+    return null;
+  }
+  const target = getInternalLinkTarget(element);
+  return resolveManagedInternalLinkHref(target, resolver);
+}
 function isAllowedNoteOutputImageSrc(src) {
   if (typeof src !== "string") {
     return false;
@@ -6338,14 +6400,14 @@ function hasMeaningfulInline(inlines) {
     return hasMeaningfulInline(inline.children);
   });
 }
-function collectInlineFromChildren(childNodes) {
+function collectInlineFromChildren(childNodes, context) {
   const parts = [];
   for (const child of Array.from(childNodes)) {
-    parts.push(...collectInlineFromNode(child));
+    parts.push(...collectInlineFromNode(child, context));
   }
   return parts;
 }
-function collectInlineFromNode(node) {
+function collectInlineFromNode(node, context) {
   if (node.nodeType === Node.COMMENT_NODE) {
     return [];
   }
@@ -6365,29 +6427,31 @@ function collectInlineFromNode(node) {
     return [{ type: "lineBreak" }];
   }
   if (tagName === "strong" || tagName === "b") {
-    const children = collectInlineFromChildren(element.childNodes);
+    const children = collectInlineFromChildren(element.childNodes, context);
     return hasMeaningfulInline(children) ? [{ type: "bold", children }] : [];
   }
   if (tagName === "a") {
     const href = element.getAttribute("href");
+    const managedInternalHref = buildManagedInternalLinkHref(element, context);
     const directImageChildren = Array.from(element.childNodes).filter((child) => child.nodeType === Node.ELEMENT_NODE && child.tagName.toLowerCase() === "img");
-    if (isAllowedHref(href)) {
-      const imageChildren = directImageChildren.flatMap((imageElement) => createImageInline(imageElement, href.trim())).filter((inline) => !!inline);
+    if (managedInternalHref || isAllowedHref(href)) {
+      const resolvedHref = managedInternalHref ?? href.trim();
+      const imageChildren = directImageChildren.flatMap((imageElement) => createImageInline(imageElement, resolvedHref)).filter((inline) => !!inline);
       if (imageChildren.length > 0) {
         const nonImageChildren = Array.from(element.childNodes).filter((child) => !directImageChildren.includes(child));
-        return [...imageChildren, ...collectInlineFromChildren(nonImageChildren)];
+        return [...imageChildren, ...collectInlineFromChildren(nonImageChildren, context)];
       }
-      const children2 = collectInlineFromChildren(element.childNodes);
-      return [{ type: "link", href: href.trim(), children: children2 }];
+      const children2 = collectInlineFromChildren(element.childNodes, context);
+      return [{ type: "link", href: resolvedHref, children: children2 }];
     }
-    const children = collectInlineFromChildren(element.childNodes);
+    const children = collectInlineFromChildren(element.childNodes, context);
     return children;
   }
   if (tagName === "img") {
     const image = createImageInline(element);
     return image ? [image] : [];
   }
-  return collectInlineFromChildren(element.childNodes);
+  return collectInlineFromChildren(element.childNodes, context);
 }
 function createTextInline(text) {
   return { type: "text", text };
@@ -6423,12 +6487,12 @@ function prependPrefixToFirstParagraphBlock(blocks, prefixInlines) {
   }
   return prefixedBlocks;
 }
-function collectPrefixedBlocksFromListItem(element, prefixInlines) {
+function collectPrefixedBlocksFromListItem(element, prefixInlines, context) {
   const blocks = [];
   let pendingInlineNodes = [];
   let hasPrefixedParagraph = false;
   const flushPendingInlineNodes = () => {
-    const paragraphBlocks = createParagraph(collectInlineFromChildren(pendingInlineNodes), hasPrefixedParagraph ? [] : prefixInlines);
+    const paragraphBlocks = createParagraph(collectInlineFromChildren(pendingInlineNodes, context), hasPrefixedParagraph ? [] : prefixInlines);
     pendingInlineNodes = [];
     if (paragraphBlocks.length === 0) {
       return;
@@ -6454,7 +6518,7 @@ function collectPrefixedBlocksFromListItem(element, prefixInlines) {
       continue;
     }
     flushPendingInlineNodes();
-    let childBlocks = collectBlocksFromNode(child);
+    let childBlocks = collectBlocksFromNode(child, context);
     if (!hasPrefixedParagraph) {
       childBlocks = prependPrefixToFirstParagraphBlock(childBlocks, prefixInlines);
       hasPrefixedParagraph = childBlocks.some((block) => block.type === "paragraph");
@@ -6464,11 +6528,11 @@ function collectPrefixedBlocksFromListItem(element, prefixInlines) {
   flushPendingInlineNodes();
   return blocks;
 }
-function collectStructuredListItem(element) {
+function collectStructuredListItem(element, context) {
   const blocks = [];
   let pendingInlineNodes = [];
   const flushPendingInlineNodes = () => {
-    const paragraphBlocks = createParagraph(collectInlineFromChildren(pendingInlineNodes));
+    const paragraphBlocks = createParagraph(collectInlineFromChildren(pendingInlineNodes, context));
     pendingInlineNodes = [];
     if (paragraphBlocks.length === 0) {
       return;
@@ -6493,7 +6557,7 @@ function collectStructuredListItem(element) {
       continue;
     }
     flushPendingInlineNodes();
-    blocks.push(...collectBlocksFromNode(child));
+    blocks.push(...collectBlocksFromNode(child, context));
   }
   flushPendingInlineNodes();
   const normalizedBlocks = normalizeBlocks(blocks);
@@ -6510,7 +6574,7 @@ function readIntegerAttribute(element, attributeName) {
   const parsed = Number.parseInt(rawValue, 10);
   return Number.isFinite(parsed) ? parsed : null;
 }
-function collectOrderedListBlocks(element) {
+function collectOrderedListBlocks(element, context) {
   const blocks = [];
   let nextIndex = readIntegerAttribute(element, "start") ?? 1;
   for (const child of Array.from(element.childNodes)) {
@@ -6518,7 +6582,7 @@ function collectOrderedListBlocks(element) {
       continue;
     }
     if (child.nodeType !== Node.ELEMENT_NODE) {
-      blocks.push(...collectBlocksFromNode(child));
+      blocks.push(...collectBlocksFromNode(child, context));
       continue;
     }
     const childElement = child;
@@ -6526,17 +6590,17 @@ function collectOrderedListBlocks(element) {
       continue;
     }
     if (childElement.tagName.toLowerCase() !== "li") {
-      blocks.push(...collectBlocksFromNode(child));
+      blocks.push(...collectBlocksFromNode(child, context));
       continue;
     }
     const explicitIndex = readIntegerAttribute(childElement, "value");
     const currentIndex = explicitIndex ?? nextIndex;
-    blocks.push(...collectPrefixedBlocksFromListItem(childElement, createOrderedListPrefixInlines(currentIndex)));
+    blocks.push(...collectPrefixedBlocksFromListItem(childElement, createOrderedListPrefixInlines(currentIndex), context));
     nextIndex = currentIndex + 1;
   }
   return blocks;
 }
-function collectUnorderedListBlocks(element) {
+function collectUnorderedListBlocks(element, context) {
   const blocks = [];
   const items = [];
   for (const child of Array.from(element.childNodes)) {
@@ -6544,7 +6608,7 @@ function collectUnorderedListBlocks(element) {
       continue;
     }
     if (child.nodeType !== Node.ELEMENT_NODE) {
-      const textBlocks = collectBlocksFromNode(child);
+      const textBlocks = collectBlocksFromNode(child, context);
       if (textBlocks.length > 0) {
         if (items.length > 0) {
           blocks.push({ type: "unorderedList", items: [...items] });
@@ -6563,10 +6627,10 @@ function collectUnorderedListBlocks(element) {
         blocks.push({ type: "unorderedList", items: [...items] });
         items.length = 0;
       }
-      blocks.push(...collectBlocksFromNode(child));
+      blocks.push(...collectBlocksFromNode(child, context));
       continue;
     }
-    const item = collectStructuredListItem(childElement);
+    const item = collectStructuredListItem(childElement, context);
     if (item) {
       items.push(item);
     }
@@ -6576,14 +6640,14 @@ function collectUnorderedListBlocks(element) {
   }
   return blocks;
 }
-function collectBlocksFromChildren(childNodes) {
+function collectBlocksFromChildren(childNodes, context) {
   const blocks = [];
   for (const child of Array.from(childNodes)) {
-    blocks.push(...collectBlocksFromNode(child));
+    blocks.push(...collectBlocksFromNode(child, context));
   }
   return blocks;
 }
-function collectBlocksFromNode(node) {
+function collectBlocksFromNode(node, context) {
   if (node.nodeType === Node.COMMENT_NODE) {
     return [];
   }
@@ -6603,22 +6667,22 @@ function collectBlocksFromNode(node) {
     return [{ type: "separator" }];
   }
   if (tagName === "ol") {
-    return collectOrderedListBlocks(element);
+    return collectOrderedListBlocks(element, context);
   }
   if (tagName === "ul") {
-    return collectUnorderedListBlocks(element);
+    return collectUnorderedListBlocks(element, context);
   }
   if (PARAGRAPH_TAGS.has(tagName)) {
-    return createParagraph(collectInlineFromChildren(element.childNodes));
+    return createParagraph(collectInlineFromChildren(element.childNodes, context));
   }
   if (tagName === "li") {
-    const item = collectStructuredListItem(element);
+    const item = collectStructuredListItem(element, context);
     return item ? item.blocks : [];
   }
   if (hasDirectBlockChildren(element)) {
-    return collectBlocksFromChildren(element.childNodes);
+    return collectBlocksFromChildren(element.childNodes, context);
   }
-  return createParagraph(collectInlineFromChildren(element.childNodes));
+  return createParagraph(collectInlineFromChildren(element.childNodes, context));
 }
 function normalizeBlocks(blocks) {
   const normalized = [];
@@ -6636,9 +6700,9 @@ function normalizeBlocks(blocks) {
   }
   return normalized;
 }
-function buildNoteOutputBlocks(renderedHtml) {
+function buildNoteOutputBlocks(renderedHtml, linkResolver) {
   const documentRoot = new DOMParser().parseFromString(`<body>${renderedHtml}</body>`, "text/html");
-  return normalizeBlocks(collectBlocksFromChildren(documentRoot.body.childNodes));
+  return normalizeBlocks(collectBlocksFromChildren(documentRoot.body.childNodes, { linkResolver }));
 }
 
 // src/note-output/serializer.ts
@@ -6774,8 +6838,8 @@ function serializeNoteOutputBlocks(blocks, mode) {
 }
 
 // src/note-output/index.ts
-function buildFinalNoteHtml(renderedHtml, mode) {
-  const blocks = buildNoteOutputBlocks(renderedHtml);
+function buildFinalNoteHtml(renderedHtml, mode, linkResolver) {
+  const blocks = buildNoteOutputBlocks(renderedHtml, linkResolver);
   return serializeNoteOutputBlocks(blocks, mode);
 }
 function createTextInline2(text) {
@@ -6798,8 +6862,8 @@ function buildLinkedWordHeadingBlock(word, href) {
     ]
   };
 }
-function buildFinalWordNoteHtml(renderedHtml, mode, word, href) {
-  const blocks = buildNoteOutputBlocks(renderedHtml);
+function buildFinalWordNoteHtml(renderedHtml, mode, word, href, linkResolver) {
+  const blocks = buildNoteOutputBlocks(renderedHtml, linkResolver);
   return serializeNoteOutputBlocks([buildLinkedWordHeadingBlock(word, href), ...blocks], mode);
 }
 
@@ -7142,7 +7206,12 @@ var SyncService = class {
       file.path,
       (sourcePath, embeddedFromPath) => this.getSemanticBlockTransformOptionsForSourcePath(sourcePath, embeddedFromPath, file, context.word, wordLinkId)
     );
-    const finalNoteBodyHtml = buildFinalNoteHtml(renderedHtml, settings.noteOutputMode);
+    const linkResolver = {
+      app: this.options.app,
+      pathScope: this.options.pathScope,
+      sourcePath: file.path
+    };
+    const finalNoteBodyHtml = buildFinalNoteHtml(renderedHtml, settings.noteOutputMode, linkResolver);
     if (!finalNoteBodyHtml.trim()) {
       throw new Error(EMPTY_WORD_BODY_SYNC_ERROR);
     }
@@ -7151,7 +7220,8 @@ var SyncService = class {
         renderedHtml,
         settings.noteOutputMode,
         context.word,
-        buildEudicProtocolUrl(this.options.app, "word", wordLinkId, context.word)
+        buildEudicProtocolUrl(this.options.app, "word", wordLinkId, context.word),
+        linkResolver
       )
     };
   }
