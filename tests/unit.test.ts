@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import {
+  EMPTY_EUDIC_BLOCK_OPENING_LINE,
+  buildEmptyEudicBlockInsertion,
   extractLeadingPresetKindFromList,
   normalizeEudicBlockKindsFromBody,
   transformEudicBlocksToMarkdown,
@@ -322,6 +324,35 @@ assert.equal(
     "充满；大量存在；",
     "```",
   ].join("\n"),
+);
+
+const emptyBlockCursorCh = EMPTY_EUDIC_BLOCK_OPENING_LINE.length;
+assert.deepEqual(
+  buildEmptyEudicBlockInsertion({ line: 3, ch: 2 }, "   "),
+  {
+    insertText: ["``` eudic-block kind=", "```"].join("\n"),
+    from: { line: 3, ch: 0 },
+    to: { line: 3, ch: 3 },
+    cursor: { line: 3, ch: emptyBlockCursorCh },
+  },
+);
+assert.deepEqual(
+  buildEmptyEudicBlockInsertion({ line: 1, ch: 5 }, "alpha beta"),
+  {
+    insertText: ["", "``` eudic-block kind=", "```", ""].join("\n"),
+    from: { line: 1, ch: 5 },
+    to: { line: 1, ch: 5 },
+    cursor: { line: 2, ch: emptyBlockCursorCh },
+  },
+);
+assert.deepEqual(
+  buildEmptyEudicBlockInsertion({ line: 1, ch: 10 }, "alpha beta"),
+  {
+    insertText: ["", "``` eudic-block kind=", "```"].join("\n"),
+    from: { line: 1, ch: 10 },
+    to: { line: 1, ch: 10 },
+    cursor: { line: 2, ch: emptyBlockCursorCh },
+  },
 );
 
 const semanticMarkerOptions = buildSemanticBlockTransformOptions(

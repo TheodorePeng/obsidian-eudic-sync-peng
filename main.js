@@ -1488,6 +1488,9 @@ function transformSemanticBlockBody(kind, rawBody, options) {
 var EUDIC_BLOCK_LANGUAGE = "eudic-block";
 var DEFAULT_EUDIC_BLOCK_KIND = "Cog.";
 var EUDIC_BLOCK_KIND_PRESETS = [...DEFAULT_SEMANTIC_BLOCK_KIND_PRESETS];
+var EMPTY_EUDIC_BLOCK_OPENING_LINE = `\`\`\` ${EUDIC_BLOCK_LANGUAGE} kind=`;
+var EMPTY_EUDIC_BLOCK_MARKDOWN = `${EMPTY_EUDIC_BLOCK_OPENING_LINE}
+\`\`\``;
 function normalizeMarkdown(markdown) {
   return markdown.replace(/\r\n?/g, "\n");
 }
@@ -1663,6 +1666,29 @@ ${closingLine}`;
   }
   return `${openingLine}
 ${normalizedBody}${normalizedBody.endsWith("\n") ? "" : "\n"}${closingLine}`;
+}
+function buildEmptyEudicBlockInsertion(cursor, currentLine) {
+  let from = cursor;
+  let to = cursor;
+  let insertText = EMPTY_EUDIC_BLOCK_MARKDOWN;
+  let openingLine = cursor.line;
+  if (currentLine.trim().length === 0) {
+    from = { line: cursor.line, ch: 0 };
+    to = { line: cursor.line, ch: currentLine.length };
+  } else {
+    const beforeCursor = currentLine.slice(0, cursor.ch);
+    const afterCursor = currentLine.slice(cursor.ch);
+    const needsLeadingNewline = beforeCursor.trim().length > 0;
+    const needsTrailingNewline = afterCursor.trim().length > 0;
+    insertText = `${needsLeadingNewline ? "\n" : ""}${EMPTY_EUDIC_BLOCK_MARKDOWN}${needsTrailingNewline ? "\n" : ""}`;
+    openingLine = cursor.line + (needsLeadingNewline ? 1 : 0);
+  }
+  return {
+    insertText,
+    from,
+    to,
+    cursor: { line: openingLine, ch: EMPTY_EUDIC_BLOCK_OPENING_LINE.length }
+  };
 }
 function findEudicBlockAtLine(markdown, targetLine) {
   const lines = normalizeMarkdown(markdown).split("\n");
@@ -9190,30 +9216,11 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
       const editor = view.editor;
       const cursor = editor.getCursor();
       const currentLine = editor.getLine(cursor.line);
-      const bodyPrefix = `${DEFAULT_EUDIC_BLOCK_KIND} `;
-      const blockMarkdown = buildEudicBlock(DEFAULT_EUDIC_BLOCK_KIND, bodyPrefix);
-      let from = cursor;
-      let to = cursor;
-      let insertText = blockMarkdown;
-      let openingLine = cursor.line;
-      if (currentLine.trim().length === 0) {
-        from = { line: cursor.line, ch: 0 };
-        to = { line: cursor.line, ch: currentLine.length };
-      } else {
-        const beforeCursor = currentLine.slice(0, cursor.ch);
-        const afterCursor = currentLine.slice(cursor.ch);
-        const needsLeadingNewline = beforeCursor.trim().length > 0;
-        const needsTrailingNewline = afterCursor.trim().length > 0;
-        insertText = `${needsLeadingNewline ? "\n" : ""}${blockMarkdown}${needsTrailingNewline ? "\n" : ""}`;
-        openingLine = cursor.line + (needsLeadingNewline ? 1 : 0);
-      }
-      editor.replaceRange(insertText, from, to, "eudic-sync");
-      editor.setSelection(
-        { line: openingLine + 1, ch: 0 },
-        { line: openingLine + 1, ch: DEFAULT_EUDIC_BLOCK_KIND.length }
-      );
+      const insertion = buildEmptyEudicBlockInsertion(cursor, currentLine);
+      editor.replaceRange(insertion.insertText, insertion.from, insertion.to, "eudic-sync");
+      editor.setCursor(insertion.cursor);
       editor.focus();
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: inserted a new Eudic block. Type the kind in the first line to change it.`);
+      new import_obsidian16.Notice(`${PLUGIN_NAME}: inserted a new Eudic block. Type the Eudic block kind after kind=.`);
       this.refreshUi();
     });
   }

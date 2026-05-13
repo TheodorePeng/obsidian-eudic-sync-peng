@@ -1,3 +1,4 @@
+import type { EditorPosition } from "obsidian";
 import { DEFAULT_SEMANTIC_BLOCK_KIND_PRESETS } from "./constants";
 import type { SemanticBlockTransformOptions } from "./semantic-block-transform";
 import { transformSemanticBlockBody } from "./semantic-block-transform";
@@ -6,6 +7,8 @@ import { trimBoundaryBlankLines } from "./word-body";
 export const EUDIC_BLOCK_LANGUAGE = "eudic-block";
 export const DEFAULT_EUDIC_BLOCK_KIND = "Cog.";
 export const EUDIC_BLOCK_KIND_PRESETS = [...DEFAULT_SEMANTIC_BLOCK_KIND_PRESETS] as const;
+export const EMPTY_EUDIC_BLOCK_OPENING_LINE = `\`\`\` ${EUDIC_BLOCK_LANGUAGE} kind=`;
+export const EMPTY_EUDIC_BLOCK_MARKDOWN = `${EMPTY_EUDIC_BLOCK_OPENING_LINE}\n\`\`\``;
 
 export interface ParsedEudicBlockFence {
   indent: string;
@@ -22,6 +25,13 @@ export interface EudicBlockMatch extends ParsedEudicBlockFence {
   body: string;
   openingLine: number;
   closingLine: number;
+}
+
+export interface EmptyEudicBlockInsertion {
+  insertText: string;
+  from: EditorPosition;
+  to: EditorPosition;
+  cursor: EditorPosition;
 }
 
 function normalizeMarkdown(markdown: string): string {
@@ -242,6 +252,35 @@ export function buildEudicBlock(kind: string, body: string, fenceToken = "```"):
   }
 
   return `${openingLine}\n${normalizedBody}${normalizedBody.endsWith("\n") ? "" : "\n"}${closingLine}`;
+}
+
+export function buildEmptyEudicBlockInsertion(
+  cursor: EditorPosition,
+  currentLine: string,
+): EmptyEudicBlockInsertion {
+  let from = cursor;
+  let to = cursor;
+  let insertText = EMPTY_EUDIC_BLOCK_MARKDOWN;
+  let openingLine = cursor.line;
+
+  if (currentLine.trim().length === 0) {
+    from = { line: cursor.line, ch: 0 };
+    to = { line: cursor.line, ch: currentLine.length };
+  } else {
+    const beforeCursor = currentLine.slice(0, cursor.ch);
+    const afterCursor = currentLine.slice(cursor.ch);
+    const needsLeadingNewline = beforeCursor.trim().length > 0;
+    const needsTrailingNewline = afterCursor.trim().length > 0;
+    insertText = `${needsLeadingNewline ? "\n" : ""}${EMPTY_EUDIC_BLOCK_MARKDOWN}${needsTrailingNewline ? "\n" : ""}`;
+    openingLine = cursor.line + (needsLeadingNewline ? 1 : 0);
+  }
+
+  return {
+    insertText,
+    from,
+    to,
+    cursor: { line: openingLine, ch: EMPTY_EUDIC_BLOCK_OPENING_LINE.length },
+  };
 }
 
 export function findEudicBlockAtLine(markdown: string, targetLine: number): EudicBlockAtLine | null {

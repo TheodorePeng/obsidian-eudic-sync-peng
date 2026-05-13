@@ -27,6 +27,7 @@ import {
 } from "./eudic-link";
 import {
   buildEudicBlock,
+  buildEmptyEudicBlockInsertion,
   DEFAULT_EUDIC_BLOCK_KIND,
   EUDIC_BLOCK_LANGUAGE,
   extractLeadingPresetKindFromList,
@@ -1593,33 +1594,12 @@ export default class EudicSyncPlugin extends Plugin {
       const editor = view.editor;
       const cursor = editor.getCursor();
       const currentLine = editor.getLine(cursor.line);
-      const bodyPrefix = `${DEFAULT_EUDIC_BLOCK_KIND} `;
-      const blockMarkdown = buildEudicBlock(DEFAULT_EUDIC_BLOCK_KIND, bodyPrefix);
+      const insertion = buildEmptyEudicBlockInsertion(cursor, currentLine);
 
-      let from = cursor;
-      let to = cursor;
-      let insertText = blockMarkdown;
-      let openingLine = cursor.line;
-
-      if (currentLine.trim().length === 0) {
-        from = { line: cursor.line, ch: 0 };
-        to = { line: cursor.line, ch: currentLine.length };
-      } else {
-        const beforeCursor = currentLine.slice(0, cursor.ch);
-        const afterCursor = currentLine.slice(cursor.ch);
-        const needsLeadingNewline = beforeCursor.trim().length > 0;
-        const needsTrailingNewline = afterCursor.trim().length > 0;
-        insertText = `${needsLeadingNewline ? "\n" : ""}${blockMarkdown}${needsTrailingNewline ? "\n" : ""}`;
-        openingLine = cursor.line + (needsLeadingNewline ? 1 : 0);
-      }
-
-      editor.replaceRange(insertText, from, to, "eudic-sync");
-      editor.setSelection(
-        { line: openingLine + 1, ch: 0 },
-        { line: openingLine + 1, ch: DEFAULT_EUDIC_BLOCK_KIND.length },
-      );
+      editor.replaceRange(insertion.insertText, insertion.from, insertion.to, "eudic-sync");
+      editor.setCursor(insertion.cursor);
       editor.focus();
-      new Notice(`${PLUGIN_NAME}: inserted a new Eudic block. Type the kind in the first line to change it.`);
+      new Notice(`${PLUGIN_NAME}: inserted a new Eudic block. Type the Eudic block kind after kind=.`);
       this.refreshUi();
     });
   }
