@@ -53,8 +53,11 @@ import {
   setWordSyncFrontmatterInMarkdown,
 } from "../src/word-sync-frontmatter-patch";
 import { transformMarkdownForEudicRender } from "../src/html-renderer";
+import { withRetry } from "../src/retry";
 import { resolveWordDirtySignatureDecision } from "../src/word-dirty-signature-state";
 import { getWordSyncSignature } from "../src/word-sync-signature";
+import { getSemanticSettingsSignature, SyncRenderCache } from "../src/sync-render-cache";
+import { StartupCoordinator } from "../src/startup-coordinator";
 import type { EudicStudylistCache } from "../src/types";
 import type { NoteOutputBlock } from "../src/note-output/model";
 import type { App, Editor, EditorPosition, TAbstractFile, TFile } from "obsidian";
@@ -852,6 +855,23 @@ assert.equal(
     "minimal",
   ),
   "Unsafe",
+);
+
+const goldenDynamicSyncedHtml = serializeNoteOutputBlocks(
+  buildNoteOutputBlocks(embedExternalLinkHtml, managedLinkResolver),
+  "minimal",
+);
+assert.equal(goldenDynamicSyncedHtml.includes(`<a href="${eudicWebUrl.replace(/&/g, "&amp;")}">2020-Text2-KY2</a>`), true);
+assert.equal(goldenDynamicSyncedHtml.includes("snw-link-preview"), false);
+
+const whisperEmbedHtml = [
+  '<p><a data-href="whisper" href="whisper" class="internal-link">whisper</a>',
+  ' and <a data-href="peer" href="peer" class="internal-link">classmate</a>',
+  ' plus <a href="https://example.com/source" class="external-link">source</a></p>',
+].join("");
+assert.equal(
+  serializeNoteOutputBlocks(buildNoteOutputBlocks(whisperEmbedHtml, managedLinkResolver), "minimal"),
+  '<a href="obsidian://eudic-sync?vault=English%20Peng&amp;kind=word&amp;id=w-whisper&amp;word=whisper">whisper</a> and <a href="obsidian://eudic-sync?vault=English%20Peng&amp;kind=word&amp;id=w-peer&amp;word=peer">classmate</a> plus <a href="https://example.com/source">source</a>',
 );
 
 assert.equal(
@@ -2446,6 +2466,16 @@ assert.equal(
   "**Cog.** [abound](obsidian://eudic-sync?vault=Test%20Vault&kind=word&id=w-abound&word=abound) [abundantly](obsidian://eudic-sync?vault=Test%20Vault&kind=word&id=w-abundantly&word=abundantly)",
 );
 
+const semanticCachedReferenceOptions = await semanticResolver.getTransformOptionsForSourcePath({
+  sourcePath: semanticReferenceFile.path,
+});
+assert.deepEqual(semanticCachedReferenceOptions, semanticStandaloneReferenceOptions);
+semanticResolver.invalidateReferenceLinkTargets([semanticReferenceFile.path]);
+const semanticInvalidatedReferenceOptions = await semanticResolver.getTransformOptionsForSourcePath({
+  sourcePath: semanticReferenceFile.path,
+});
+assert.deepEqual(semanticInvalidatedReferenceOptions, semanticStandaloneReferenceOptions);
+
 const semanticUnrelatedWordFile = mockFile("Eudic/Words/unrelated.md");
 semanticFiles.push(semanticUnrelatedWordFile);
 semanticFrontmatterByPath.set(semanticUnrelatedWordFile.path, {
@@ -2977,3 +3007,88 @@ const resolvedUnknownIdAssignment = await catalogResolver.resolveAssignment("en"
 assert.deepEqual(resolvedUnknownIdAssignment.ids, ["999999"]);
 assert.deepEqual(resolvedUnknownIdAssignment.names, ["999999"]);
 assert.deepEqual(resolvedUnknownIdAssignment.unknownIds, ["999999"]);
+
+const syncRenderCache = new SyncRenderCache();
+const syncRenderSettingsSignature = getSemanticSettingsSignature({
+  ...DEFAULT_SETTINGS,
+  enableSemanticBlockWordLinks: true,
+});
+const syncRenderCacheKey = {
+  wordPath: "Words/cache.md",
+  wordSignature: "body-a",
+  noteOutputMode: "minimal",
+  semanticSettingsSignature: syncRenderSettingsSignature,
+  referenceDependencySignature: "References/ref-a.md",
+};
+syncRenderCache.set(syncRenderCacheKey, "<p>cached</p>");
+assert.equal(syncRenderCache.get(syncRenderCacheKey), "<p>cached</p>");
+assert.equal(syncRenderCache.get({ ...syncRenderCacheKey, referenceDependencySignature: "References/ref-b.md" }), null);
+syncRenderCache.invalidateWord("Words/cache.md");
+assert.equal(syncRenderCache.get(syncRenderCacheKey), null);
+
+let retryAttempts = 0;
+const retryResult = await withRetry(
+  async () => {
+    retryAttempts += 1;
+    if (retryAttempts < 3) {
+      throw new Error("temporary");
+    }
+    return "ok";
+  },
+  {
+    attempts: 3,
+    initialDelayMs: 0,
+    maxDelayMs: 0,
+    shouldRetry: () => true,
+  },
+);
+assert.equal(retryResult, "ok");
+assert.equal(retryAttempts, 3);
+
+let noRetryAttempts = 0;
+await assert.rejects(
+  withRetry(
+    async () => {
+      noRetryAttempts += 1;
+      throw new Error("permanent");
+    },
+    {
+      attempts: 3,
+      initialDelayMs: 0,
+      maxDelayMs: 0,
+      shouldRetry: () => false,
+    },
+  ),
+  /permanent/,
+);
+assert.equal(noRetryAttempts, 1);
+
+const startupEvents: string[] = [];
+const startupCoordinator = new StartupCoordinator({
+  isUnloaded: () => false,
+  measure: (_label, callback) => callback(),
+  onError: (label) => startupEvents.push(`error:${label}`),
+  afterTask: () => startupEvents.push("after"),
+});
+await startupCoordinator.run([
+  {
+    label: "first",
+    run: () => {
+      startupEvents.push("first");
+    },
+  },
+  {
+    label: "second",
+    run: () => {
+      startupEvents.push("second");
+      throw new Error("boom");
+    },
+  },
+  {
+    label: "third",
+    run: () => {
+      startupEvents.push("third");
+    },
+  },
+]);
+assert.deepEqual(startupEvents, ["first", "after", "second", "error:second", "after", "third", "after"]);

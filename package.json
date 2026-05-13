@@ -1,6 +1,6 @@
 {
   "name": "eudic-sync",
-  "version": "0.6.33",
+  "version": "0.6.34",
   "private": true,
   "main": "main.js",
   "scripts": {

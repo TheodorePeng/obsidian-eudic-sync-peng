@@ -48,6 +48,7 @@ import { EudicSyncSettingTab } from "./settings";
 import { migrateLoadedSettings } from "./settings-data";
 import { EudicSyncSaveHookController } from "./save-hook-controller";
 import { StudylistService } from "./studylist-service";
+import { StartupCoordinator, type StartupTask } from "./startup-coordinator";
 import { applySyncStatusPatchToEditor, buildSyncStatusPatch } from "./sync-status-frontmatter-patch";
 import {
   applyWordSyncFrontmatterPatchToEditor,
@@ -164,6 +165,12 @@ export default class EudicSyncPlugin extends Plugin {
     },
     getReferenceMetadataWriteMode: () => this.settings.referenceMetadataWriteMode,
   });
+  private readonly startupCoordinator = new StartupCoordinator({
+    isUnloaded: () => this.isUnloaded,
+    measure: (label, callback) => this.perf.measure(label, callback),
+    onError: (label, error) => this.handleStartupTaskError(label, error),
+    afterTask: () => this.refreshUi(),
+  });
   private readonly semanticBlockAutomation = new SemanticBlockAutomationResolver({
     app: this.app,
     pathScope: this.pathScope,
@@ -264,6 +271,7 @@ export default class EudicSyncPlugin extends Plugin {
       onLayoutReady: () => {
         this.lastActiveWordPath = this.getActiveWordPath();
         this.scheduleStartupKnownPathClear();
+        this.runStartupTasks();
       },
       onEditorChange: (file, markdown, editor) => this.handleEditorChange(file, markdown, editor),
       onModify: (file) => this.handleModify(file),
@@ -321,13 +329,6 @@ export default class EudicSyncPlugin extends Plugin {
     this.commandController.registerFileMenuAction();
     this.registerProtocolHandler();
 
-    await this.perf.measure("startup.ensureReferenceFrontmatter", () => this.ensureAllReferenceManagedFrontmatter());
-    await this.perf.measure("startup.ensureWordFrontmatter", () => this.ensureAllWordManagedFrontmatter());
-    await this.perf.measure("startup.ensureStudylistFrontmatter", () => this.studylistService.ensureAllWordStudylistFrontmatter());
-    this.perf.measure("startup.captureStudylistSnapshots", () => this.studylistService.captureAllLocalSnapshots());
-    await this.perf.measure("startup.ensureNoteOutputFormatVersion", () => this.ensureCurrentNoteOutputFormatVersion());
-    await this.perf.measure("startup.captureWordSyncSignatures", () => this.captureWordSyncSignatures());
-    await this.perf.measure("startup.rebuildReferenceIndex", () => this.rebuildReferenceIndex());
     this.lastActiveWordPath = this.getActiveWordPath();
     this.refreshUi();
     this.registerVaultEventsOnLayoutReady();
@@ -442,6 +443,55 @@ export default class EudicSyncPlugin extends Plugin {
 
   private registerVaultEventsOnLayoutReady(): void {
     this.vaultEventController.registerOnLayoutReady();
+  }
+
+  private runStartupTasks(): void {
+    void this.startupCoordinator.run(this.getStartupTasks()).then(() => {
+      if (this.isUnloaded) {
+        return;
+      }
+
+      this.lastActiveWordPath = this.getActiveWordPath();
+      this.refreshUi();
+    });
+  }
+
+  private getStartupTasks(): StartupTask[] {
+    return [
+      {
+        label: "startup.ensureReferenceFrontmatter",
+        run: () => this.ensureAllReferenceManagedFrontmatter(),
+      },
+      {
+        label: "startup.ensureWordFrontmatter",
+        run: () => this.ensureAllWordManagedFrontmatter(),
+      },
+      {
+        label: "startup.ensureStudylistFrontmatter",
+        run: () => this.studylistService.ensureAllWordStudylistFrontmatter(),
+      },
+      {
+        label: "startup.captureStudylistSnapshots",
+        run: () => this.studylistService.captureAllLocalSnapshots(),
+      },
+      {
+        label: "startup.ensureNoteOutputFormatVersion",
+        run: () => this.ensureCurrentNoteOutputFormatVersion(),
+      },
+      {
+        label: "startup.captureWordSyncSignatures",
+        run: () => this.captureWordSyncSignatures(),
+      },
+      {
+        label: "startup.rebuildReferenceIndex",
+        run: () => this.rebuildReferenceIndex(),
+      },
+    ];
+  }
+
+  private handleStartupTaskError(label: string, error: unknown): void {
+    console.error(`${PLUGIN_NAME}: startup task failed (${label})`, error);
+    new Notice(`${PLUGIN_NAME}: startup task failed (${label}): ${toErrorMessage(error)}`, 8000);
   }
 
   private captureStartupKnownPaths(): void {

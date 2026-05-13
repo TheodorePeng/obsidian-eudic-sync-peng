@@ -18,6 +18,7 @@ import {
 import type { PathScope } from "./path-scope";
 import { SemanticBlockAutomationResolver, type ReferenceWordIndex } from "./semantic-block-automation-resolver";
 import type { SemanticBlockTransformOptions } from "./semantic-block-transform";
+import { getSemanticSettingsSignature, SyncRenderCache } from "./sync-render-cache";
 import type {
   DeleteEudicNoteResult,
   EudicSyncSettings,
@@ -28,6 +29,7 @@ import type {
   WordNoteContext,
 } from "./types";
 import { EMPTY_WORD_BODY_SYNC_ERROR, prepareSyncBodyMarkdown } from "./word-body";
+import { getWordSyncSignature } from "./word-sync-signature";
 import type { WordSyncFrontmatterPatchData } from "./word-sync-frontmatter-patch";
 
 interface SyncServiceOptions {
@@ -89,6 +91,7 @@ export class SyncService {
   private readonly apiClient: EudicApiClient;
   private readonly aliasSyncService: AliasSyncService;
   private readonly semanticBlockAutomation: SemanticBlockAutomationResolver;
+  private readonly renderCache = new SyncRenderCache();
 
   constructor(private readonly options: SyncServiceOptions) {
     this.renderer = new HtmlRenderer(options.app, options.pathScope);
@@ -136,6 +139,7 @@ export class SyncService {
 
   invalidateSemanticBlockReferenceCache(referencePaths?: Iterable<string>): void {
     this.semanticBlockAutomation.invalidateReferenceLinkTargets(referencePaths);
+    this.renderCache.invalidateAll();
   }
 
   async collectDirtyWords(): Promise<TFile[]> {
@@ -192,7 +196,8 @@ export class SyncService {
       const frontmatter = getFrontmatter(this.options.app, file);
       const storedAliasHash = readNullableString(frontmatter[FRONTMATTER_KEYS.lastSyncedAliasesHash]);
       const settings = this.options.getSettings();
-      const { finalNoteHtml } = await this.renderFinalWordNoteHtml(file, context, wordLinkId, settings);
+      const rawMarkdown = await this.options.app.vault.cachedRead(file);
+      const { finalNoteHtml } = await this.renderFinalWordNoteHtml(file, context, wordLinkId, settings, rawMarkdown);
       const currentHash = await sha256Hex(finalNoteHtml);
       let uploaded = false;
 
@@ -438,14 +443,33 @@ export class SyncService {
     });
   }
 
+  private getReferenceDependencySignature(file: TFile): string {
+    const references = this.options.referenceIndex?.findReferencesForWord?.(file.path) ?? [];
+    return references.join("\u0000");
+  }
+
   private async renderFinalWordNoteHtml(
     file: TFile,
     context: WordNoteContext,
     wordLinkId: string,
     settings: EudicSyncSettings,
+    rawMarkdown?: string,
   ): Promise<{ finalNoteHtml: string }> {
-    const rawMarkdown = await this.options.app.vault.cachedRead(file);
-    const normalizedMarkdown = normalizeEudicBlockKindsFromBody(rawMarkdown, settings.semanticBlockKindPresets);
+    const sourceMarkdown = rawMarkdown ?? await this.options.app.vault.cachedRead(file);
+    const wordSignature = getWordSyncSignature(sourceMarkdown);
+    const cacheKey = {
+      wordPath: file.path,
+      wordSignature,
+      noteOutputMode: settings.noteOutputMode,
+      semanticSettingsSignature: getSemanticSettingsSignature(settings),
+      referenceDependencySignature: this.getReferenceDependencySignature(file),
+    };
+    const cachedFinalNoteHtml = this.renderCache.get(cacheKey);
+    if (cachedFinalNoteHtml !== null) {
+      return { finalNoteHtml: cachedFinalNoteHtml };
+    }
+
+    const normalizedMarkdown = normalizeEudicBlockKindsFromBody(sourceMarkdown, settings.semanticBlockKindPresets);
 
     const syncBodyMarkdown = prepareSyncBodyMarkdown(normalizedMarkdown.markdown);
     if (!syncBodyMarkdown) {
@@ -465,15 +489,15 @@ export class SyncService {
       throw new Error(EMPTY_WORD_BODY_SYNC_ERROR);
     }
 
-    return {
-      finalNoteHtml: buildFinalWordNoteHtml(
+    const finalNoteHtml = buildFinalWordNoteHtml(
         renderedHtml,
         settings.noteOutputMode,
         context.word,
         buildEudicProtocolUrl(this.options.app, "word", wordLinkId, context.word),
         linkResolver,
-      ),
-    };
+      );
+    this.renderCache.set(cacheKey, finalNoteHtml);
+    return { finalNoteHtml };
   }
 
   private async isWordContentSynced(file: TFile): Promise<boolean> {

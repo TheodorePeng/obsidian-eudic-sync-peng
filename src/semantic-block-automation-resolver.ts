@@ -20,6 +20,7 @@ import type { EudicSyncSettings } from "./types";
 
 export interface ReferenceWordIndex {
   findWordsReferencing(referencePath: string): string[];
+  findReferencesForWord?(wordPath: string): string[];
   readReferencePropertyWordPaths?(referencePath: string): string[];
   repairReferenceMetadataForReference?(
     referencePath: string,
@@ -52,6 +53,11 @@ interface ReferenceSemanticTargets {
   linkTargets: SemanticBlockLinkTarget[];
 }
 
+interface ReferenceSemanticTargetsCacheEntry {
+  referencePath: string;
+  targets: ReferenceSemanticTargets;
+}
+
 function normalizeResolverPath(path: string): string {
   return path.trim().replace(/\\/g, "/").replace(/\/+/g, "/");
 }
@@ -72,10 +78,19 @@ function buildWordProtocolUrl(app: App, id: string, word: string): string {
 }
 
 export class SemanticBlockAutomationResolver {
+  private readonly referenceTargetsByPath = new Map<string, ReferenceSemanticTargetsCacheEntry>();
+
   constructor(private readonly options: SemanticBlockAutomationResolverOptions) {}
 
   invalidateReferenceLinkTargets(referencePaths?: Iterable<string>): void {
-    void referencePaths;
+    if (!referencePaths) {
+      this.referenceTargetsByPath.clear();
+      return;
+    }
+
+    for (const referencePath of referencePaths) {
+      this.referenceTargetsByPath.delete(normalizeResolverPath(referencePath));
+    }
   }
 
   async getTransformOptionsForSourcePath(resolveOptions: SemanticBlockResolveOptions): Promise<SemanticBlockTransformOptions | null> {
@@ -110,7 +125,23 @@ export class SemanticBlockAutomationResolver {
     referenceFile: TFile,
     resolveOptions: SemanticBlockResolveOptions,
   ): Promise<ReferenceSemanticTargets> {
-    return this.resolveReferenceSemanticTargets(referenceFile, resolveOptions);
+    if (resolveOptions.currentWordFile || resolveOptions.currentWord || resolveOptions.currentWordLinkId || resolveOptions.embeddedFromPath) {
+      return this.resolveReferenceSemanticTargets(referenceFile, resolveOptions);
+    }
+
+    const normalizedPath = normalizeResolverPath(referenceFile.path);
+    const cached = this.referenceTargetsByPath.get(normalizedPath);
+    if (cached) {
+      return Promise.resolve(cached.targets);
+    }
+
+    return this.resolveReferenceSemanticTargets(referenceFile, resolveOptions).then((targets) => {
+      this.referenceTargetsByPath.set(normalizedPath, {
+        referencePath: normalizedPath,
+        targets,
+      });
+      return targets;
+    });
   }
 
   private async resolveReferenceSemanticTargets(
