@@ -5682,7 +5682,7 @@ function compareAliasNames(left, right) {
 }
 function buildAliasRedirectNoteHtml(app, pathScope, file, mainWord, wordLinkId) {
   const href = buildManagedObsidianUrl(app, pathScope, file, wordLinkId);
-  return `See main entry: ${buildLinkedWordHtml(mainWord, href)}`;
+  return `See detail: ${buildLinkedWordHtml(mainWord, href)}`;
 }
 function toErrorMessage5(error) {
   if (error instanceof Error) {
@@ -6083,11 +6083,95 @@ function waitForFrame() {
     window.requestAnimationFrame(() => resolve());
   });
 }
+function normalizeMarkdown3(markdown) {
+  return markdown.replace(/\r\n?/g, "\n");
+}
 function resolveSemanticOptions(source, sourcePath, embeddedFromPath) {
   if (!source) {
     return null;
   }
   return typeof source === "function" ? source(sourcePath, embeddedFromPath) : source;
+}
+async function expandReferenceSegments(app, pathScope, markdown, sourcePath, embeddedFromPath) {
+  return pathScope ? expandManagedReferenceEmbedsInMarkdownSegments(app, pathScope, markdown, sourcePath, /* @__PURE__ */ new Set(), 0, embeddedFromPath) : [{ markdown, sourcePath, embeddedFromPath }];
+}
+async function transformRegularMarkdownForEudicRender(app, pathScope, markdown, sourcePath, semanticOptions, embeddedFromPath) {
+  const segments = await expandReferenceSegments(app, pathScope, markdown, sourcePath, embeddedFromPath);
+  const transformedMarkdownSegments = [];
+  for (const segment of segments) {
+    transformedMarkdownSegments.push(
+      transformEudicBlocksToMarkdown(
+        segment.markdown,
+        await resolveSemanticOptions(semanticOptions, segment.sourcePath, segment.embeddedFromPath)
+      )
+    );
+  }
+  return transformedMarkdownSegments.join("");
+}
+async function transformEudicBlockForRender(app, pathScope, kind, body, sourcePath, semanticOptions) {
+  const bodySegments = await expandReferenceSegments(app, pathScope, body, sourcePath);
+  const transformedBodySegments = [];
+  for (const segment of bodySegments) {
+    const resolvedOptions = await resolveSemanticOptions(semanticOptions, segment.sourcePath, segment.embeddedFromPath);
+    transformedBodySegments.push(
+      resolvedOptions ? transformSemanticBlockBody(kind, segment.markdown, resolvedOptions) : segment.markdown
+    );
+  }
+  return renderEudicBlockToMarkdown(kind, transformedBodySegments.join(""), null);
+}
+async function transformMarkdownForEudicRender(app, pathScope, markdown, sourcePath, semanticOptions) {
+  const normalizedMarkdown = normalizeMarkdown3(markdown);
+  const lines = normalizedMarkdown.split("\n");
+  const output = [];
+  let regularLines = [];
+  const flushRegularLines = async () => {
+    if (regularLines.length === 0) {
+      return;
+    }
+    output.push(
+      await transformRegularMarkdownForEudicRender(
+        app,
+        pathScope,
+        regularLines.join("\n"),
+        sourcePath,
+        semanticOptions
+      )
+    );
+    regularLines = [];
+  };
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const currentLine = lines[lineIndex] ?? "";
+    const openingFence = parseEudicBlockFenceLine(currentLine);
+    if (!openingFence) {
+      regularLines.push(currentLine);
+      continue;
+    }
+    let closingLineIndex = null;
+    for (let candidateIndex = lineIndex + 1; candidateIndex < lines.length; candidateIndex += 1) {
+      if (isClosingEudicBlockFenceLine2(lines[candidateIndex] ?? "", openingFence.fenceToken)) {
+        closingLineIndex = candidateIndex;
+        break;
+      }
+    }
+    if (closingLineIndex === null) {
+      regularLines.push(currentLine);
+      continue;
+    }
+    await flushRegularLines();
+    output.push(
+      await transformEudicBlockForRender(
+        app,
+        pathScope,
+        openingFence.kind,
+        lines.slice(lineIndex + 1, closingLineIndex).join("\n"),
+        sourcePath,
+        semanticOptions
+      )
+    );
+    lineIndex = closingLineIndex;
+  }
+  await flushRegularLines();
+  return output.join("\n");
 }
 var HtmlRenderer = class {
   constructor(app, pathScope) {
@@ -6103,17 +6187,13 @@ var HtmlRenderer = class {
     const container = document.createElement("div");
     const component = new import_obsidian12.Component();
     component.load();
-    const segments = this.pathScope ? await expandManagedReferenceEmbedsInMarkdownSegments(this.app, this.pathScope, markdown, sourcePath) : [{ markdown, sourcePath }];
-    const transformedMarkdownSegments = [];
-    for (const segment of segments) {
-      transformedMarkdownSegments.push(
-        transformEudicBlocksToMarkdown(
-          segment.markdown,
-          await resolveSemanticOptions(semanticOptions, segment.sourcePath, segment.embeddedFromPath)
-        )
-      );
-    }
-    const transformedMarkdown = transformedMarkdownSegments.join("");
+    const transformedMarkdown = await transformMarkdownForEudicRender(
+      this.app,
+      this.pathScope,
+      markdown,
+      sourcePath,
+      semanticOptions
+    );
     const renderableMarkdown = protectLeadingThematicBreakFromFrontmatter(transformedMarkdown);
     try {
       await import_obsidian12.MarkdownRenderer.render(this.app, renderableMarkdown, container, sourcePath, component);
@@ -6599,6 +6679,43 @@ function renderInlines(inlines, mode) {
   const rendered = inlines.map((inline) => renderInline(inline, mode)).join("");
   return normalizeInlineOutput(rendered, mode);
 }
+function getPlainInlineText(inline) {
+  switch (inline.type) {
+    case "text":
+      return inline.text;
+    case "bold": {
+      let text = "";
+      for (const child of inline.children) {
+        const childText = getPlainInlineText(child);
+        if (childText === null) {
+          return null;
+        }
+        text += childText;
+      }
+      return text;
+    }
+    case "lineBreak":
+    case "link":
+    case "image":
+      return null;
+  }
+}
+function isOrderedListMarkerParagraph(block) {
+  if (block.type !== "paragraph") {
+    return false;
+  }
+  let text = "";
+  let hasBoldMarker = false;
+  for (const inline of block.inlines) {
+    const inlineText = getPlainInlineText(inline);
+    if (inlineText === null) {
+      return false;
+    }
+    text += inlineText;
+    hasBoldMarker ||= inline.type === "bold";
+  }
+  return hasBoldMarker && /^\d+\.$/.test(text.trim());
+}
 function getUnorderedListPadding(depth) {
   return depth === 0 ? "1.1em" : "1em";
 }
@@ -6628,6 +6745,9 @@ function renderBlock(block, mode, depth) {
   }
 }
 function getBlockJoiner(previous, next, mode) {
+  if (isOrderedListMarkerParagraph(previous) && next.type === "paragraph") {
+    return " ";
+  }
   if (mode === "minimal") {
     return "\n";
   }

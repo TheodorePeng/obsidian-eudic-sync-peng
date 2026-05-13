@@ -45,7 +45,7 @@ function compareAliasNames(left: string, right: string): number {
 
 function buildAliasRedirectNoteHtml(app: App, pathScope: PathScope, file: TFile, mainWord: string, wordLinkId: string): string {
   const href = buildManagedObsidianUrl(app, pathScope, file, wordLinkId);
-  return `See main entry: ${buildLinkedWordHtml(mainWord, href)}`;
+  return `See detail: ${buildLinkedWordHtml(mainWord, href)}`;
 }
 
 function toErrorMessage(error: unknown): string {

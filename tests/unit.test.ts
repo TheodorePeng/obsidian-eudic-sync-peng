@@ -50,6 +50,7 @@ import {
   buildWordSyncFrontmatterPatch,
   setWordSyncFrontmatterInMarkdown,
 } from "../src/word-sync-frontmatter-patch";
+import { transformMarkdownForEudicRender } from "../src/html-renderer";
 import { resolveWordDirtySignatureDecision } from "../src/word-dirty-signature-state";
 import { getWordSyncSignature } from "../src/word-sync-signature";
 import type { EudicStudylistCache } from "../src/types";
@@ -604,6 +605,48 @@ assert.equal(
         type: "paragraph",
         inlines: [
           {
+            type: "bold",
+            children: [{ type: "text", text: "1." }],
+          },
+        ],
+      },
+      {
+        type: "paragraph",
+        inlines: [
+          {
+            type: "bold",
+            children: [{ type: "text", text: "aged" }],
+          },
+          { type: "text", text: " a. 年迈的；" },
+        ],
+      },
+      {
+        type: "paragraph",
+        inlines: [
+          {
+            type: "bold",
+            children: [{ type: "text", text: "2." }],
+          },
+          { type: "text", text: " " },
+        ],
+      },
+      {
+        type: "paragraph",
+        inlines: [{ type: "text", text: "aging a. 老化的；" }],
+      },
+    ],
+    "minimal",
+  ),
+  "<b>1.</b> <b>aged</b> a. 年迈的；\n<b>2.</b> aging a. 老化的；",
+);
+
+assert.equal(
+  serializeNoteOutputBlocks(
+    [
+      {
+        type: "paragraph",
+        inlines: [
+          {
             type: "image",
             src: "https://cdn.jsdelivr.net/gh/TheodorePeng/myimage@main/img/20260504112642050.PNG",
             href: "https://cdn.jsdelivr.net/gh/TheodorePeng/myimage@main/img/20260504112642050.PNG",
@@ -651,6 +694,180 @@ function mockFile(path: string): TFile {
     extension: "md",
   } as TFile;
 }
+
+const renderWordFile = mockFile("Eudic/Words/affair.md");
+const renderReferenceFile = mockFile("Eudic/References/ref-render.md");
+const renderFiles = [renderWordFile, renderReferenceFile];
+const renderFrontmatterByPath = new Map<string, Record<string, unknown>>([
+  [
+    renderWordFile.path,
+    {
+      word: "affair",
+      eudic_link_id: "w-affair",
+      sync_eudic_enabled: true,
+      reference_paths: ["References/ref-render"],
+    },
+  ],
+  [
+    renderReferenceFile.path,
+    {
+      referenced_by: [renderWordFile.path],
+    },
+  ],
+]);
+const renderMarkdownByPath = new Map<string, string>([
+  [
+    renderReferenceFile.path,
+    [
+      "---",
+      "eudic_link_id: r-render",
+      "---",
+      "",
+      "e.g. His affair with a slave **stained** his **prestige**. 他与奴隶的婚外情玷污了他的声望。@2008-Text 4-KY #题目",
+      "^ref-render-main",
+    ].join("\n"),
+  ],
+]);
+const renderApp = {
+  vault: {
+    getName: () => "English Peng",
+    getMarkdownFiles: () => renderFiles,
+    getFileByPath: (path: string) => renderFiles.find((file) => file.path === path) ?? null,
+    cachedRead: async (file: TFile) => renderMarkdownByPath.get(file.path) ?? "",
+  },
+  metadataCache: {
+    getFileCache: (file: TFile) => ({ frontmatter: renderFrontmatterByPath.get(file.path) ?? {} }),
+    getFirstLinkpathDest: (linkpath: string) => (linkpath.includes("ref-render") ? renderReferenceFile : null),
+  },
+} as unknown as App;
+const renderPathScope = {
+  isWordPath: (path: string) => path.startsWith("Eudic/Words/"),
+  isReferencePath: (path: string) => path.startsWith("Eudic/References/"),
+  getPrimaryReferenceFolderPath: () => "Eudic/References",
+  resolveStoredReferenceStemToVaultPath: (storedRef: string) => {
+    const normalized = storedRef.replace(/\.md$/i, "");
+    if (normalized.startsWith("References/")) {
+      return `Eudic/${normalized}`;
+    }
+    if (normalized.startsWith("Eudic/References/")) {
+      return normalized;
+    }
+    return null;
+  },
+} as never;
+const renderManagedFiles = new ManagedFileRegistry(renderApp, renderPathScope);
+renderManagedFiles.rebuild();
+const renderSemanticSettings = {
+  ...DEFAULT_SETTINGS,
+  enableSemanticBlockWordBold: true,
+  semanticBlockWordBoldKinds: ["n."],
+  enableSemanticBlockMarkerBold: false,
+  enableSemanticBlockWordLinks: false,
+};
+const renderSemanticResolver = new SemanticBlockAutomationResolver({
+  app: renderApp,
+  pathScope: renderPathScope,
+  managedFiles: renderManagedFiles,
+  getSettings: () => renderSemanticSettings,
+});
+const renderResolverCalls: Array<{ sourcePath: string; embeddedFromPath?: string }> = [];
+const eudicBlockWithReferenceEmbed = await transformMarkdownForEudicRender(
+  renderApp,
+  renderPathScope,
+  [
+    "``` eudic-block kind=n.",
+    "婚外情；",
+    "![[References/ref-render#^ref-render-main]]",
+    "```",
+  ].join("\n"),
+  renderWordFile.path,
+  (sourcePath, embeddedFromPath) => {
+    renderResolverCalls.push({ sourcePath, embeddedFromPath });
+    return renderSemanticResolver.getTransformOptionsForSourcePath({
+      sourcePath,
+      embeddedFromPath,
+      currentWordFile: renderWordFile,
+      currentWord: "affair",
+      currentWordLinkId: "w-affair",
+    });
+  },
+);
+assert.equal(
+  eudicBlockWithReferenceEmbed,
+  [
+    "**n.** 婚外情；",
+    "e.g. His **affair** with a slave **stained** his **prestige**. 他与奴隶的婚外情玷污了他的声望。@2008-Text 4-KY #题目",
+  ].join("\n"),
+);
+assert.equal(eudicBlockWithReferenceEmbed.includes("![[References/ref-render"), false);
+assert.equal(eudicBlockWithReferenceEmbed.includes("```"), false);
+assert.equal(eudicBlockWithReferenceEmbed.includes("^ref-render-main"), false);
+assert.equal(
+  renderResolverCalls.some(
+    (call) => call.sourcePath === renderReferenceFile.path && call.embeddedFromPath === renderWordFile.path,
+  ),
+  true,
+);
+
+renderSemanticSettings.enableSemanticBlockWordBold = false;
+assert.equal(
+  await transformMarkdownForEudicRender(
+    renderApp,
+    renderPathScope,
+    [
+      "``` eudic-block kind=n.",
+      "婚外情；",
+      "![[References/ref-render#^ref-render-main]]",
+      "```",
+    ].join("\n"),
+    renderWordFile.path,
+    (sourcePath, embeddedFromPath) =>
+      renderSemanticResolver.getTransformOptionsForSourcePath({
+        sourcePath,
+        embeddedFromPath,
+        currentWordFile: renderWordFile,
+        currentWord: "affair",
+        currentWordLinkId: "w-affair",
+      }),
+  ),
+  [
+    "**n.** 婚外情；",
+    "e.g. His affair with a slave **stained** his **prestige**. 他与奴隶的婚外情玷污了他的声望。@2008-Text 4-KY #题目",
+  ].join("\n"),
+);
+renderSemanticSettings.enableSemanticBlockWordBold = true;
+
+assert.equal(
+  await transformMarkdownForEudicRender(
+    renderApp,
+    renderPathScope,
+    ["``` eudic-block kind=n.", "事情/事件；事务；", "```"].join("\n"),
+    renderWordFile.path,
+  ),
+  "**n.** 事情/事件；事务；",
+);
+assert.equal(
+  await transformMarkdownForEudicRender(
+    renderApp,
+    renderPathScope,
+    ["Before", "![[References/ref-render#^ref-render-main]]", "After"].join("\n"),
+    renderWordFile.path,
+  ),
+  [
+    "Before",
+    "e.g. His affair with a slave **stained** his **prestige**. 他与奴隶的婚外情玷污了他的声望。@2008-Text 4-KY #题目",
+    "After",
+  ].join("\n"),
+);
+assert.equal(
+  await transformMarkdownForEudicRender(
+    renderApp,
+    renderPathScope,
+    ["``` eudic-block kind=n.", "![[References/missing#^missing-main]]", "```"].join("\n"),
+    renderWordFile.path,
+  ),
+  "**n.** ![[References/missing#^missing-main]]",
+);
 
 const overrideFile = mockFile("Eudic/Words/assemble.md");
 const overrideStore = new WordStatusOverrideStore();

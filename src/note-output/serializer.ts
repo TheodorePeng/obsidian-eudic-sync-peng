@@ -55,6 +55,48 @@ function renderInlines(inlines: NoteOutputInline[], mode: EudicNoteOutputMode): 
   return normalizeInlineOutput(rendered, mode);
 }
 
+function getPlainInlineText(inline: NoteOutputInline): string | null {
+  switch (inline.type) {
+    case "text":
+      return inline.text;
+    case "bold": {
+      let text = "";
+      for (const child of inline.children) {
+        const childText = getPlainInlineText(child);
+        if (childText === null) {
+          return null;
+        }
+        text += childText;
+      }
+      return text;
+    }
+    case "lineBreak":
+    case "link":
+    case "image":
+      return null;
+  }
+}
+
+function isOrderedListMarkerParagraph(block: NoteOutputBlock): boolean {
+  if (block.type !== "paragraph") {
+    return false;
+  }
+
+  let text = "";
+  let hasBoldMarker = false;
+  for (const inline of block.inlines) {
+    const inlineText = getPlainInlineText(inline);
+    if (inlineText === null) {
+      return false;
+    }
+
+    text += inlineText;
+    hasBoldMarker ||= inline.type === "bold";
+  }
+
+  return hasBoldMarker && /^\d+\.$/.test(text.trim());
+}
+
 function getUnorderedListPadding(depth: number): string {
   return depth === 0 ? "1.1em" : "1em";
 }
@@ -94,6 +136,10 @@ function renderBlock(block: NoteOutputBlock, mode: EudicNoteOutputMode, depth: n
 }
 
 function getBlockJoiner(previous: NoteOutputBlock, next: NoteOutputBlock, mode: EudicNoteOutputMode): string {
+  if (isOrderedListMarkerParagraph(previous) && next.type === "paragraph") {
+    return " ";
+  }
+
   if (mode === "minimal") {
     return "\n";
   }
