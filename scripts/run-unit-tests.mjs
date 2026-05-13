@@ -3,11 +3,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import esbuild from "esbuild";
+import { DOMParser, Node } from "linkedom";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const tempDir = await mkdtemp(join(tmpdir(), "eudic-sync-tests-"));
 const entrypoint = join(tempDir, "all-tests.mjs");
 const outfile = join(tempDir, "unit-tests.mjs");
+
+globalThis.DOMParser = DOMParser;
+globalThis.Node = Node;
 
 try {
   const testFiles = (await readdir(join(root, "tests")))

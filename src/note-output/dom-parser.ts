@@ -29,6 +29,27 @@ const BLOCK_TAGS = new Set([
 ]);
 
 const PARAGRAPH_TAGS = new Set(["blockquote", "h1", "h2", "h3", "h4", "h5", "h6", "p", "pre"]);
+const INLINE_TAGS = new Set([
+  "a",
+  "abbr",
+  "b",
+  "br",
+  "cite",
+  "code",
+  "em",
+  "i",
+  "img",
+  "kbd",
+  "mark",
+  "s",
+  "small",
+  "span",
+  "strong",
+  "sub",
+  "sup",
+  "time",
+  "u",
+]);
 const STRIP_TAGS = new Set(["script", "style"]);
 const STRIP_CLASSES = new Set([
   "copy-code-button",
@@ -242,6 +263,11 @@ function hasDirectBlockChildren(element: Element): boolean {
     const tagName = childElement.tagName.toLowerCase();
     return tagName === "hr" || BLOCK_TAGS.has(tagName);
   });
+}
+
+function isBlockChildElement(element: Element): boolean {
+  const tagName = element.tagName.toLowerCase();
+  return tagName === "hr" || (!INLINE_TAGS.has(tagName) && BLOCK_TAGS.has(tagName));
 }
 
 function hasMeaningfulInline(inlines: NoteOutputInline[]): boolean {
@@ -579,11 +605,42 @@ function collectBlocksFromChildren(
   context: NoteOutputParseContext,
 ): NoteOutputBlock[] {
   const blocks: NoteOutputBlock[] = [];
+  let pendingInlineNodes: ChildNode[] = [];
+
+  const flushPendingInlineNodes = (): void => {
+    if (pendingInlineNodes.length === 0) {
+      return;
+    }
+
+    blocks.push(...createParagraph(collectInlineFromChildren(pendingInlineNodes, context)));
+    pendingInlineNodes = [];
+  };
 
   for (const child of Array.from(childNodes)) {
+    if (child.nodeType === Node.COMMENT_NODE) {
+      continue;
+    }
+
+    if (child.nodeType !== Node.ELEMENT_NODE) {
+      pendingInlineNodes.push(child);
+      continue;
+    }
+
+    const childElement = child as Element;
+    if (shouldStripElement(childElement)) {
+      continue;
+    }
+
+    if (!isBlockChildElement(childElement)) {
+      pendingInlineNodes.push(child);
+      continue;
+    }
+
+    flushPendingInlineNodes();
     blocks.push(...collectBlocksFromNode(child, context));
   }
 
+  flushPendingInlineNodes();
   return blocks;
 }
 
@@ -662,6 +719,6 @@ export function buildNoteOutputBlocks(
   renderedHtml: string,
   linkResolver?: NoteOutputLinkResolverContext,
 ): NoteOutputBlock[] {
-  const documentRoot = new DOMParser().parseFromString(`<body>${renderedHtml}</body>`, "text/html");
+  const documentRoot = new DOMParser().parseFromString(`<html><body>${renderedHtml}</body></html>`, "text/html");
   return normalizeBlocks(collectBlocksFromChildren(documentRoot.body.childNodes, { linkResolver }));
 }

@@ -17,7 +17,7 @@ import {
   mergeSemanticBlockLinkTargets,
 } from "../src/semantic-block-transform";
 import { serializeNoteOutputBlocks } from "../src/note-output/serializer";
-import { isAllowedNoteOutputImageSrc, resolveManagedInternalLinkHref } from "../src/note-output/dom-parser";
+import { buildNoteOutputBlocks, isAllowedNoteOutputImageSrc, resolveManagedInternalLinkHref } from "../src/note-output/dom-parser";
 import { resolveManagedReferencePath } from "../src/reference-links";
 import {
   collectReferenceUsageWordPaths,
@@ -807,6 +807,52 @@ assert.equal(resolveManagedInternalLinkHref("missing-id", managedLinkResolver), 
 assert.equal(resolveManagedInternalLinkHref("Material/2012 Text 1", managedLinkResolver), null);
 assert.equal(resolveManagedInternalLinkHref("https://example.com", managedLinkResolver), null);
 assert.equal(resolveManagedInternalLinkHref("%E0%A4%A", managedLinkResolver), null);
+
+const eudicWebUrl = "https://cn.eudic.net/ting/openArticle?id=b8e3892d-353d-11eb-9e86-00505686c5e6&timestamp=00:58.06";
+const embedExternalLinkHtml = [
+  '<p dir="auto">',
+  '<span alt="2020-Text2-KY2 > ^3uck1t" src="2020-Text2-KY2#^3uck1t" class="internal-embed markdown-embed inline-embed is-loaded"></span>',
+  '<div class="embed-title markdown-embed-title"></div>',
+  '<div class="markdown-embed-content">',
+  '<div class="markdown-preview-view markdown-rendered show-indentation-guide">',
+  '<p dir="auto">',
+  "e.g. The efforts of America's highest-earning 1% have been one of the more ",
+  '<a data-href="dynamic" href="dynamic" class="internal-link" target="_blank" rel="noopener nofollow">dynamic</a>',
+  '<div class="snw-link-preview"><div class="snw-reference snw-link snw-liveupdate" data-snw-type="link">2</div></div>',
+  " elements of the global economy. 美国收入最高的 1% 的人的努力一直是全球经济中比较活跃的因素之一。 @",
+  `<a data-tooltip-position="top" aria-label="${eudicWebUrl.replace(/&/g, "&amp;")}" rel="noopener nofollow" class="external-link" href="${eudicWebUrl.replace(/&/g, "&amp;")}" target="_blank">2020-Text2-KY2</a>`,
+  "</p>",
+  "</div>",
+  "</div>",
+  '<div class="snw-embed-preview"><div class="snw-reference snw-embed snw-liveupdate" data-snw-type="embed">1</div></div>',
+  "</p>",
+].join("");
+assert.equal(
+  serializeNoteOutputBlocks(buildNoteOutputBlocks(embedExternalLinkHtml, managedLinkResolver), "minimal").includes(
+    `<a href="${eudicWebUrl.replace(/&/g, "&amp;")}">2020-Text2-KY2</a>`,
+  ),
+  true,
+);
+assert.equal(
+  serializeNoteOutputBlocks(buildNoteOutputBlocks(embedExternalLinkHtml, managedLinkResolver), "minimal").includes("snw-link-preview"),
+  false,
+);
+assert.equal(
+  serializeNoteOutputBlocks(
+    buildNoteOutputBlocks(
+      '<div><a class="external-link" href="https://example.com/path?x=1&amp;y=2">Example</a><p>tail</p></div>',
+    ),
+    "minimal",
+  ),
+  '<a href="https://example.com/path?x=1&amp;y=2">Example</a>\ntail',
+);
+assert.equal(
+  serializeNoteOutputBlocks(
+    buildNoteOutputBlocks('<div><a class="external-link" href="javascript:alert(1)">Unsafe</a></div>'),
+    "minimal",
+  ),
+  "Unsafe",
+);
 
 assert.equal(
   serializeNoteOutputBlocks(

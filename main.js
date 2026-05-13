@@ -6255,6 +6255,27 @@ var BLOCK_TAGS = /* @__PURE__ */ new Set([
   "ul"
 ]);
 var PARAGRAPH_TAGS = /* @__PURE__ */ new Set(["blockquote", "h1", "h2", "h3", "h4", "h5", "h6", "p", "pre"]);
+var INLINE_TAGS = /* @__PURE__ */ new Set([
+  "a",
+  "abbr",
+  "b",
+  "br",
+  "cite",
+  "code",
+  "em",
+  "i",
+  "img",
+  "kbd",
+  "mark",
+  "s",
+  "small",
+  "span",
+  "strong",
+  "sub",
+  "sup",
+  "time",
+  "u"
+]);
 var STRIP_TAGS = /* @__PURE__ */ new Set(["script", "style"]);
 var STRIP_CLASSES = /* @__PURE__ */ new Set([
   "copy-code-button",
@@ -6411,6 +6432,10 @@ function hasDirectBlockChildren(element) {
     const tagName = childElement.tagName.toLowerCase();
     return tagName === "hr" || BLOCK_TAGS.has(tagName);
   });
+}
+function isBlockChildElement(element) {
+  const tagName = element.tagName.toLowerCase();
+  return tagName === "hr" || !INLINE_TAGS.has(tagName) && BLOCK_TAGS.has(tagName);
 }
 function hasMeaningfulInline(inlines) {
   return inlines.some((inline) => {
@@ -6668,9 +6693,34 @@ function collectUnorderedListBlocks(element, context) {
 }
 function collectBlocksFromChildren(childNodes, context) {
   const blocks = [];
+  let pendingInlineNodes = [];
+  const flushPendingInlineNodes = () => {
+    if (pendingInlineNodes.length === 0) {
+      return;
+    }
+    blocks.push(...createParagraph(collectInlineFromChildren(pendingInlineNodes, context)));
+    pendingInlineNodes = [];
+  };
   for (const child of Array.from(childNodes)) {
+    if (child.nodeType === Node.COMMENT_NODE) {
+      continue;
+    }
+    if (child.nodeType !== Node.ELEMENT_NODE) {
+      pendingInlineNodes.push(child);
+      continue;
+    }
+    const childElement = child;
+    if (shouldStripElement(childElement)) {
+      continue;
+    }
+    if (!isBlockChildElement(childElement)) {
+      pendingInlineNodes.push(child);
+      continue;
+    }
+    flushPendingInlineNodes();
     blocks.push(...collectBlocksFromNode(child, context));
   }
+  flushPendingInlineNodes();
   return blocks;
 }
 function collectBlocksFromNode(node, context) {
@@ -6727,7 +6777,7 @@ function normalizeBlocks(blocks) {
   return normalized;
 }
 function buildNoteOutputBlocks(renderedHtml, linkResolver) {
-  const documentRoot = new DOMParser().parseFromString(`<body>${renderedHtml}</body>`, "text/html");
+  const documentRoot = new DOMParser().parseFromString(`<html><body>${renderedHtml}</body></html>`, "text/html");
   return normalizeBlocks(collectBlocksFromChildren(documentRoot.body.childNodes, { linkResolver }));
 }
 
