@@ -61,6 +61,8 @@ const STRIP_CLASSES = new Set([
   "mod-header",
   "mod-footer",
   "snw-block-preview",
+  "snw-embed-preview",
+  "snw-link-preview",
   "snw-reference",
 ]);
 
@@ -373,6 +375,16 @@ function createParagraph(inlines: NoteOutputInline[], prefixInlines: NoteOutputI
   return hasMeaningfulInline(nextInlines) ? [{ type: "paragraph", inlines: nextInlines }] : [];
 }
 
+function appendInlinesToPreviousParagraph(blocks: NoteOutputBlock[], inlines: NoteOutputInline[]): boolean {
+  const previousBlock = blocks.at(-1);
+  if (previousBlock?.type !== "paragraph" || !hasMeaningfulInline(inlines)) {
+    return false;
+  }
+
+  previousBlock.inlines.push(...inlines);
+  return true;
+}
+
 function createOrderedListPrefixInlines(index: number): NoteOutputInline[] {
   return [
     {
@@ -606,14 +618,22 @@ function collectBlocksFromChildren(
 ): NoteOutputBlock[] {
   const blocks: NoteOutputBlock[] = [];
   let pendingInlineNodes: ChildNode[] = [];
+  let joinPendingInlineWithPreviousParagraph = false;
 
   const flushPendingInlineNodes = (): void => {
     if (pendingInlineNodes.length === 0) {
       return;
     }
 
-    blocks.push(...createParagraph(collectInlineFromChildren(pendingInlineNodes, context)));
+    const pendingInlines = collectInlineFromChildren(pendingInlineNodes, context);
+    if (
+      !joinPendingInlineWithPreviousParagraph
+      || !appendInlinesToPreviousParagraph(blocks, pendingInlines)
+    ) {
+      blocks.push(...createParagraph(pendingInlines));
+    }
     pendingInlineNodes = [];
+    joinPendingInlineWithPreviousParagraph = false;
   };
 
   for (const child of Array.from(childNodes)) {
@@ -628,6 +648,9 @@ function collectBlocksFromChildren(
 
     const childElement = child as Element;
     if (shouldStripElement(childElement)) {
+      if (blocks.at(-1)?.type === "paragraph" && pendingInlineNodes.length === 0) {
+        joinPendingInlineWithPreviousParagraph = true;
+      }
       continue;
     }
 
@@ -637,6 +660,7 @@ function collectBlocksFromChildren(
     }
 
     flushPendingInlineNodes();
+    joinPendingInlineWithPreviousParagraph = false;
     blocks.push(...collectBlocksFromNode(child, context));
   }
 

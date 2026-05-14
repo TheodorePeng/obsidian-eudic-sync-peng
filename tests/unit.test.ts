@@ -675,6 +675,7 @@ assert.equal(
 );
 
 const managedLinkWordFile = mockFile("Words/whisper.md");
+const managedLinkDynamicFile = mockFile("Words/dynamic.md");
 const managedLinkPeerFile = mockFile("Words/peer.md");
 const managedLinkDisabledFile = mockFile("Words/disabled.md");
 const managedLinkMissingIdFile = mockFile("Words/missing-id.md");
@@ -682,6 +683,7 @@ const managedLinkReferenceFile = mockFile("References/ref-render.md");
 const managedLinkMaterialFile = mockFile("Material/2012 Text 1.md");
 const managedLinkFiles = [
   managedLinkWordFile,
+  managedLinkDynamicFile,
   managedLinkPeerFile,
   managedLinkDisabledFile,
   managedLinkMissingIdFile,
@@ -694,6 +696,13 @@ const managedLinkFrontmatterByPath = new Map<string, Record<string, unknown>>([
     {
       sync_eudic_enabled: true,
       eudic_link_id: "w-whisper",
+    },
+  ],
+  [
+    managedLinkDynamicFile.path,
+    {
+      sync_eudic_enabled: true,
+      eudic_link_id: "w-dynamic",
     },
   ],
   [
@@ -741,6 +750,9 @@ const managedLinkApp = {
       const normalized = linkpath.replace(/\.md$/i, "").replace(/^\/+/, "");
       if (normalized === "whisper" || normalized === "Words/whisper") {
         return managedLinkWordFile;
+      }
+      if (normalized === "dynamic" || normalized === "Words/dynamic") {
+        return managedLinkDynamicFile;
       }
       if (normalized === "peer" || normalized === "Words/peer") {
         return managedLinkPeerFile;
@@ -841,6 +853,12 @@ assert.equal(
   false,
 );
 assert.equal(
+  serializeNoteOutputBlocks(buildNoteOutputBlocks(embedExternalLinkHtml, managedLinkResolver), "minimal").includes(
+    '<a href="obsidian://eudic-sync?vault=English%20Peng&amp;kind=word&amp;id=w-dynamic&amp;word=dynamic">dynamic</a>\n elements',
+  ),
+  false,
+);
+assert.equal(
   serializeNoteOutputBlocks(
     buildNoteOutputBlocks(
       '<div><a class="external-link" href="https://example.com/path?x=1&amp;y=2">Example</a><p>tail</p></div>',
@@ -872,6 +890,54 @@ const whisperEmbedHtml = [
 assert.equal(
   serializeNoteOutputBlocks(buildNoteOutputBlocks(whisperEmbedHtml, managedLinkResolver), "minimal"),
   '<a href="obsidian://eudic-sync?vault=English%20Peng&amp;kind=word&amp;id=w-whisper&amp;word=whisper">whisper</a> and <a href="obsidian://eudic-sync?vault=English%20Peng&amp;kind=word&amp;id=w-peer&amp;word=peer">classmate</a> plus <a href="https://example.com/source">source</a>',
+);
+
+const dynamicSuffixHtml = [
+  '<p dir="auto">',
+  'group ',
+  '<a data-href="dynamic" href="dynamic" class="internal-link">dynamic</a>',
+  '<div class="snw-link-preview"><div class="snw-reference snw-link snw-liveupdate" data-snw-type="link">2</div></div>',
+  's help people',
+  '</p>',
+].join("");
+assert.equal(
+  serializeNoteOutputBlocks(buildNoteOutputBlocks(dynamicSuffixHtml, managedLinkResolver), "minimal"),
+  'group <a href="obsidian://eudic-sync?vault=English%20Peng&amp;kind=word&amp;id=w-dynamic&amp;word=dynamic">dynamic</a>s help people',
+);
+
+const dynamicSpaceHtml = [
+  '<p dir="auto">',
+  '<a data-href="dynamic" href="dynamic" class="internal-link">dynamic</a>',
+  '<div class="snw-link-preview"><div class="snw-reference snw-link snw-liveupdate" data-snw-type="link">2</div></div>',
+  ' elements',
+  '</p>',
+].join("");
+assert.equal(
+  serializeNoteOutputBlocks(buildNoteOutputBlocks(dynamicSpaceHtml, managedLinkResolver), "minimal"),
+  '<a href="obsidian://eudic-sync?vault=English%20Peng&amp;kind=word&amp;id=w-dynamic&amp;word=dynamic">dynamic</a> elements',
+);
+
+const officialSpacedSuffixHtml = [
+  '<p dir="auto">',
+  '<a data-href="peer" href="peer" class="internal-link">official</a>',
+  '<div class="snw-link-preview"><div class="snw-reference snw-link snw-liveupdate" data-snw-type="link">2</div></div>',
+  ' s use the power',
+  '</p>',
+].join("");
+assert.equal(
+  serializeNoteOutputBlocks(buildNoteOutputBlocks(officialSpacedSuffixHtml, managedLinkResolver), "minimal"),
+  '<a href="obsidian://eudic-sync?vault=English%20Peng&amp;kind=word&amp;id=w-peer&amp;word=peer">official</a> s use the power',
+);
+
+assert.equal(
+  serializeNoteOutputBlocks(
+    buildNoteOutputBlocks(
+      '<div><a data-href="dynamic" href="dynamic" class="internal-link">dynamic</a><div class="real-block">tail</div></div>',
+      managedLinkResolver,
+    ),
+    "minimal",
+  ),
+  '<a href="obsidian://eudic-sync?vault=English%20Peng&amp;kind=word&amp;id=w-dynamic&amp;word=dynamic">dynamic</a>\ntail',
 );
 
 assert.equal(

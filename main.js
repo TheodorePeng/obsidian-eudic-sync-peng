@@ -6423,6 +6423,8 @@ var STRIP_CLASSES = /* @__PURE__ */ new Set([
   "mod-header",
   "mod-footer",
   "snw-block-preview",
+  "snw-embed-preview",
+  "snw-link-preview",
   "snw-reference"
 ]);
 function normalizeText(value) {
@@ -6647,6 +6649,14 @@ function createParagraph(inlines, prefixInlines = []) {
   const nextInlines = prefixInlines.length > 0 ? [...prefixInlines, ...inlines] : inlines;
   return hasMeaningfulInline(nextInlines) ? [{ type: "paragraph", inlines: nextInlines }] : [];
 }
+function appendInlinesToPreviousParagraph(blocks, inlines) {
+  const previousBlock = blocks.at(-1);
+  if (previousBlock?.type !== "paragraph" || !hasMeaningfulInline(inlines)) {
+    return false;
+  }
+  previousBlock.inlines.push(...inlines);
+  return true;
+}
 function createOrderedListPrefixInlines(index) {
   return [
     {
@@ -6830,12 +6840,17 @@ function collectUnorderedListBlocks(element, context) {
 function collectBlocksFromChildren(childNodes, context) {
   const blocks = [];
   let pendingInlineNodes = [];
+  let joinPendingInlineWithPreviousParagraph = false;
   const flushPendingInlineNodes = () => {
     if (pendingInlineNodes.length === 0) {
       return;
     }
-    blocks.push(...createParagraph(collectInlineFromChildren(pendingInlineNodes, context)));
+    const pendingInlines = collectInlineFromChildren(pendingInlineNodes, context);
+    if (!joinPendingInlineWithPreviousParagraph || !appendInlinesToPreviousParagraph(blocks, pendingInlines)) {
+      blocks.push(...createParagraph(pendingInlines));
+    }
     pendingInlineNodes = [];
+    joinPendingInlineWithPreviousParagraph = false;
   };
   for (const child of Array.from(childNodes)) {
     if (child.nodeType === Node.COMMENT_NODE) {
@@ -6847,6 +6862,9 @@ function collectBlocksFromChildren(childNodes, context) {
     }
     const childElement = child;
     if (shouldStripElement(childElement)) {
+      if (blocks.at(-1)?.type === "paragraph" && pendingInlineNodes.length === 0) {
+        joinPendingInlineWithPreviousParagraph = true;
+      }
       continue;
     }
     if (!isBlockChildElement(childElement)) {
@@ -6854,6 +6872,7 @@ function collectBlocksFromChildren(childNodes, context) {
       continue;
     }
     flushPendingInlineNodes();
+    joinPendingInlineWithPreviousParagraph = false;
     blocks.push(...collectBlocksFromNode(child, context));
   }
   flushPendingInlineNodes();
