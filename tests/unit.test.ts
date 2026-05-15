@@ -52,12 +52,16 @@ import {
   buildWordSyncFrontmatterPatch,
   setWordSyncFrontmatterInMarkdown,
 } from "../src/word-sync-frontmatter-patch";
+import { buildEudicQueryUrl, shouldFillEudicUrlBeforeFirstSync } from "../src/eudic-url";
+import { ensureManagedWordProperties } from "../src/word-frontmatter";
 import { transformMarkdownForEudicRender } from "../src/html-renderer";
 import { withRetry } from "../src/retry";
 import { resolveWordDirtySignatureDecision } from "../src/word-dirty-signature-state";
 import { getWordSyncSignature } from "../src/word-sync-signature";
 import { getSemanticSettingsSignature, SyncRenderCache } from "../src/sync-render-cache";
 import { StartupCoordinator } from "../src/startup-coordinator";
+import { SyncService } from "../src/sync-service";
+import { EudicApiClient } from "../src/eudic-api";
 import type { EudicStudylistCache } from "../src/types";
 import type { NoteOutputBlock } from "../src/note-output/model";
 import type { App, Editor, EditorPosition, TAbstractFile, TFile } from "obsidian";
@@ -207,6 +211,29 @@ assert.equal(
     "sync_status: synced",
     "studylist_sync_status: synced",
     "eudic_link_id: word-new",
+    "---",
+    "",
+    "Body",
+  ].join("\n"),
+);
+assert.equal(
+  setWordSyncFrontmatterInMarkdown(
+    [
+      "---",
+      "word: apple",
+      "eudic_url: \"\"",
+      "sync_status: dirty",
+      "---",
+      "",
+      "Body",
+    ].join("\n"),
+    { eudicUrl: "https://dict.eudic.net/dicts/en/apple" },
+  ),
+  [
+    "---",
+    "word: apple",
+    "eudic_url: https://dict.eudic.net/dicts/en/apple",
+    "sync_status: dirty",
     "---",
     "",
     "Body",
@@ -993,6 +1020,198 @@ function mockFile(path: string): TFile {
     basename: (path.split("/").pop() ?? path).replace(/\.md$/i, ""),
     extension: "md",
   } as TFile;
+}
+
+assert.equal(buildEudicQueryUrl("apple", "en"), "https://dict.eudic.net/dicts/en/apple");
+assert.equal(shouldFillEudicUrlBeforeFirstSync({}), true);
+assert.equal(shouldFillEudicUrlBeforeFirstSync({ eudic_url: "" }), true);
+assert.equal(
+  shouldFillEudicUrlBeforeFirstSync({ eudic_url: "https://dict.eudic.net/dicts/en/Untitled" }),
+  true,
+);
+assert.equal(
+  shouldFillEudicUrlBeforeFirstSync({
+    eudic_url: "https://dict.eudic.net/dicts/en/Untitled",
+    last_synced_hash: "already-synced",
+  }),
+  false,
+);
+assert.equal(
+  shouldFillEudicUrlBeforeFirstSync({ eudic_url: "https://dict.eudic.net/dicts/en/custom" }),
+  false,
+);
+
+const ensureUntitledFile = mockFile("Eudic/Words/Untitled.md");
+const ensureFrontmatterByPath = new Map<string, Record<string, unknown>>();
+const ensureMarkdownByPath = new Map<string, string>([
+  [ensureUntitledFile.path, "Body"],
+]);
+const ensureApp = {
+  vault: {
+    cachedRead: async (file: TFile) => ensureMarkdownByPath.get(file.path) ?? "",
+  },
+  metadataCache: {
+    getFileCache: (file: TFile) => ({ frontmatter: ensureFrontmatterByPath.get(file.path) ?? {} }),
+  },
+} as unknown as App;
+const ensureUntitledResult = await ensureManagedWordProperties({
+  app: ensureApp,
+  file: ensureUntitledFile,
+  writeFrontmatter: async (file, mutate) => {
+    const nextFrontmatter = { ...(ensureFrontmatterByPath.get(file.path) ?? {}) };
+    mutate(nextFrontmatter);
+    ensureFrontmatterByPath.set(file.path, nextFrontmatter);
+    ensureMarkdownByPath.set(file.path, [
+      "---",
+      ...Object.entries(nextFrontmatter).map(([key, value]) => `${key}: ${JSON.stringify(value)}`),
+      "---",
+      "",
+      "Body",
+    ].join("\n"));
+  },
+});
+assert.equal(ensureUntitledResult.changed, true);
+assert.equal(ensureFrontmatterByPath.get(ensureUntitledFile.path)?.eudic_url, "");
+assert.notEqual(
+  ensureFrontmatterByPath.get(ensureUntitledFile.path)?.eudic_url,
+  "https://dict.eudic.net/dicts/en/Untitled",
+);
+
+const ensureAppleFile = mockFile("Eudic/Words/apple.md");
+ensureFrontmatterByPath.set(ensureAppleFile.path, {
+  sync_eudic_enabled: true,
+  lang: "en",
+  aliases: [],
+  eudic_link_id: "word-apple",
+  eudic_url: "",
+  sync_status: "dirty",
+  eudic_studylist_ids: [],
+  eudic_studylist_names: [],
+  studylist_sync_status: "synced",
+});
+ensureMarkdownByPath.set(ensureAppleFile.path, [
+  "---",
+  "sync_eudic_enabled: true",
+  "lang: en",
+  "aliases: []",
+  "eudic_link_id: word-apple",
+  "eudic_url: \"\"",
+  "sync_status: dirty",
+  "eudic_studylist_ids: []",
+  "eudic_studylist_names: []",
+  "studylist_sync_status: synced",
+  "---",
+  "",
+  "Body",
+].join("\n"));
+const ensureAppleResult = await ensureManagedWordProperties({
+  app: ensureApp,
+  file: ensureAppleFile,
+  writeFrontmatter: async (file, mutate) => {
+    const nextFrontmatter = { ...(ensureFrontmatterByPath.get(file.path) ?? {}) };
+    mutate(nextFrontmatter);
+    ensureFrontmatterByPath.set(file.path, nextFrontmatter);
+  },
+});
+assert.equal(ensureAppleResult.changed, false);
+assert.equal(ensureFrontmatterByPath.get(ensureAppleFile.path)?.eudic_url, "");
+
+const originalOverwriteNotePreservingAttachments = EudicApiClient.prototype.overwriteNotePreservingAttachments;
+try {
+  const syncUrlFile = mockFile("Eudic/Words/apple.md");
+  const syncUrlFrontmatterByPath = new Map<string, Record<string, unknown>>([
+    [
+      syncUrlFile.path,
+      {
+        word: "apple",
+        lang: "en",
+        aliases: [],
+        eudic_link_id: "word-apple",
+        eudic_url: "",
+        sync_eudic_enabled: true,
+        sync_status: "dirty",
+      },
+    ],
+  ]);
+  const syncUrlMarkdownByPath = new Map<string, string>([
+    [
+      syncUrlFile.path,
+      [
+        "---",
+        "word: apple",
+        "lang: en",
+        "aliases: []",
+        "eudic_link_id: word-apple",
+        "eudic_url: \"\"",
+        "sync_eudic_enabled: true",
+        "sync_status: dirty",
+        "---",
+        "",
+        "A fruit.",
+      ].join("\n"),
+    ],
+  ]);
+  const syncUrlApp = {
+    vault: {
+      getName: () => "Test Vault",
+      getMarkdownFiles: () => [syncUrlFile],
+      cachedRead: async (file: TFile) => syncUrlMarkdownByPath.get(file.path) ?? "",
+    },
+    metadataCache: {
+      getFileCache: (file: TFile) => ({ frontmatter: syncUrlFrontmatterByPath.get(file.path) ?? {} }),
+    },
+  } as unknown as App;
+  let uploadedWord: string | null = null;
+  EudicApiClient.prototype.overwriteNotePreservingAttachments = async function (payload): Promise<void> {
+    uploadedWord = payload.word;
+  };
+  const syncUrlService = new SyncService({
+    app: syncUrlApp,
+    pathScope: { isWordPath: (path: string) => path === syncUrlFile.path, isReferencePath: () => false } as never,
+    managedFiles: { getWordFiles: () => [syncUrlFile], getReferencePaths: () => [] } as never,
+    getSettings: () => DEFAULT_SETTINGS,
+    ensureWordLinkId: async () => "word-apple",
+    writeSyncFrontmatter: async (file, data) => {
+      const currentFrontmatter = { ...(syncUrlFrontmatterByPath.get(file.path) ?? {}) };
+      if (data.eudicUrl !== undefined) {
+        if (data.eudicUrl === null) {
+          delete currentFrontmatter.eudic_url;
+        } else {
+          currentFrontmatter.eudic_url = data.eudicUrl;
+        }
+      }
+      if (data.syncStatus !== undefined) currentFrontmatter.sync_status = data.syncStatus;
+      if (data.syncedAt !== undefined) currentFrontmatter.synced_at = data.syncedAt;
+      if (data.lastSyncedHash !== undefined) currentFrontmatter.last_synced_hash = data.lastSyncedHash;
+      if (data.lastSyncedAliasesHash !== undefined) currentFrontmatter.last_synced_aliases_hash = data.lastSyncedAliasesHash;
+      if (data.lastError !== undefined) {
+        if (data.lastError === null) {
+          delete currentFrontmatter.last_error;
+        } else {
+          currentFrontmatter.last_error = data.lastError;
+        }
+      }
+      syncUrlFrontmatterByPath.set(file.path, currentFrontmatter);
+    },
+  });
+  (syncUrlService as unknown as {
+    renderFinalWordNoteHtml: () => Promise<{ finalNoteHtml: string }>;
+  }).renderFinalWordNoteHtml = async () => ({ finalNoteHtml: "<p>A fruit.</p>" });
+  const syncUrlResult = await syncUrlService.syncWord(syncUrlFile);
+  assert.equal(uploadedWord, "apple");
+  assert.equal(syncUrlResult.status, "synced");
+  assert.equal(syncUrlFrontmatterByPath.get(syncUrlFile.path)?.eudic_url, "https://dict.eudic.net/dicts/en/apple");
+
+  syncUrlFrontmatterByPath.set(syncUrlFile.path, {
+    ...(syncUrlFrontmatterByPath.get(syncUrlFile.path) ?? {}),
+    eudic_url: "https://dict.eudic.net/dicts/en/custom",
+    sync_status: "dirty",
+    last_synced_hash: undefined,
+  });
+  await syncUrlService.syncWord(syncUrlFile, { force: true });
+  assert.equal(syncUrlFrontmatterByPath.get(syncUrlFile.path)?.eudic_url, "https://dict.eudic.net/dicts/en/custom");
+} finally {
+  EudicApiClient.prototype.overwriteNotePreservingAttachments = originalOverwriteNotePreservingAttachments;
 }
 
 const renderWordFile = mockFile("Eudic/Words/affair.md");

@@ -1,7 +1,6 @@
 import type { App, TFile } from "obsidian";
 import { FRONTMATTER_KEYS } from "./constants";
 import { createEudicLinkId, readEudicLinkId } from "./eudic-link";
-import { buildEudicQueryUrl, getExpectedEudicUrl } from "./eudic-url";
 import {
   aliasesNeedRewrite,
   getFrontmatter,
@@ -28,12 +27,12 @@ function hasYamlFrontmatter(markdown: string): boolean {
   return /^---\s*\n[\s\S]*?\n---(?:\s*\n|$)/.test(markdown);
 }
 
-function writeDefaultWordFrontmatter(frontmatter: Record<string, unknown>, file: TFile): void {
+function writeDefaultWordFrontmatter(frontmatter: Record<string, unknown>): void {
   frontmatter[FRONTMATTER_KEYS.syncEudicEnabled] = true;
   frontmatter[FRONTMATTER_KEYS.lang] = "en";
   frontmatter[FRONTMATTER_KEYS.aliases] = [];
   frontmatter[FRONTMATTER_KEYS.eudicLinkId] = createEudicLinkId("word");
-  frontmatter[FRONTMATTER_KEYS.eudicUrl] = buildEudicQueryUrl(file.basename, "en");
+  frontmatter[FRONTMATTER_KEYS.eudicUrl] = "";
   frontmatter[FRONTMATTER_KEYS.syncStatus] = "dirty";
   frontmatter[FRONTMATTER_KEYS.studylistIds] = [];
   frontmatter[FRONTMATTER_KEYS.studylistNames] = [];
@@ -57,7 +56,7 @@ export async function ensureManagedWordProperties(
 
   if (!hasYamlFrontmatter(markdown)) {
     await writeFrontmatter(file, (frontmatter) => {
-      writeDefaultWordFrontmatter(frontmatter, file);
+      writeDefaultWordFrontmatter(frontmatter);
     });
     return {
       skipped: false,
@@ -79,8 +78,7 @@ export async function ensureManagedWordProperties(
   const shouldUpdateAliases = aliasesNeedRewrite(frontmatter, file);
   const shouldAddEudicLinkId = readEudicLinkId(frontmatter) === null;
   const shouldAddLang = readNullableString(frontmatter[FRONTMATTER_KEYS.lang]) === null;
-  const expectedEudicUrl = getExpectedEudicUrl(frontmatter, file);
-  const shouldUpdateEudicUrl = readNullableString(frontmatter[FRONTMATTER_KEYS.eudicUrl]) !== expectedEudicUrl;
+  const shouldAddEudicUrl = !(FRONTMATTER_KEYS.eudicUrl in frontmatter);
   const shouldAddSyncStatus = readNullableString(frontmatter[FRONTMATTER_KEYS.syncStatus]) === null;
   const shouldNormalizeStudylistStatus = !isStudylistSyncStatusNormalized(frontmatter);
   const shouldAddStudylistIds = !Array.isArray(frontmatter[FRONTMATTER_KEYS.studylistIds]);
@@ -91,7 +89,7 @@ export async function ensureManagedWordProperties(
     !shouldAddSyncEudicEnabled &&
     !shouldUpdateAliases &&
     !shouldAddEudicLinkId &&
-    !shouldUpdateEudicUrl &&
+    !shouldAddEudicUrl &&
     !shouldNormalizeStudylistStatus &&
     !shouldAddStudylistIds &&
     !shouldAddStudylistNames &&
@@ -117,8 +115,8 @@ export async function ensureManagedWordProperties(
       nextFrontmatter[FRONTMATTER_KEYS.eudicLinkId] = createEudicLinkId("word");
     }
 
-    if (shouldUpdateEudicUrl) {
-      nextFrontmatter[FRONTMATTER_KEYS.eudicUrl] = expectedEudicUrl;
+    if (shouldAddEudicUrl) {
+      nextFrontmatter[FRONTMATTER_KEYS.eudicUrl] = "";
     }
 
     if (shouldNormalizeStudylistStatus) {

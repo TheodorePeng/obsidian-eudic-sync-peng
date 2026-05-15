@@ -3,6 +3,7 @@ import { FRONTMATTER_KEYS } from "./constants";
 import type { EudicSyncStatus } from "./types";
 
 export interface WordSyncFrontmatterPatchData {
+  eudicUrl?: string | null;
   syncStatus?: EudicSyncStatus;
   syncedAt?: string | null;
   lastSyncedHash?: string | null;
@@ -82,6 +83,7 @@ function formatYamlScalar(value: string, bare = false): string {
 
 function buildFields(data: WordSyncFrontmatterPatchData): WordSyncField[] {
   return [
+    { key: FRONTMATTER_KEYS.eudicUrl, value: data.eudicUrl },
     { key: FRONTMATTER_KEYS.eudicLinkId, value: data.eudicLinkId },
     { key: FRONTMATTER_KEYS.syncStatus, value: data.syncStatus, bare: true },
     { key: FRONTMATTER_KEYS.syncedAt, value: data.syncedAt },

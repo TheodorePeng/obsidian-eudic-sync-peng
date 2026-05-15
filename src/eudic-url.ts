@@ -14,3 +14,16 @@ export function getExpectedEudicUrl(frontmatter: Record<string, unknown>, file: 
   const lang = readNullableString(frontmatter[FRONTMATTER_KEYS.lang]) ?? "en";
   return buildEudicQueryUrl(word, lang);
 }
+
+export function shouldFillEudicUrlBeforeFirstSync(frontmatter: Record<string, unknown>): boolean {
+  const currentUrl = readNullableString(frontmatter[FRONTMATTER_KEYS.eudicUrl]);
+  if (!currentUrl) {
+    return true;
+  }
+
+  if (readNullableString(frontmatter[FRONTMATTER_KEYS.lastSyncedHash])) {
+    return false;
+  }
+
+  return currentUrl === buildEudicQueryUrl("Untitled", "en");
+}

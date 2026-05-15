@@ -3,6 +3,7 @@ import { AliasSyncService } from "./alias-sync";
 import { FRONTMATTER_KEYS } from "./constants";
 import { EudicApiClient } from "./eudic-api";
 import { buildEudicProtocolUrl, readEudicLinkId } from "./eudic-link";
+import { buildEudicQueryUrl, shouldFillEudicUrlBeforeFirstSync } from "./eudic-url";
 import { normalizeEudicBlockKindsFromBody } from "./eudic-block";
 import { sha256Hex } from "./hash";
 import { HtmlRenderer } from "./html-renderer";
@@ -193,6 +194,8 @@ export class SyncService {
         throw new Error(`Missing '${FRONTMATTER_KEYS.lang}' in ${file.path}.`);
       }
 
+      await this.ensureEudicUrlBeforeFirstSync(file, context);
+
       const frontmatter = getFrontmatter(this.options.app, file);
       const storedAliasHash = readNullableString(frontmatter[FRONTMATTER_KEYS.lastSyncedAliasesHash]);
       const settings = this.options.getSettings();
@@ -264,6 +267,17 @@ export class SyncService {
         error: message,
       };
     }
+  }
+
+  private async ensureEudicUrlBeforeFirstSync(file: TFile, context: WordNoteContext): Promise<void> {
+    const frontmatter = getFrontmatter(this.options.app, file);
+    if (!shouldFillEudicUrlBeforeFirstSync(frontmatter)) {
+      return;
+    }
+
+    await this.options.writeSyncFrontmatter(file, {
+      eudicUrl: buildEudicQueryUrl(context.word, context.lang),
+    });
   }
 
   async reconcileWordSyncStatus(file: TFile): Promise<EudicSyncStatus> {

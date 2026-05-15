@@ -5690,6 +5690,7 @@ function formatYamlScalar(value, bare = false) {
 }
 function buildFields(data) {
   return [
+    { key: FRONTMATTER_KEYS.eudicUrl, value: data.eudicUrl },
     { key: FRONTMATTER_KEYS.eudicLinkId, value: data.eudicLinkId },
     { key: FRONTMATTER_KEYS.syncStatus, value: data.syncStatus, bare: true },
     { key: FRONTMATTER_KEYS.syncedAt, value: data.syncedAt },
@@ -6004,6 +6005,23 @@ var AliasSyncService = class {
     return null;
   }
 };
+
+// src/eudic-url.ts
+var EUDIC_DICT_BASE_URL = "https://dict.eudic.net/dicts";
+function buildEudicQueryUrl(word, lang) {
+  const normalizedLang = lang?.trim() || "en";
+  return `${EUDIC_DICT_BASE_URL}/${encodeURIComponent(normalizedLang)}/${encodeURIComponent(word)}`;
+}
+function shouldFillEudicUrlBeforeFirstSync(frontmatter) {
+  const currentUrl = readNullableString(frontmatter[FRONTMATTER_KEYS.eudicUrl]);
+  if (!currentUrl) {
+    return true;
+  }
+  if (readNullableString(frontmatter[FRONTMATTER_KEYS.lastSyncedHash])) {
+    return false;
+  }
+  return currentUrl === buildEudicQueryUrl("Untitled", "en");
+}
 
 // src/html-renderer.ts
 var import_obsidian12 = require("obsidian");
@@ -7305,6 +7323,7 @@ var SyncService = class {
       if (!context.lang) {
         throw new Error(`Missing '${FRONTMATTER_KEYS.lang}' in ${file.path}.`);
       }
+      await this.ensureEudicUrlBeforeFirstSync(file, context);
       const frontmatter = getFrontmatter(this.options.app, file);
       const storedAliasHash = readNullableString(frontmatter[FRONTMATTER_KEYS.lastSyncedAliasesHash]);
       const settings = this.options.getSettings();
@@ -7371,6 +7390,15 @@ var SyncService = class {
         error: message
       };
     }
+  }
+  async ensureEudicUrlBeforeFirstSync(file, context) {
+    const frontmatter = getFrontmatter(this.options.app, file);
+    if (!shouldFillEudicUrlBeforeFirstSync(frontmatter)) {
+      return;
+    }
+    await this.options.writeSyncFrontmatter(file, {
+      eudicUrl: buildEudicQueryUrl(context.word, context.lang)
+    });
   }
   async reconcileWordSyncStatus(file) {
     let wordContentSynced = false;
@@ -8071,28 +8099,16 @@ function resolveWordDirtySignatureDecision(state) {
   return state.nextSignature === state.previousSignature ? "unchanged" : "dirty";
 }
 
-// src/eudic-url.ts
-var EUDIC_DICT_BASE_URL = "https://dict.eudic.net/dicts";
-function buildEudicQueryUrl(word, lang) {
-  const normalizedLang = lang?.trim() || "en";
-  return `${EUDIC_DICT_BASE_URL}/${encodeURIComponent(normalizedLang)}/${encodeURIComponent(word)}`;
-}
-function getExpectedEudicUrl(frontmatter, file) {
-  const word = getConfiguredWord(frontmatter, file);
-  const lang = readNullableString(frontmatter[FRONTMATTER_KEYS.lang]) ?? "en";
-  return buildEudicQueryUrl(word, lang);
-}
-
 // src/word-frontmatter.ts
 function hasYamlFrontmatter(markdown) {
   return /^---\s*\n[\s\S]*?\n---(?:\s*\n|$)/.test(markdown);
 }
-function writeDefaultWordFrontmatter(frontmatter, file) {
+function writeDefaultWordFrontmatter(frontmatter) {
   frontmatter[FRONTMATTER_KEYS.syncEudicEnabled] = true;
   frontmatter[FRONTMATTER_KEYS.lang] = "en";
   frontmatter[FRONTMATTER_KEYS.aliases] = [];
   frontmatter[FRONTMATTER_KEYS.eudicLinkId] = createEudicLinkId("word");
-  frontmatter[FRONTMATTER_KEYS.eudicUrl] = buildEudicQueryUrl(file.basename, "en");
+  frontmatter[FRONTMATTER_KEYS.eudicUrl] = "";
   frontmatter[FRONTMATTER_KEYS.syncStatus] = "dirty";
   frontmatter[FRONTMATTER_KEYS.studylistIds] = [];
   frontmatter[FRONTMATTER_KEYS.studylistNames] = [];
@@ -8110,7 +8126,7 @@ async function ensureManagedWordProperties(options) {
   const markdown = await app.vault.cachedRead(file);
   if (!hasYamlFrontmatter(markdown)) {
     await writeFrontmatter(file, (frontmatter2) => {
-      writeDefaultWordFrontmatter(frontmatter2, file);
+      writeDefaultWordFrontmatter(frontmatter2);
     });
     return {
       skipped: false,
@@ -8131,14 +8147,13 @@ async function ensureManagedWordProperties(options) {
   const shouldUpdateAliases = aliasesNeedRewrite(frontmatter, file);
   const shouldAddEudicLinkId = readEudicLinkId(frontmatter) === null;
   const shouldAddLang = readNullableString(frontmatter[FRONTMATTER_KEYS.lang]) === null;
-  const expectedEudicUrl = getExpectedEudicUrl(frontmatter, file);
-  const shouldUpdateEudicUrl = readNullableString(frontmatter[FRONTMATTER_KEYS.eudicUrl]) !== expectedEudicUrl;
+  const shouldAddEudicUrl = !(FRONTMATTER_KEYS.eudicUrl in frontmatter);
   const shouldAddSyncStatus = readNullableString(frontmatter[FRONTMATTER_KEYS.syncStatus]) === null;
   const shouldNormalizeStudylistStatus = !isStudylistSyncStatusNormalized(frontmatter);
   const shouldAddStudylistIds = !Array.isArray(frontmatter[FRONTMATTER_KEYS.studylistIds]);
   const shouldAddStudylistNames = !Array.isArray(frontmatter[FRONTMATTER_KEYS.studylistNames]);
   const shouldAddSyncableFields = !isDisabled;
-  if (!shouldAddSyncEudicEnabled && !shouldUpdateAliases && !shouldAddEudicLinkId && !shouldUpdateEudicUrl && !shouldNormalizeStudylistStatus && !shouldAddStudylistIds && !shouldAddStudylistNames && (!shouldAddSyncableFields || !shouldAddLang && !shouldAddSyncStatus)) {
+  if (!shouldAddSyncEudicEnabled && !shouldUpdateAliases && !shouldAddEudicLinkId && !shouldAddEudicUrl && !shouldNormalizeStudylistStatus && !shouldAddStudylistIds && !shouldAddStudylistNames && (!shouldAddSyncableFields || !shouldAddLang && !shouldAddSyncStatus)) {
     return {
       skipped: isDisabled,
       changed: false,
@@ -8155,8 +8170,8 @@ async function ensureManagedWordProperties(options) {
     if (shouldAddEudicLinkId) {
       nextFrontmatter[FRONTMATTER_KEYS.eudicLinkId] = createEudicLinkId("word");
     }
-    if (shouldUpdateEudicUrl) {
-      nextFrontmatter[FRONTMATTER_KEYS.eudicUrl] = expectedEudicUrl;
+    if (shouldAddEudicUrl) {
+      nextFrontmatter[FRONTMATTER_KEYS.eudicUrl] = "";
     }
     if (shouldNormalizeStudylistStatus) {
       normalizeStudylistSyncStatus(nextFrontmatter);
