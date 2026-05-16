@@ -1,7 +1,7 @@
 {
   "id": "eudic-sync",
   "name": "Eudic Sync",
-  "version": "0.6.36",
+  "version": "0.6.37",
   "minAppVersion": "1.7.7",
   "description": "Sync Obsidian word notes to Eudic with dirty tracking and manual confirmation.",
   "author": "Peng",

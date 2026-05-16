@@ -54,6 +54,7 @@ import {
 } from "../src/word-sync-frontmatter-patch";
 import { buildEudicQueryUrl, shouldFillEudicUrlBeforeFirstSync } from "../src/eudic-url";
 import { ensureManagedWordProperties } from "../src/word-frontmatter";
+import { waitForCachedFrontmatterString } from "../src/frontmatter-cache-settle";
 import { transformMarkdownForEudicRender } from "../src/html-renderer";
 import { withRetry } from "../src/retry";
 import { resolveWordDirtySignatureDecision } from "../src/word-dirty-signature-state";
@@ -1040,6 +1041,79 @@ assert.equal(
   shouldFillEudicUrlBeforeFirstSync({ eudic_url: "https://dict.eudic.net/dicts/en/custom" }),
   false,
 );
+
+const cacheSettleFile = mockFile("Eudic/Words/cache-settle.md");
+const cacheSettleFrontmatter: Record<string, unknown> = { eudic_url: "" };
+const cacheSettleApp = {
+  metadataCache: {
+    getFileCache: () => ({ frontmatter: cacheSettleFrontmatter }),
+  },
+} as unknown as App;
+let cacheSettleTimeoutNow = 0;
+let cacheSettleTimeoutSleeps = 0;
+assert.equal(
+  await waitForCachedFrontmatterString(
+    cacheSettleApp,
+    cacheSettleFile,
+    "eudic_url",
+    "https://dict.eudic.net/dicts/en/cache-settle",
+    {
+      timeoutMs: 100,
+      intervalMs: 40,
+      now: () => cacheSettleTimeoutNow,
+      sleep: async (ms) => {
+        cacheSettleTimeoutSleeps += 1;
+        cacheSettleTimeoutNow += ms;
+      },
+    },
+  ),
+  false,
+);
+assert.equal(cacheSettleTimeoutSleeps, 3);
+cacheSettleFrontmatter.eudic_url = "https://dict.eudic.net/dicts/en/cache-settle";
+assert.equal(
+  await waitForCachedFrontmatterString(
+    cacheSettleApp,
+    cacheSettleFile,
+    "eudic_url",
+    "https://dict.eudic.net/dicts/en/cache-settle",
+    {
+      timeoutMs: 100,
+      intervalMs: 20,
+      now: () => 0,
+      sleep: async () => {
+        throw new Error("Already-settled cache must not sleep.");
+      },
+    },
+  ),
+  true,
+);
+
+let cacheSettleNow = 0;
+let cacheSettleSleeps = 0;
+cacheSettleFrontmatter.eudic_url = "";
+assert.equal(
+  await waitForCachedFrontmatterString(
+    cacheSettleApp,
+    cacheSettleFile,
+    "eudic_url",
+    "https://dict.eudic.net/dicts/en/cache-settle",
+    {
+      timeoutMs: 200,
+      intervalMs: 50,
+      now: () => cacheSettleNow,
+      sleep: async (ms) => {
+        cacheSettleSleeps += 1;
+        cacheSettleNow += ms;
+        if (cacheSettleSleeps === 2) {
+          cacheSettleFrontmatter.eudic_url = "https://dict.eudic.net/dicts/en/cache-settle";
+        }
+      },
+    },
+  ),
+  true,
+);
+assert.equal(cacheSettleSleeps, 2);
 
 const ensureUntitledFile = mockFile("Eudic/Words/Untitled.md");
 const ensureFrontmatterByPath = new Map<string, Record<string, unknown>>();

@@ -36,8 +36,9 @@ import {
 } from "./eudic-block";
 import { ReferenceNoteService, hasPendingReferenceBlocks } from "./reference-note-service";
 import { formatBoldMarkersInMarkdown } from "./markdown-bold-markers";
+import { waitForCachedFrontmatterString } from "./frontmatter-cache-settle";
 import { ManagedFileRegistry } from "./managed-file-registry";
-import { getFrontmatter } from "./note-metadata";
+import { getFrontmatter, readNullableString } from "./note-metadata";
 import { PathScope } from "./path-scope";
 import { PerformanceMonitor } from "./performance-monitor";
 import { ReferenceGraphService } from "./reference-index-service";
@@ -2203,6 +2204,7 @@ export default class EudicSyncPlugin extends Plugin {
   }
 
   private async writeWordSyncFrontmatter(file: TFile, data: WordSyncFrontmatterPatchData): Promise<void> {
+    const eudicUrlToSet = typeof data.eudicUrl === "string" && data.eudicUrl.trim() ? data.eudicUrl.trim() : null;
     const view = this.getOpenMarkdownViewForFile(file);
     if (view) {
       const normalizedPath = normalizePath(file.path);
@@ -2227,7 +2229,20 @@ export default class EudicSyncPlugin extends Plugin {
           this.syncingEditorWordStatusPatchSignatures.delete(normalizedPath);
           throw error;
         }
+      } else if (
+        eudicUrlToSet &&
+        readNullableString(getFrontmatter(this.app, file)[FRONTMATTER_KEYS.eudicUrl]) !== eudicUrlToSet
+      ) {
+        this.suppressPath(file.path);
+        try {
+          await view.save();
+        } catch (error) {
+          this.clearSuppression(file.path);
+          throw error;
+        }
       }
+
+      await this.waitForEudicUrlCacheSettle(file, eudicUrlToSet);
 
       if (data.syncStatus === "synced") {
         this.recordWordBodySyncedFromMarkdown(file, nextMarkdown);
@@ -2242,11 +2257,22 @@ export default class EudicSyncPlugin extends Plugin {
       applyWordSyncFrontmatterToObject(frontmatter, data);
     });
 
+    await this.waitForEudicUrlCacheSettle(file, eudicUrlToSet);
+
     if (data.syncStatus === "dirty") {
       this.setWordBodyStatusOverride(file, "dirty", data.lastError ?? null);
     } else if (data.syncStatus === "synced") {
       this.setWordBodyStatusOverride(file, "synced", null);
     }
+  }
+
+  private async waitForEudicUrlCacheSettle(file: TFile, eudicUrl: string | null): Promise<void> {
+    if (!eudicUrl) {
+      return;
+    }
+
+    await waitForCachedFrontmatterString(this.app, file, FRONTMATTER_KEYS.eudicUrl, eudicUrl);
+    this.refreshUi();
   }
 
   private async writeStudylistFrontmatter(file: TFile, mutate: FrontmatterMutator): Promise<void> {

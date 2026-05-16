@@ -2404,6 +2404,35 @@ function editorRangeHasMeaningfulText(lines, from, to) {
   return false;
 }
 
+// src/frontmatter-cache-settle.ts
+var DEFAULT_TIMEOUT_MS = 1200;
+var DEFAULT_INTERVAL_MS = 50;
+function sleep(ms) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+function hasCachedStringValue(app, file, key, expectedValue) {
+  return readNullableString(getFrontmatter(app, file)[key]) === expectedValue;
+}
+async function waitForCachedFrontmatterString(app, file, key, expectedValue, options = {}) {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const intervalMs = options.intervalMs ?? DEFAULT_INTERVAL_MS;
+  const now2 = options.now ?? Date.now;
+  const wait = options.sleep ?? sleep;
+  const deadline = now2() + timeoutMs;
+  while (true) {
+    if (hasCachedStringValue(app, file, key, expectedValue)) {
+      return true;
+    }
+    const remainingMs = deadline - now2();
+    if (remainingMs <= 0) {
+      return false;
+    }
+    await wait(Math.min(intervalMs, remainingMs));
+  }
+}
+
 // src/managed-file-registry.ts
 function normalizeRegistryPath(path) {
   return path.trim().replace(/\\/g, "/").replace(/\/+/g, "/");
@@ -10005,6 +10034,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     return nextLinkId;
   }
   async writeWordSyncFrontmatter(file, data) {
+    const eudicUrlToSet = typeof data.eudicUrl === "string" && data.eudicUrl.trim() ? data.eudicUrl.trim() : null;
     const view = this.getOpenMarkdownViewForFile(file);
     if (view) {
       const normalizedPath = (0, import_obsidian16.normalizePath)(file.path);
@@ -10027,7 +10057,16 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
           this.syncingEditorWordStatusPatchSignatures.delete(normalizedPath);
           throw error;
         }
+      } else if (eudicUrlToSet && readNullableString(getFrontmatter(this.app, file)[FRONTMATTER_KEYS.eudicUrl]) !== eudicUrlToSet) {
+        this.suppressPath(file.path);
+        try {
+          await view.save();
+        } catch (error) {
+          this.clearSuppression(file.path);
+          throw error;
+        }
       }
+      await this.waitForEudicUrlCacheSettle(file, eudicUrlToSet);
       if (data.syncStatus === "synced") {
         this.recordWordBodySyncedFromMarkdown(file, nextMarkdown);
       } else if (data.syncStatus === "dirty") {
@@ -10039,11 +10078,19 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     await this.writeFrontmatter(file, (frontmatter) => {
       applyWordSyncFrontmatterToObject(frontmatter, data);
     });
+    await this.waitForEudicUrlCacheSettle(file, eudicUrlToSet);
     if (data.syncStatus === "dirty") {
       this.setWordBodyStatusOverride(file, "dirty", data.lastError ?? null);
     } else if (data.syncStatus === "synced") {
       this.setWordBodyStatusOverride(file, "synced", null);
     }
+  }
+  async waitForEudicUrlCacheSettle(file, eudicUrl) {
+    if (!eudicUrl) {
+      return;
+    }
+    await waitForCachedFrontmatterString(this.app, file, FRONTMATTER_KEYS.eudicUrl, eudicUrl);
+    this.refreshUi();
   }
   async writeStudylistFrontmatter(file, mutate) {
     await this.writeFrontmatter(file, mutate);
