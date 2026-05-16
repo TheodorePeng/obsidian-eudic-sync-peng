@@ -2211,6 +2211,7 @@ export default class EudicSyncPlugin extends Plugin {
       const currentMarkdown = view.editor.getValue();
       const nextMarkdown = setWordSyncFrontmatterInMarkdown(currentMarkdown, data);
       const nextSignature = getWordSyncSignature(nextMarkdown);
+      let savedOpenView = false;
 
       if (nextMarkdown !== currentMarkdown) {
         this.syncingEditorWordStatusPatchSignatures.set(normalizedPath, nextSignature);
@@ -2224,6 +2225,7 @@ export default class EudicSyncPlugin extends Plugin {
         try {
           applyWordSyncFrontmatterPatchToEditor(view.editor, data);
           await view.save();
+          savedOpenView = true;
         } catch (error) {
           this.clearSuppression(file.path);
           this.syncingEditorWordStatusPatchSignatures.delete(normalizedPath);
@@ -2236,9 +2238,18 @@ export default class EudicSyncPlugin extends Plugin {
         this.suppressPath(file.path);
         try {
           await view.save();
+          savedOpenView = true;
         } catch (error) {
           this.clearSuppression(file.path);
           throw error;
+        }
+      }
+
+      if (savedOpenView) {
+        try {
+          view.editor.refresh();
+        } catch (error) {
+          console.warn(`${PLUGIN_NAME}: failed to refresh editor after saving frontmatter for ${file.path}.`, error);
         }
       }
 
@@ -2266,13 +2277,17 @@ export default class EudicSyncPlugin extends Plugin {
     }
   }
 
-  private async waitForEudicUrlCacheSettle(file: TFile, eudicUrl: string | null): Promise<void> {
+  private async waitForEudicUrlCacheSettle(file: TFile, eudicUrl: string | null): Promise<boolean> {
     if (!eudicUrl) {
-      return;
+      return true;
     }
 
-    await waitForCachedFrontmatterString(this.app, file, FRONTMATTER_KEYS.eudicUrl, eudicUrl);
+    const settled = await waitForCachedFrontmatterString(this.app, file, FRONTMATTER_KEYS.eudicUrl, eudicUrl);
+    if (!settled) {
+      console.warn(`${PLUGIN_NAME}: eudic_url was saved for ${file.path}, but Obsidian metadata cache did not refresh before timeout.`);
+    }
     this.refreshUi();
+    return settled;
   }
 
   private async writeStudylistFrontmatter(file: TFile, mutate: FrontmatterMutator): Promise<void> {

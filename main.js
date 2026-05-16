@@ -2412,8 +2412,17 @@ function sleep(ms) {
     window.setTimeout(resolve, ms);
   });
 }
+function hasFrontmatterStringValue(frontmatter, key, expectedValue) {
+  return readNullableString(frontmatter?.[key]) === expectedValue;
+}
 function hasCachedStringValue(app, file, key, expectedValue) {
-  return readNullableString(getFrontmatter(app, file)[key]) === expectedValue;
+  return hasFrontmatterStringValue(getFrontmatter(app, file), key, expectedValue);
+}
+function hasChangedMetadataStringValue(cache, key, expectedValue) {
+  return hasFrontmatterStringValue(cache.frontmatter, key, expectedValue);
+}
+function sameFile(left, right) {
+  return left.path === right.path;
 }
 async function waitForCachedFrontmatterString(app, file, key, expectedValue, options = {}) {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -2421,15 +2430,49 @@ async function waitForCachedFrontmatterString(app, file, key, expectedValue, opt
   const now2 = options.now ?? Date.now;
   const wait = options.sleep ?? sleep;
   const deadline = now2() + timeoutMs;
-  while (true) {
-    if (hasCachedStringValue(app, file, key, expectedValue)) {
-      return true;
+  let settled = hasCachedStringValue(app, file, key, expectedValue);
+  let wakeListener = null;
+  let eventRef = null;
+  if (settled) {
+    return true;
+  }
+  const wake = () => {
+    const listener = wakeListener;
+    wakeListener = null;
+    listener?.();
+  };
+  eventRef = app.metadataCache.on("changed", (changedFile, _data, cache) => {
+    if (!sameFile(changedFile, file)) {
+      return;
     }
-    const remainingMs = deadline - now2();
-    if (remainingMs <= 0) {
-      return false;
+    if (hasChangedMetadataStringValue(cache, key, expectedValue)) {
+      settled = true;
+      wake();
     }
-    await wait(Math.min(intervalMs, remainingMs));
+  });
+  try {
+    while (true) {
+      if (settled || hasCachedStringValue(app, file, key, expectedValue)) {
+        return true;
+      }
+      const remainingMs = deadline - now2();
+      if (remainingMs <= 0) {
+        return false;
+      }
+      await Promise.race([
+        wait(Math.min(intervalMs, remainingMs)),
+        new Promise((resolve) => {
+          wakeListener = resolve;
+        })
+      ]);
+    }
+  } finally {
+    if (wakeListener) {
+      wake();
+    }
+    if (eventRef) {
+      app.metadataCache.offref(eventRef);
+    }
   }
 }
 
@@ -10041,6 +10084,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
       const currentMarkdown = view.editor.getValue();
       const nextMarkdown = setWordSyncFrontmatterInMarkdown(currentMarkdown, data);
       const nextSignature = getWordSyncSignature(nextMarkdown);
+      let savedOpenView = false;
       if (nextMarkdown !== currentMarkdown) {
         this.syncingEditorWordStatusPatchSignatures.set(normalizedPath, nextSignature);
         window.setTimeout(() => {
@@ -10052,6 +10096,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
         try {
           applyWordSyncFrontmatterPatchToEditor(view.editor, data);
           await view.save();
+          savedOpenView = true;
         } catch (error) {
           this.clearSuppression(file.path);
           this.syncingEditorWordStatusPatchSignatures.delete(normalizedPath);
@@ -10061,9 +10106,17 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
         this.suppressPath(file.path);
         try {
           await view.save();
+          savedOpenView = true;
         } catch (error) {
           this.clearSuppression(file.path);
           throw error;
+        }
+      }
+      if (savedOpenView) {
+        try {
+          view.editor.refresh();
+        } catch (error) {
+          console.warn(`${PLUGIN_NAME}: failed to refresh editor after saving frontmatter for ${file.path}.`, error);
         }
       }
       await this.waitForEudicUrlCacheSettle(file, eudicUrlToSet);
@@ -10087,10 +10140,14 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
   }
   async waitForEudicUrlCacheSettle(file, eudicUrl) {
     if (!eudicUrl) {
-      return;
+      return true;
     }
-    await waitForCachedFrontmatterString(this.app, file, FRONTMATTER_KEYS.eudicUrl, eudicUrl);
+    const settled = await waitForCachedFrontmatterString(this.app, file, FRONTMATTER_KEYS.eudicUrl, eudicUrl);
+    if (!settled) {
+      console.warn(`${PLUGIN_NAME}: eudic_url was saved for ${file.path}, but Obsidian metadata cache did not refresh before timeout.`);
+    }
     this.refreshUi();
+    return settled;
   }
   async writeStudylistFrontmatter(file, mutate) {
     await this.writeFrontmatter(file, mutate);

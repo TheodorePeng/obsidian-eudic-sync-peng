@@ -1,4 +1,4 @@
-import type { App, TFile } from "obsidian";
+import type { App, CachedMetadata, EventRef, TFile } from "obsidian";
 import { getFrontmatter, readNullableString } from "./note-metadata";
 
 interface WaitForCachedFrontmatterStringOptions {
@@ -17,8 +17,24 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
+function hasFrontmatterStringValue(
+  frontmatter: Record<string, unknown> | undefined,
+  key: string,
+  expectedValue: string,
+): boolean {
+  return readNullableString(frontmatter?.[key]) === expectedValue;
+}
+
 function hasCachedStringValue(app: App, file: TFile, key: string, expectedValue: string): boolean {
-  return readNullableString(getFrontmatter(app, file)[key]) === expectedValue;
+  return hasFrontmatterStringValue(getFrontmatter(app, file), key, expectedValue);
+}
+
+function hasChangedMetadataStringValue(cache: CachedMetadata, key: string, expectedValue: string): boolean {
+  return hasFrontmatterStringValue(cache.frontmatter as Record<string, unknown> | undefined, key, expectedValue);
+}
+
+function sameFile(left: TFile, right: TFile): boolean {
+  return left.path === right.path;
 }
 
 export async function waitForCachedFrontmatterString(
@@ -33,17 +49,55 @@ export async function waitForCachedFrontmatterString(
   const now = options.now ?? Date.now;
   const wait = options.sleep ?? sleep;
   const deadline = now() + timeoutMs;
+  let settled = hasCachedStringValue(app, file, key, expectedValue);
+  let wakeListener: (() => void) | null = null;
+  let eventRef: EventRef | null = null;
 
-  while (true) {
-    if (hasCachedStringValue(app, file, key, expectedValue)) {
-      return true;
+  if (settled) {
+    return true;
+  }
+
+  const wake = () => {
+    const listener = wakeListener;
+    wakeListener = null;
+    listener?.();
+  };
+
+  eventRef = app.metadataCache.on("changed", (changedFile, _data, cache) => {
+    if (!sameFile(changedFile, file)) {
+      return;
     }
 
-    const remainingMs = deadline - now();
-    if (remainingMs <= 0) {
-      return false;
+    if (hasChangedMetadataStringValue(cache, key, expectedValue)) {
+      settled = true;
+      wake();
     }
+  });
 
-    await wait(Math.min(intervalMs, remainingMs));
+  try {
+    while (true) {
+      if (settled || hasCachedStringValue(app, file, key, expectedValue)) {
+        return true;
+      }
+
+      const remainingMs = deadline - now();
+      if (remainingMs <= 0) {
+        return false;
+      }
+
+      await Promise.race([
+        wait(Math.min(intervalMs, remainingMs)),
+        new Promise<void>((resolve) => {
+          wakeListener = resolve;
+        }),
+      ]);
+    }
+  } finally {
+    if (wakeListener) {
+      wake();
+    }
+    if (eventRef) {
+      app.metadataCache.offref(eventRef);
+    }
   }
 }

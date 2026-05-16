@@ -240,6 +240,18 @@ assert.equal(
     "Body",
   ].join("\n"),
 );
+assert.equal(
+  setWordSyncFrontmatterInMarkdown("Body without properties", {
+    eudicUrl: "https://dict.eudic.net/dicts/en/apple",
+  }),
+  [
+    "---",
+    "eudic_url: https://dict.eudic.net/dicts/en/apple",
+    "---",
+    "",
+    "Body without properties",
+  ].join("\n"),
+);
 assert.deepEqual(buildWordSyncFrontmatterPatch(syncedWordWithStudylist, {}).changed, false);
 
 let editorWordSyncMarkdown = syncedWordWithStudylist;
@@ -1044,11 +1056,30 @@ assert.equal(
 
 const cacheSettleFile = mockFile("Eudic/Words/cache-settle.md");
 const cacheSettleFrontmatter: Record<string, unknown> = { eudic_url: "" };
+let cacheSettleChangedHandler:
+  | ((file: TFile, data: string, cache: { frontmatter: Record<string, unknown> }) => void)
+  | null = null;
+let cacheSettleOffrefCalls = 0;
+const cacheSettleEventRef = {};
 const cacheSettleApp = {
   metadataCache: {
     getFileCache: () => ({ frontmatter: cacheSettleFrontmatter }),
+    on: (
+      name: string,
+      callback: (file: TFile, data: string, cache: { frontmatter: Record<string, unknown> }) => void,
+    ) => {
+      assert.equal(name, "changed");
+      cacheSettleChangedHandler = callback;
+      return cacheSettleEventRef;
+    },
+    offref: (ref: unknown) => {
+      assert.equal(ref, cacheSettleEventRef);
+      cacheSettleChangedHandler = null;
+      cacheSettleOffrefCalls += 1;
+    },
   },
 } as unknown as App;
+const cacheSettleExpectedUrl = "https://dict.eudic.net/dicts/en/cache-settle";
 let cacheSettleTimeoutNow = 0;
 let cacheSettleTimeoutSleeps = 0;
 assert.equal(
@@ -1056,7 +1087,7 @@ assert.equal(
     cacheSettleApp,
     cacheSettleFile,
     "eudic_url",
-    "https://dict.eudic.net/dicts/en/cache-settle",
+    cacheSettleExpectedUrl,
     {
       timeoutMs: 100,
       intervalMs: 40,
@@ -1070,13 +1101,15 @@ assert.equal(
   false,
 );
 assert.equal(cacheSettleTimeoutSleeps, 3);
-cacheSettleFrontmatter.eudic_url = "https://dict.eudic.net/dicts/en/cache-settle";
+assert.equal(cacheSettleOffrefCalls, 1);
+assert.equal(cacheSettleChangedHandler, null);
+cacheSettleFrontmatter.eudic_url = cacheSettleExpectedUrl;
 assert.equal(
   await waitForCachedFrontmatterString(
     cacheSettleApp,
     cacheSettleFile,
     "eudic_url",
-    "https://dict.eudic.net/dicts/en/cache-settle",
+    cacheSettleExpectedUrl,
     {
       timeoutMs: 100,
       intervalMs: 20,
@@ -1088,6 +1121,36 @@ assert.equal(
   ),
   true,
 );
+assert.equal(cacheSettleOffrefCalls, 1);
+
+let cacheSettleEventNow = 0;
+let cacheSettleEventSleeps = 0;
+cacheSettleFrontmatter.eudic_url = "";
+assert.equal(
+  await waitForCachedFrontmatterString(
+    cacheSettleApp,
+    cacheSettleFile,
+    "eudic_url",
+    cacheSettleExpectedUrl,
+    {
+      timeoutMs: 200,
+      intervalMs: 50,
+      now: () => cacheSettleEventNow,
+      sleep: async (ms) => {
+        cacheSettleEventSleeps += 1;
+        cacheSettleFrontmatter.eudic_url = cacheSettleExpectedUrl;
+        cacheSettleChangedHandler?.(cacheSettleFile, "", {
+          frontmatter: { eudic_url: cacheSettleExpectedUrl },
+        });
+        cacheSettleEventNow += ms;
+      },
+    },
+  ),
+  true,
+);
+assert.equal(cacheSettleEventSleeps, 1);
+assert.equal(cacheSettleOffrefCalls, 2);
+assert.equal(cacheSettleChangedHandler, null);
 
 let cacheSettleNow = 0;
 let cacheSettleSleeps = 0;
@@ -1097,7 +1160,7 @@ assert.equal(
     cacheSettleApp,
     cacheSettleFile,
     "eudic_url",
-    "https://dict.eudic.net/dicts/en/cache-settle",
+    cacheSettleExpectedUrl,
     {
       timeoutMs: 200,
       intervalMs: 50,
@@ -1106,7 +1169,7 @@ assert.equal(
         cacheSettleSleeps += 1;
         cacheSettleNow += ms;
         if (cacheSettleSleeps === 2) {
-          cacheSettleFrontmatter.eudic_url = "https://dict.eudic.net/dicts/en/cache-settle";
+          cacheSettleFrontmatter.eudic_url = cacheSettleExpectedUrl;
         }
       },
     },
@@ -1114,6 +1177,8 @@ assert.equal(
   true,
 );
 assert.equal(cacheSettleSleeps, 2);
+assert.equal(cacheSettleOffrefCalls, 3);
+assert.equal(cacheSettleChangedHandler, null);
 
 const ensureUntitledFile = mockFile("Eudic/Words/Untitled.md");
 const ensureFrontmatterByPath = new Map<string, Record<string, unknown>>();
