@@ -36,6 +36,11 @@ export interface NoteOutputSeparator {
   type: "separator";
 }
 
+export interface NoteOutputAuthoredGap {
+  type: "authoredGap";
+  blankLines: number;
+}
+
 export interface NoteOutputListItem {
   blocks: NoteOutputBlock[];
 }
@@ -45,4 +50,4 @@ export interface NoteOutputUnorderedList {
   items: NoteOutputListItem[];
 }
 
-export type NoteOutputBlock = NoteOutputParagraph | NoteOutputSeparator | NoteOutputUnorderedList;
+export type NoteOutputBlock = NoteOutputParagraph | NoteOutputSeparator | NoteOutputAuthoredGap | NoteOutputUnorderedList;

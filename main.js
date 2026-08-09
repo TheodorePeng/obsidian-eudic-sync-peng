@@ -686,7 +686,7 @@ var EudicSyncCommandController = class {
 var PLUGIN_ID = "eudic-sync";
 var PLUGIN_NAME = "Eudic Sync";
 var SUPPRESSED_WRITE_TTL_MS = 1500;
-var NOTE_OUTPUT_FORMAT_VERSION = 7;
+var NOTE_OUTPUT_FORMAT_VERSION = 8;
 var DEFAULT_SEMANTIC_BLOCK_WORD_BOLD_KINDS = ["n.", "v.", "a.", "adj.", "adv.", "vt.", "vi."];
 var DEFAULT_SEMANTIC_BLOCK_WORD_LINK_KINDS = ["Cog.", "Syn.", "Syn./Cog.", "Ant."];
 var DEFAULT_SEMANTIC_BLOCK_KIND_PRESETS = [
@@ -6098,6 +6098,91 @@ function shouldFillEudicUrlBeforeFirstSync(frontmatter) {
 // src/html-renderer.ts
 var import_obsidian12 = require("obsidian");
 
+// src/authored-blank-lines.ts
+var AUTHORED_GAP_MARKER_ATTRIBUTE = "data-eudic-authored-gap-id";
+var AUTHORED_GAP_COUNT_ATTRIBUTE = "data-eudic-authored-gap-count";
+function isBlankLine2(line) {
+  return line.trim().length === 0;
+}
+function isThematicBreak(line) {
+  return /^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$/.test(line);
+}
+function isStandaloneEmbed(line) {
+  return /^!\[\[[^\]\n]+\]\]$/.test(line.trim());
+}
+function parseEudicOpeningFence(line) {
+  const match = line.match(/^\s*(`{3,}|~{3,})\s*eudic-block(?:\s+.*?)?\s*$/);
+  if (!match) {
+    return null;
+  }
+  const token = match[1] ?? "```";
+  return {
+    character: token[0] === "~" ? "~" : "`",
+    minimumLength: token.length
+  };
+}
+function isMatchingEudicClosingFence(line, fence) {
+  const tokenPattern = fence.character === "`" ? "`" : "~";
+  return new RegExp(`^\\s*${tokenPattern}{${fence.minimumLength},}\\s*$`).test(line);
+}
+function buildStructuralLineMask(lines) {
+  const structuralLines = lines.map(() => false);
+  let activeEudicFence = null;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+    if (activeEudicFence && isMatchingEudicClosingFence(line, activeEudicFence)) {
+      structuralLines[index] = true;
+      activeEudicFence = null;
+      continue;
+    }
+    if (!activeEudicFence) {
+      const openingFence = parseEudicOpeningFence(line);
+      if (openingFence) {
+        structuralLines[index] = true;
+        activeEudicFence = openingFence;
+        continue;
+      }
+    }
+    structuralLines[index] = isThematicBreak(line) || isStandaloneEmbed(line);
+  }
+  return structuralLines;
+}
+function escapeHtmlAttribute(value) {
+  return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function buildGapMarker(markerId, blankLines) {
+  return `<div ${AUTHORED_GAP_MARKER_ATTRIBUTE}="${escapeHtmlAttribute(markerId)}" ${AUTHORED_GAP_COUNT_ATTRIBUTE}="${blankLines}"></div>`;
+}
+function annotateAuthoredBlankLines(markdown, markerId) {
+  const lines = markdown.replace(/\r\n?/g, "\n").split("\n");
+  const structuralLines = buildStructuralLineMask(lines);
+  const output = [];
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index] ?? "";
+    if (!isBlankLine2(line)) {
+      output.push(line);
+      index += 1;
+      continue;
+    }
+    const runStart = index;
+    while (index < lines.length && isBlankLine2(lines[index] ?? "")) {
+      index += 1;
+    }
+    if (runStart === 0 || index === lines.length) {
+      continue;
+    }
+    const runLength = index - runStart;
+    const touchesStructuralLine = structuralLines[runStart - 1] || structuralLines[index];
+    const authoredBlankLines = Math.max(0, runLength - (touchesStructuralLine ? 1 : 0));
+    output.push("");
+    if (authoredBlankLines > 0) {
+      output.push(buildGapMarker(markerId, authoredBlankLines), "");
+    }
+  }
+  return output.join("\n");
+}
+
 // src/reference-embed-expander.ts
 var EMBED_PATTERN2 = /!\[\[([^[\]\n]+)\]\]/g;
 var MAX_REFERENCE_EMBED_DEPTH = 4;
@@ -6224,7 +6309,7 @@ function extractReferenceMarkdownByBlockId(markdown, blockId) {
   }
   return null;
 }
-async function readExpandedReferenceMarkdownSegments(app, pathScope, referenceFile, blockId, visited, depth, embeddedFromPath) {
+async function readExpandedReferenceMarkdownSegments(app, pathScope, referenceFile, blockId, visited, depth, embeddedFromPath, authoredGapMarkerId) {
   const visitKey = `${referenceFile.path}#${blockId ?? ""}`;
   if (visited.has(visitKey)) {
     return null;
@@ -6234,16 +6319,18 @@ async function readExpandedReferenceMarkdownSegments(app, pathScope, referenceFi
   if (!referenceMarkdown) {
     return null;
   }
+  const annotatedReferenceMarkdown = authoredGapMarkerId ? annotateAuthoredBlankLines(referenceMarkdown, authoredGapMarkerId) : referenceMarkdown;
   const nextVisited = new Set(visited);
   nextVisited.add(visitKey);
   return expandManagedReferenceEmbedsInMarkdownSegments(
     app,
     pathScope,
-    referenceMarkdown,
+    annotatedReferenceMarkdown,
     referenceFile.path,
     nextVisited,
     depth + 1,
-    embeddedFromPath
+    embeddedFromPath,
+    authoredGapMarkerId
   );
 }
 function pushSegment(segments, segment) {
@@ -6257,7 +6344,7 @@ function pushSegment(segments, segment) {
   }
   segments.push({ ...segment });
 }
-async function expandManagedReferenceEmbedsInMarkdownSegments(app, pathScope, markdown, sourcePath, visited = /* @__PURE__ */ new Set(), depth = 0, embeddedFromPath) {
+async function expandManagedReferenceEmbedsInMarkdownSegments(app, pathScope, markdown, sourcePath, visited = /* @__PURE__ */ new Set(), depth = 0, embeddedFromPath, authoredGapMarkerId) {
   if (depth >= MAX_REFERENCE_EMBED_DEPTH || !markdown.includes("![[") || !markdown.includes("]]")) {
     return [{ markdown, sourcePath, embeddedFromPath }];
   }
@@ -6291,7 +6378,8 @@ async function expandManagedReferenceEmbedsInMarkdownSegments(app, pathScope, ma
       parsedTarget.blockId,
       visited,
       depth,
-      sourcePath
+      sourcePath,
+      authoredGapMarkerId
     );
     if (!expandedSegments) {
       pushSegment(output, {
@@ -6344,11 +6432,27 @@ function resolveSemanticOptions(source, sourcePath, embeddedFromPath) {
   }
   return typeof source === "function" ? source(sourcePath, embeddedFromPath) : source;
 }
-async function expandReferenceSegments(app, pathScope, markdown, sourcePath, embeddedFromPath) {
-  return pathScope ? expandManagedReferenceEmbedsInMarkdownSegments(app, pathScope, markdown, sourcePath, /* @__PURE__ */ new Set(), 0, embeddedFromPath) : [{ markdown, sourcePath, embeddedFromPath }];
+async function expandReferenceSegments(app, pathScope, markdown, sourcePath, embeddedFromPath, authoredGapMarkerId) {
+  return pathScope ? expandManagedReferenceEmbedsInMarkdownSegments(
+    app,
+    pathScope,
+    markdown,
+    sourcePath,
+    /* @__PURE__ */ new Set(),
+    0,
+    embeddedFromPath,
+    authoredGapMarkerId
+  ) : [{ markdown, sourcePath, embeddedFromPath }];
 }
-async function transformRegularMarkdownForEudicRender(app, pathScope, markdown, sourcePath, semanticOptions, embeddedFromPath) {
-  const segments = await expandReferenceSegments(app, pathScope, markdown, sourcePath, embeddedFromPath);
+async function transformRegularMarkdownForEudicRender(app, pathScope, markdown, sourcePath, semanticOptions, embeddedFromPath, authoredGapMarkerId) {
+  const segments = await expandReferenceSegments(
+    app,
+    pathScope,
+    markdown,
+    sourcePath,
+    embeddedFromPath,
+    authoredGapMarkerId
+  );
   const transformedMarkdownSegments = [];
   for (const segment of segments) {
     transformedMarkdownSegments.push(
@@ -6360,8 +6464,8 @@ async function transformRegularMarkdownForEudicRender(app, pathScope, markdown, 
   }
   return transformedMarkdownSegments.join("");
 }
-async function transformEudicBlockForRender(app, pathScope, kind, body, sourcePath, semanticOptions) {
-  const bodySegments = await expandReferenceSegments(app, pathScope, body, sourcePath);
+async function transformEudicBlockForRender(app, pathScope, kind, body, sourcePath, semanticOptions, authoredGapMarkerId) {
+  const bodySegments = await expandReferenceSegments(app, pathScope, body, sourcePath, void 0, authoredGapMarkerId);
   const transformedBodySegments = [];
   for (const segment of bodySegments) {
     const resolvedOptions = await resolveSemanticOptions(semanticOptions, segment.sourcePath, segment.embeddedFromPath);
@@ -6371,8 +6475,8 @@ async function transformEudicBlockForRender(app, pathScope, kind, body, sourcePa
   }
   return renderEudicBlockToMarkdown(kind, transformedBodySegments.join(""), null);
 }
-async function transformMarkdownForEudicRender(app, pathScope, markdown, sourcePath, semanticOptions) {
-  const normalizedMarkdown = normalizeMarkdown3(markdown);
+async function transformMarkdownForEudicRender(app, pathScope, markdown, sourcePath, semanticOptions, authoredGapMarkerId) {
+  const normalizedMarkdown = authoredGapMarkerId ? annotateAuthoredBlankLines(normalizeMarkdown3(markdown), authoredGapMarkerId) : normalizeMarkdown3(markdown);
   const lines = normalizedMarkdown.split("\n");
   const output = [];
   let regularLines = [];
@@ -6386,7 +6490,9 @@ async function transformMarkdownForEudicRender(app, pathScope, markdown, sourceP
         pathScope,
         regularLines.join("\n"),
         sourcePath,
-        semanticOptions
+        semanticOptions,
+        void 0,
+        authoredGapMarkerId
       )
     );
     regularLines = [];
@@ -6417,7 +6523,8 @@ async function transformMarkdownForEudicRender(app, pathScope, markdown, sourceP
         openingFence.kind,
         lines.slice(lineIndex + 1, closingLineIndex).join("\n"),
         sourcePath,
-        semanticOptions
+        semanticOptions,
+        authoredGapMarkerId
       )
     );
     lineIndex = closingLineIndex;
@@ -6438,19 +6545,24 @@ var HtmlRenderer = class {
   async renderMarkdown(markdown, sourcePath, semanticOptions) {
     const container = document.createElement("div");
     const component = new import_obsidian12.Component();
+    const authoredGapMarkerId = globalThis.crypto.randomUUID();
     component.load();
     const transformedMarkdown = await transformMarkdownForEudicRender(
       this.app,
       this.pathScope,
       markdown,
       sourcePath,
-      semanticOptions
+      semanticOptions,
+      authoredGapMarkerId
     );
     const renderableMarkdown = protectLeadingThematicBreakFromFrontmatter(transformedMarkdown);
     try {
       await import_obsidian12.MarkdownRenderer.render(this.app, renderableMarkdown, container, sourcePath, component);
       await waitForFrame();
-      return container.innerHTML;
+      return {
+        html: container.innerHTML,
+        authoredGapMarkerId
+      };
     } finally {
       component.unload();
     }
@@ -6984,6 +7096,14 @@ function collectBlocksFromNode(node, context) {
     return [];
   }
   const tagName = element.tagName.toLowerCase();
+  const markerId = element.getAttribute(AUTHORED_GAP_MARKER_ATTRIBUTE);
+  if (tagName === "div" && element.childNodes.length === 0 && context.authoredGapMarkerId && markerId === context.authoredGapMarkerId) {
+    const rawBlankLines = element.getAttribute(AUTHORED_GAP_COUNT_ATTRIBUTE) ?? "";
+    const blankLines = Number(rawBlankLines);
+    if (/^[1-9]\d*$/.test(rawBlankLines) && Number.isSafeInteger(blankLines)) {
+      return [{ type: "authoredGap", blankLines }];
+    }
+  }
   if (tagName === "hr") {
     return [{ type: "separator" }];
   }
@@ -7008,6 +7128,18 @@ function collectBlocksFromNode(node, context) {
 function normalizeBlocks(blocks) {
   const normalized = [];
   for (const block of blocks) {
+    if (block.type === "authoredGap") {
+      if (!Number.isSafeInteger(block.blankLines) || block.blankLines <= 0 || normalized.length === 0) {
+        continue;
+      }
+      const previousBlock = normalized.at(-1);
+      if (previousBlock?.type === "authoredGap") {
+        previousBlock.blankLines += block.blankLines;
+      } else {
+        normalized.push({ ...block });
+      }
+      continue;
+    }
     if (block.type === "paragraph" && !hasMeaningfulInline(block.inlines)) {
       continue;
     }
@@ -7019,11 +7151,14 @@ function normalizeBlocks(blocks) {
     }
     normalized.push(block);
   }
+  if (normalized.at(-1)?.type === "authoredGap") {
+    normalized.pop();
+  }
   return normalized;
 }
-function buildNoteOutputBlocks(renderedHtml, linkResolver) {
+function buildNoteOutputBlocks(renderedHtml, linkResolver, authoredGapMarkerId) {
   const documentRoot = new DOMParser().parseFromString(`<html><body>${renderedHtml}</body></html>`, "text/html");
-  return normalizeBlocks(collectBlocksFromChildren(documentRoot.body.childNodes, { linkResolver }));
+  return normalizeBlocks(collectBlocksFromChildren(documentRoot.body.childNodes, { linkResolver, authoredGapMarkerId }));
 }
 
 // src/note-output/serializer.ts
@@ -7121,6 +7256,8 @@ function renderListItem(item, mode, depth) {
 }
 function renderBlock(block, mode, depth) {
   switch (block.type) {
+    case "authoredGap":
+      return "";
     case "separator":
       return "<hr>";
     case "paragraph":
@@ -7128,6 +7265,10 @@ function renderBlock(block, mode, depth) {
     case "unorderedList":
       return renderUnorderedList(block, mode, depth);
   }
+}
+function renderAuthoredGap(blankLines, mode) {
+  const lineBreak = mode === "minimal" ? "\n" : "<br>";
+  return lineBreak.repeat(blankLines + 1);
 }
 function getBlockJoiner(previous, next, mode) {
   if (isOrderedListMarkerParagraph(previous) && next.type === "paragraph") {
@@ -7142,15 +7283,29 @@ function getBlockJoiner(previous, next, mode) {
   return "<br>";
 }
 function renderBlocks(blocks, mode, _context, depth) {
-  const meaningfulBlocks = blocks.map((block) => ({ block, rendered: renderBlock(block, mode, depth) })).filter(({ rendered }) => rendered.length > 0);
-  if (meaningfulBlocks.length === 0) {
-    return "";
-  }
-  let output = meaningfulBlocks[0].rendered;
-  for (let index = 1; index < meaningfulBlocks.length; index += 1) {
-    const previous = meaningfulBlocks[index - 1];
-    const current = meaningfulBlocks[index];
-    output += getBlockJoiner(previous.block, current.block, mode) + current.rendered;
+  let output = "";
+  let previousBlock = null;
+  let pendingAuthoredBlankLines = 0;
+  for (const block of blocks) {
+    if (block.type === "authoredGap") {
+      if (previousBlock && Number.isSafeInteger(block.blankLines) && block.blankLines > 0) {
+        pendingAuthoredBlankLines += block.blankLines;
+      }
+      continue;
+    }
+    const rendered = renderBlock(block, mode, depth);
+    if (!rendered) {
+      continue;
+    }
+    if (!previousBlock) {
+      output = rendered;
+      previousBlock = block;
+      pendingAuthoredBlankLines = 0;
+      continue;
+    }
+    output += (pendingAuthoredBlankLines > 0 ? renderAuthoredGap(pendingAuthoredBlankLines, mode) : getBlockJoiner(previousBlock, block, mode)) + rendered;
+    previousBlock = block;
+    pendingAuthoredBlankLines = 0;
   }
   return output.trim();
 }
@@ -7159,8 +7314,8 @@ function serializeNoteOutputBlocks(blocks, mode) {
 }
 
 // src/note-output/index.ts
-function buildFinalNoteHtml(renderedHtml, mode, linkResolver) {
-  const blocks = buildNoteOutputBlocks(renderedHtml, linkResolver);
+function buildFinalNoteHtml(rendered, mode, linkResolver) {
+  const blocks = buildNoteOutputBlocks(rendered.html, linkResolver, rendered.authoredGapMarkerId);
   return serializeNoteOutputBlocks(blocks, mode);
 }
 function createTextInline2(text) {
@@ -7183,8 +7338,8 @@ function buildLinkedWordHeadingBlock(word, href) {
     ]
   };
 }
-function buildFinalWordNoteHtml(renderedHtml, mode, word, href, linkResolver) {
-  const blocks = buildNoteOutputBlocks(renderedHtml, linkResolver);
+function buildFinalWordNoteHtml(rendered, mode, word, href, linkResolver) {
+  const blocks = buildNoteOutputBlocks(rendered.html, linkResolver, rendered.authoredGapMarkerId);
   return serializeNoteOutputBlocks([buildLinkedWordHeadingBlock(word, href), ...blocks], mode);
 }
 
@@ -7211,7 +7366,7 @@ function getSemanticSettingsSignature(settings) {
   });
 }
 function keysEqual(left, right) {
-  return left.wordPath === right.wordPath && left.wordSignature === right.wordSignature && left.noteOutputMode === right.noteOutputMode && left.semanticSettingsSignature === right.semanticSettingsSignature && left.referenceDependencySignature === right.referenceDependencySignature;
+  return left.wordPath === right.wordPath && left.wordSignature === right.wordSignature && left.noteOutputMode === right.noteOutputMode && left.noteOutputFormatVersion === right.noteOutputFormatVersion && left.semanticSettingsSignature === right.semanticSettingsSignature && left.referenceDependencySignature === right.referenceDependencySignature;
 }
 var SyncRenderCache = class {
   constructor() {
@@ -7630,6 +7785,7 @@ var SyncService = class {
       wordPath: file.path,
       wordSignature,
       noteOutputMode: settings.noteOutputMode,
+      noteOutputFormatVersion: settings.noteOutputFormatVersion,
       semanticSettingsSignature: getSemanticSettingsSignature(settings),
       referenceDependencySignature: this.getReferenceDependencySignature(file)
     };
@@ -7642,7 +7798,7 @@ var SyncService = class {
     if (!syncBodyMarkdown) {
       throw new Error(EMPTY_WORD_BODY_SYNC_ERROR);
     }
-    const renderedHtml = await this.renderer.renderMarkdown(
+    const rendered = await this.renderer.renderMarkdown(
       syncBodyMarkdown,
       file.path,
       (sourcePath, embeddedFromPath) => this.getSemanticBlockTransformOptionsForSourcePath(sourcePath, embeddedFromPath, file, context.word, wordLinkId)
@@ -7652,12 +7808,12 @@ var SyncService = class {
       pathScope: this.options.pathScope,
       sourcePath: file.path
     };
-    const finalNoteBodyHtml = buildFinalNoteHtml(renderedHtml, settings.noteOutputMode, linkResolver);
+    const finalNoteBodyHtml = buildFinalNoteHtml(rendered, settings.noteOutputMode, linkResolver);
     if (!finalNoteBodyHtml.trim()) {
       throw new Error(EMPTY_WORD_BODY_SYNC_ERROR);
     }
     const finalNoteHtml = buildFinalWordNoteHtml(
-      renderedHtml,
+      rendered,
       settings.noteOutputMode,
       context.word,
       buildEudicProtocolUrl(this.options.app, "word", wordLinkId, context.word),

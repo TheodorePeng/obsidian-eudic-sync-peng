@@ -126,6 +126,8 @@ function renderListItem(item: NoteOutputListItem, mode: EudicNoteOutputMode, dep
 
 function renderBlock(block: NoteOutputBlock, mode: EudicNoteOutputMode, depth: number): string {
   switch (block.type) {
+    case "authoredGap":
+      return "";
     case "separator":
       return "<hr>";
     case "paragraph":
@@ -133,6 +135,11 @@ function renderBlock(block: NoteOutputBlock, mode: EudicNoteOutputMode, depth: n
     case "unorderedList":
       return renderUnorderedList(block, mode, depth);
   }
+}
+
+function renderAuthoredGap(blankLines: number, mode: EudicNoteOutputMode): string {
+  const lineBreak = mode === "minimal" ? "\n" : "<br>";
+  return lineBreak.repeat(blankLines + 1);
 }
 
 function getBlockJoiner(previous: NoteOutputBlock, next: NoteOutputBlock, mode: EudicNoteOutputMode): string {
@@ -162,20 +169,37 @@ function renderBlocks(
   _context: "top-level" | "list-item",
   depth: number,
 ): string {
-  const meaningfulBlocks = blocks
-    .map((block) => ({ block, rendered: renderBlock(block, mode, depth) }))
-    .filter(({ rendered }) => rendered.length > 0);
+  let output = "";
+  let previousBlock: NoteOutputBlock | null = null;
+  let pendingAuthoredBlankLines = 0;
 
-  if (meaningfulBlocks.length === 0) {
-    return "";
-  }
+  for (const block of blocks) {
+    if (block.type === "authoredGap") {
+      if (previousBlock && Number.isSafeInteger(block.blankLines) && block.blankLines > 0) {
+        pendingAuthoredBlankLines += block.blankLines;
+      }
+      continue;
+    }
 
-  let output = meaningfulBlocks[0].rendered;
+    const rendered = renderBlock(block, mode, depth);
+    if (!rendered) {
+      continue;
+    }
 
-  for (let index = 1; index < meaningfulBlocks.length; index += 1) {
-    const previous = meaningfulBlocks[index - 1];
-    const current = meaningfulBlocks[index];
-    output += getBlockJoiner(previous.block, current.block, mode) + current.rendered;
+    if (!previousBlock) {
+      output = rendered;
+      previousBlock = block;
+      pendingAuthoredBlankLines = 0;
+      continue;
+    }
+
+    output += (
+      pendingAuthoredBlankLines > 0
+        ? renderAuthoredGap(pendingAuthoredBlankLines, mode)
+        : getBlockJoiner(previousBlock, block, mode)
+    ) + rendered;
+    previousBlock = block;
+    pendingAuthoredBlankLines = 0;
   }
 
   return output.trim();

@@ -42,6 +42,13 @@ The default folder examples are:
 - `Wrap selection as Eudic block`
 - `Insert Eudic block`
 
+## Blank lines in synced notes
+
+- Blank lines between ordinary content are preserved in Eudic.
+- Beside a thematic break, an `eudic-block` fence, or a standalone embed, the first blank line is treated as Obsidian source formatting and is not added as visible Eudic spacing.
+- Additional blank lines beside those structures are preserved. For example, two source blank lines produce one visible blank line in Eudic.
+- Sync rendering never writes placeholders, literal `\n` text, or generated `<br>` tags back into the Obsidian Markdown file.
+
 ## Install with BRAT
 
 1. Install the [BRAT](https://github.com/TfTHacker/obsidian42-brat) plugin from Obsidian Community Plugins.
@@ -128,6 +135,13 @@ Eudic Sync 是一个 Obsidian 插件，用于管理英语单词笔记，并将�
 - `Extract current Eudic block to reference`
 - `Wrap selection as Eudic block`
 - `Insert Eudic block`
+
+## 同步后的空行规则
+
+- 普通内容之间的空行会保留到欧路词典。
+- 分割线、`eudic-block` 围栏或独占一行的嵌入链接旁，第一个空行只用于保持 Obsidian 源码清爽，不会变成欧路词典中的额外留白。
+- 这些结构旁更多的空行会继续保留。例如，源码中的两个空行会在欧路词典中留下一个可见空白行。
+- 同步渲染不会把占位符、可见的 `\n` 字样或生成的 `<br>` 标签写回 Obsidian Markdown 文件。
 
 ## 通过 BRAT 安装
 

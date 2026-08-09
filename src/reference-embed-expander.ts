@@ -1,4 +1,5 @@
 import type { App, TFile } from "obsidian";
+import { annotateAuthoredBlankLines } from "./authored-blank-lines";
 import type { PathScope } from "./path-scope";
 import { resolveManagedReferencePath } from "./reference-links";
 import { stripYamlFrontmatter, trimBoundaryBlankLines } from "./word-body";
@@ -210,6 +211,7 @@ async function readExpandedReferenceMarkdownSegments(
   visited: Set<string>,
   depth: number,
   embeddedFromPath: string,
+  authoredGapMarkerId?: string,
 ): Promise<ExpandedReferenceMarkdownSegment[] | null> {
   const visitKey = `${referenceFile.path}#${blockId ?? ""}`;
   if (visited.has(visitKey)) {
@@ -225,16 +227,20 @@ async function readExpandedReferenceMarkdownSegments(
     return null;
   }
 
+  const annotatedReferenceMarkdown = authoredGapMarkerId
+    ? annotateAuthoredBlankLines(referenceMarkdown, authoredGapMarkerId)
+    : referenceMarkdown;
   const nextVisited = new Set(visited);
   nextVisited.add(visitKey);
   return expandManagedReferenceEmbedsInMarkdownSegments(
     app,
     pathScope,
-    referenceMarkdown,
+    annotatedReferenceMarkdown,
     referenceFile.path,
     nextVisited,
     depth + 1,
     embeddedFromPath,
+    authoredGapMarkerId,
   );
 }
 
@@ -260,6 +266,7 @@ export async function expandManagedReferenceEmbedsInMarkdownSegments(
   visited = new Set<string>(),
   depth = 0,
   embeddedFromPath?: string,
+  authoredGapMarkerId?: string,
 ): Promise<ExpandedReferenceMarkdownSegment[]> {
   if (depth >= MAX_REFERENCE_EMBED_DEPTH || !markdown.includes("![[") || !markdown.includes("]]")) {
     return [{ markdown, sourcePath, embeddedFromPath }];
@@ -300,6 +307,7 @@ export async function expandManagedReferenceEmbedsInMarkdownSegments(
       visited,
       depth,
       sourcePath,
+      authoredGapMarkerId,
     );
     if (!expandedSegments) {
       pushSegment(output, {

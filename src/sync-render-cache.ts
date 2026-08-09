@@ -4,6 +4,7 @@ export interface SyncRenderCacheKey {
   wordPath: string;
   wordSignature: string;
   noteOutputMode: string;
+  noteOutputFormatVersion: number;
   semanticSettingsSignature: string;
   referenceDependencySignature: string;
 }
@@ -42,6 +43,7 @@ function keysEqual(left: SyncRenderCacheKey, right: SyncRenderCacheKey): boolean
   return left.wordPath === right.wordPath
     && left.wordSignature === right.wordSignature
     && left.noteOutputMode === right.noteOutputMode
+    && left.noteOutputFormatVersion === right.noteOutputFormatVersion
     && left.semanticSettingsSignature === right.semanticSettingsSignature
     && left.referenceDependencySignature === right.referenceDependencySignature;
 }

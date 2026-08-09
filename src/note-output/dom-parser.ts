@@ -1,4 +1,5 @@
 import type { App, TFile } from "obsidian";
+import { AUTHORED_GAP_COUNT_ATTRIBUTE, AUTHORED_GAP_MARKER_ATTRIBUTE } from "../authored-blank-lines";
 import { buildManagedFileProtocolUrl } from "../eudic-link";
 import { getFrontmatter, isWordSyncDisabledFrontmatter, readNullableString } from "../note-metadata";
 import type { PathScope } from "../path-scope";
@@ -112,6 +113,7 @@ export interface NoteOutputLinkResolverContext {
 
 interface NoteOutputParseContext {
   linkResolver?: NoteOutputLinkResolverContext;
+  authoredGapMarkerId?: string;
 }
 
 function getHrefScheme(href: string): string | null {
@@ -688,6 +690,19 @@ function collectBlocksFromNode(node: ChildNode, context: NoteOutputParseContext)
   }
 
   const tagName = element.tagName.toLowerCase();
+  const markerId = element.getAttribute(AUTHORED_GAP_MARKER_ATTRIBUTE);
+  if (
+    tagName === "div"
+    && element.childNodes.length === 0
+    && context.authoredGapMarkerId
+    && markerId === context.authoredGapMarkerId
+  ) {
+    const rawBlankLines = element.getAttribute(AUTHORED_GAP_COUNT_ATTRIBUTE) ?? "";
+    const blankLines = Number(rawBlankLines);
+    if (/^[1-9]\d*$/.test(rawBlankLines) && Number.isSafeInteger(blankLines)) {
+      return [{ type: "authoredGap", blankLines }];
+    }
+  }
 
   if (tagName === "hr") {
     return [{ type: "separator" }];
@@ -721,6 +736,20 @@ function normalizeBlocks(blocks: NoteOutputBlock[]): NoteOutputBlock[] {
   const normalized: NoteOutputBlock[] = [];
 
   for (const block of blocks) {
+    if (block.type === "authoredGap") {
+      if (!Number.isSafeInteger(block.blankLines) || block.blankLines <= 0 || normalized.length === 0) {
+        continue;
+      }
+
+      const previousBlock = normalized.at(-1);
+      if (previousBlock?.type === "authoredGap") {
+        previousBlock.blankLines += block.blankLines;
+      } else {
+        normalized.push({ ...block });
+      }
+      continue;
+    }
+
     if (block.type === "paragraph" && !hasMeaningfulInline(block.inlines)) {
       continue;
     }
@@ -736,13 +765,18 @@ function normalizeBlocks(blocks: NoteOutputBlock[]): NoteOutputBlock[] {
     normalized.push(block);
   }
 
+  if (normalized.at(-1)?.type === "authoredGap") {
+    normalized.pop();
+  }
+
   return normalized;
 }
 
 export function buildNoteOutputBlocks(
   renderedHtml: string,
   linkResolver?: NoteOutputLinkResolverContext,
+  authoredGapMarkerId?: string,
 ): NoteOutputBlock[] {
   const documentRoot = new DOMParser().parseFromString(`<html><body>${renderedHtml}</body></html>`, "text/html");
-  return normalizeBlocks(collectBlocksFromChildren(documentRoot.body.childNodes, { linkResolver }));
+  return normalizeBlocks(collectBlocksFromChildren(documentRoot.body.childNodes, { linkResolver, authoredGapMarkerId }));
 }

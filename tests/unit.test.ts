@@ -71,7 +71,7 @@ const presets = ["Syn.", "Syn./Cog.", "a.", "Cog."];
 
 assert.equal(DEFAULT_SETTINGS.enableAutoBoldMarkersOnEdit, false);
 assert.equal(DEFAULT_SETTINGS.enableSemanticBlockMarkerBold, false);
-assert.equal(NOTE_OUTPUT_FORMAT_VERSION, 7);
+assert.equal(NOTE_OUTPUT_FORMAT_VERSION, 8);
 assert.equal(DEFAULT_SETTINGS.referenceMetadataWriteMode, "auto");
 
 const syncedWordMarkdown = [
@@ -3441,11 +3441,13 @@ const syncRenderCacheKey = {
   wordPath: "Words/cache.md",
   wordSignature: "body-a",
   noteOutputMode: "minimal",
+  noteOutputFormatVersion: NOTE_OUTPUT_FORMAT_VERSION,
   semanticSettingsSignature: syncRenderSettingsSignature,
   referenceDependencySignature: "References/ref-a.md",
 };
 syncRenderCache.set(syncRenderCacheKey, "<p>cached</p>");
 assert.equal(syncRenderCache.get(syncRenderCacheKey), "<p>cached</p>");
+assert.equal(syncRenderCache.get({ ...syncRenderCacheKey, noteOutputFormatVersion: NOTE_OUTPUT_FORMAT_VERSION - 1 }), null);
 assert.equal(syncRenderCache.get({ ...syncRenderCacheKey, referenceDependencySignature: "References/ref-b.md" }), null);
 syncRenderCache.invalidateWord("Words/cache.md");
 assert.equal(syncRenderCache.get(syncRenderCacheKey), null);

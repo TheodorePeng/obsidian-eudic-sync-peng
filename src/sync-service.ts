@@ -475,6 +475,7 @@ export class SyncService {
       wordPath: file.path,
       wordSignature,
       noteOutputMode: settings.noteOutputMode,
+      noteOutputFormatVersion: settings.noteOutputFormatVersion,
       semanticSettingsSignature: getSemanticSettingsSignature(settings),
       referenceDependencySignature: this.getReferenceDependencySignature(file),
     };
@@ -490,7 +491,7 @@ export class SyncService {
       throw new Error(EMPTY_WORD_BODY_SYNC_ERROR);
     }
 
-    const renderedHtml = await this.renderer.renderMarkdown(syncBodyMarkdown, file.path, (sourcePath, embeddedFromPath) =>
+    const rendered = await this.renderer.renderMarkdown(syncBodyMarkdown, file.path, (sourcePath, embeddedFromPath) =>
       this.getSemanticBlockTransformOptionsForSourcePath(sourcePath, embeddedFromPath, file, context.word, wordLinkId),
     );
     const linkResolver = {
@@ -498,18 +499,18 @@ export class SyncService {
       pathScope: this.options.pathScope,
       sourcePath: file.path,
     };
-    const finalNoteBodyHtml = buildFinalNoteHtml(renderedHtml, settings.noteOutputMode, linkResolver);
+    const finalNoteBodyHtml = buildFinalNoteHtml(rendered, settings.noteOutputMode, linkResolver);
     if (!finalNoteBodyHtml.trim()) {
       throw new Error(EMPTY_WORD_BODY_SYNC_ERROR);
     }
 
     const finalNoteHtml = buildFinalWordNoteHtml(
-        renderedHtml,
-        settings.noteOutputMode,
-        context.word,
-        buildEudicProtocolUrl(this.options.app, "word", wordLinkId, context.word),
-        linkResolver,
-      );
+      rendered,
+      settings.noteOutputMode,
+      context.word,
+      buildEudicProtocolUrl(this.options.app, "word", wordLinkId, context.word),
+      linkResolver,
+    );
     this.renderCache.set(cacheKey, finalNoteHtml);
     return { finalNoteHtml };
   }

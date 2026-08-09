@@ -1,4 +1,5 @@
 import { App, Component, MarkdownRenderer, TFile } from "obsidian";
+import { annotateAuthoredBlankLines } from "./authored-blank-lines";
 import {
   isClosingEudicBlockFenceLine,
   parseEudicBlockFenceLine,
@@ -25,6 +26,11 @@ export type SemanticBlockTransformOptionsSource =
   | SemanticBlockTransformOptions
   | SemanticBlockTransformOptionsResolver
   | null;
+
+export interface RenderedMarkdownHtml {
+  html: string;
+  authoredGapMarkerId: string;
+}
 
 function waitForFrame(): Promise<void> {
   return new Promise((resolve) => {
@@ -54,9 +60,19 @@ async function expandReferenceSegments(
   markdown: string,
   sourcePath: string,
   embeddedFromPath?: string,
+  authoredGapMarkerId?: string,
 ): Promise<ExpandedReferenceMarkdownSegment[]> {
   return pathScope
-    ? expandManagedReferenceEmbedsInMarkdownSegments(app, pathScope, markdown, sourcePath, new Set<string>(), 0, embeddedFromPath)
+    ? expandManagedReferenceEmbedsInMarkdownSegments(
+        app,
+        pathScope,
+        markdown,
+        sourcePath,
+        new Set<string>(),
+        0,
+        embeddedFromPath,
+        authoredGapMarkerId,
+      )
     : [{ markdown, sourcePath, embeddedFromPath }];
 }
 
@@ -67,8 +83,16 @@ async function transformRegularMarkdownForEudicRender(
   sourcePath: string,
   semanticOptions?: SemanticBlockTransformOptionsSource,
   embeddedFromPath?: string,
+  authoredGapMarkerId?: string,
 ): Promise<string> {
-  const segments = await expandReferenceSegments(app, pathScope, markdown, sourcePath, embeddedFromPath);
+  const segments = await expandReferenceSegments(
+    app,
+    pathScope,
+    markdown,
+    sourcePath,
+    embeddedFromPath,
+    authoredGapMarkerId,
+  );
   const transformedMarkdownSegments: string[] = [];
 
   for (const segment of segments) {
@@ -90,8 +114,9 @@ async function transformEudicBlockForRender(
   body: string,
   sourcePath: string,
   semanticOptions?: SemanticBlockTransformOptionsSource,
+  authoredGapMarkerId?: string,
 ): Promise<string> {
-  const bodySegments = await expandReferenceSegments(app, pathScope, body, sourcePath);
+  const bodySegments = await expandReferenceSegments(app, pathScope, body, sourcePath, undefined, authoredGapMarkerId);
   const transformedBodySegments: string[] = [];
 
   for (const segment of bodySegments) {
@@ -110,8 +135,11 @@ export async function transformMarkdownForEudicRender(
   markdown: string,
   sourcePath: string,
   semanticOptions?: SemanticBlockTransformOptionsSource,
+  authoredGapMarkerId?: string,
 ): Promise<string> {
-  const normalizedMarkdown = normalizeMarkdown(markdown);
+  const normalizedMarkdown = authoredGapMarkerId
+    ? annotateAuthoredBlankLines(normalizeMarkdown(markdown), authoredGapMarkerId)
+    : normalizeMarkdown(markdown);
   const lines = normalizedMarkdown.split("\n");
   const output: string[] = [];
   let regularLines: string[] = [];
@@ -128,6 +156,8 @@ export async function transformMarkdownForEudicRender(
         regularLines.join("\n"),
         sourcePath,
         semanticOptions,
+        undefined,
+        authoredGapMarkerId,
       ),
     );
     regularLines = [];
@@ -163,6 +193,7 @@ export async function transformMarkdownForEudicRender(
         lines.slice(lineIndex + 1, closingLineIndex).join("\n"),
         sourcePath,
         semanticOptions,
+        authoredGapMarkerId,
       ),
     );
     lineIndex = closingLineIndex;
@@ -178,7 +209,7 @@ export class HtmlRenderer {
     private readonly pathScope?: PathScope,
   ) {}
 
-  async renderFile(file: TFile): Promise<string> {
+  async renderFile(file: TFile): Promise<RenderedMarkdownHtml> {
     const rawMarkdown = await this.app.vault.cachedRead(file);
     const markdown = stripYamlFrontmatter(rawMarkdown);
     return this.renderMarkdown(markdown, file.path);
@@ -188,9 +219,10 @@ export class HtmlRenderer {
     markdown: string,
     sourcePath: string,
     semanticOptions?: SemanticBlockTransformOptionsSource,
-  ): Promise<string> {
+  ): Promise<RenderedMarkdownHtml> {
     const container = document.createElement("div");
     const component = new Component();
+    const authoredGapMarkerId = globalThis.crypto.randomUUID();
     component.load();
     const transformedMarkdown = await transformMarkdownForEudicRender(
       this.app,
@@ -198,13 +230,17 @@ export class HtmlRenderer {
       markdown,
       sourcePath,
       semanticOptions,
+      authoredGapMarkerId,
     );
     const renderableMarkdown = protectLeadingThematicBreakFromFrontmatter(transformedMarkdown);
 
     try {
       await MarkdownRenderer.render(this.app, renderableMarkdown, container, sourcePath, component);
       await waitForFrame();
-      return container.innerHTML;
+      return {
+        html: container.innerHTML,
+        authoredGapMarkerId,
+      };
     } finally {
       component.unload();
     }
