@@ -9,10 +9,18 @@ export function buildEudicQueryUrl(word: string, lang: string | null): string {
   return `${EUDIC_DICT_BASE_URL}/${encodeURIComponent(normalizedLang)}/${encodeURIComponent(word)}`;
 }
 
+export function buildEudicDictionaryUri(word: string): string {
+  return `eudic://dict/${encodeURIComponent(word.trim())}`;
+}
+
 export function getExpectedEudicUrl(frontmatter: Record<string, unknown>, file: TFile): string {
   const word = getConfiguredWord(frontmatter, file);
   const lang = readNullableString(frontmatter[FRONTMATTER_KEYS.lang]) ?? "en";
   return buildEudicQueryUrl(word, lang);
+}
+
+export function getExpectedEudicUri(frontmatter: Record<string, unknown>, file: TFile): string {
+  return buildEudicDictionaryUri(getConfiguredWord(frontmatter, file));
 }
 
 export function shouldFillEudicUrlBeforeFirstSync(frontmatter: Record<string, unknown>): boolean {

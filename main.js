@@ -736,6 +736,7 @@ var FRONTMATTER_KEYS = {
   lang: "lang",
   aliases: "aliases",
   eudicUrl: "eudic_url",
+  eudicUri: "eudic_uri",
   eudicLinkId: "eudic_link_id",
   syncEudicEnabled: "sync_eudic_enabled",
   eudicSync: "eudic_sync",
@@ -1889,6 +1890,29 @@ function extractLeadingPresetKindFromList(markdown, presetKinds) {
     kind: null,
     markdown: normalized
   };
+}
+
+// src/eudic-url.ts
+var EUDIC_DICT_BASE_URL = "https://dict.eudic.net/dicts";
+function buildEudicQueryUrl(word, lang) {
+  const normalizedLang = lang?.trim() || "en";
+  return `${EUDIC_DICT_BASE_URL}/${encodeURIComponent(normalizedLang)}/${encodeURIComponent(word)}`;
+}
+function buildEudicDictionaryUri(word) {
+  return `eudic://dict/${encodeURIComponent(word.trim())}`;
+}
+function getExpectedEudicUri(frontmatter, file) {
+  return buildEudicDictionaryUri(getConfiguredWord(frontmatter, file));
+}
+function shouldFillEudicUrlBeforeFirstSync(frontmatter) {
+  const currentUrl = readNullableString(frontmatter[FRONTMATTER_KEYS.eudicUrl]);
+  if (!currentUrl) {
+    return true;
+  }
+  if (readNullableString(frontmatter[FRONTMATTER_KEYS.lastSyncedHash])) {
+    return false;
+  }
+  return currentUrl === buildEudicQueryUrl("Untitled", "en");
 }
 
 // src/reference-note-service.ts
@@ -5763,6 +5787,7 @@ function formatYamlScalar(value, bare = false) {
 function buildFields(data) {
   return [
     { key: FRONTMATTER_KEYS.eudicUrl, value: data.eudicUrl },
+    { key: FRONTMATTER_KEYS.eudicUri, value: data.eudicUri },
     { key: FRONTMATTER_KEYS.eudicLinkId, value: data.eudicLinkId },
     { key: FRONTMATTER_KEYS.syncStatus, value: data.syncStatus, bare: true },
     { key: FRONTMATTER_KEYS.syncedAt, value: data.syncedAt },
@@ -6077,23 +6102,6 @@ var AliasSyncService = class {
     return null;
   }
 };
-
-// src/eudic-url.ts
-var EUDIC_DICT_BASE_URL = "https://dict.eudic.net/dicts";
-function buildEudicQueryUrl(word, lang) {
-  const normalizedLang = lang?.trim() || "en";
-  return `${EUDIC_DICT_BASE_URL}/${encodeURIComponent(normalizedLang)}/${encodeURIComponent(word)}`;
-}
-function shouldFillEudicUrlBeforeFirstSync(frontmatter) {
-  const currentUrl = readNullableString(frontmatter[FRONTMATTER_KEYS.eudicUrl]);
-  if (!currentUrl) {
-    return true;
-  }
-  if (readNullableString(frontmatter[FRONTMATTER_KEYS.lastSyncedHash])) {
-    return false;
-  }
-  return currentUrl === buildEudicQueryUrl("Untitled", "en");
-}
 
 // src/html-renderer.ts
 var import_obsidian12 = require("obsidian");
@@ -8331,12 +8339,15 @@ function resolveWordDirtySignatureDecision(state) {
 function hasYamlFrontmatter(markdown) {
   return /^---\s*\n[\s\S]*?\n---(?:\s*\n|$)/.test(markdown);
 }
-function writeDefaultWordFrontmatter(frontmatter) {
+function writeDefaultWordFrontmatter(frontmatter, file, ensureEudicUri) {
   frontmatter[FRONTMATTER_KEYS.syncEudicEnabled] = true;
   frontmatter[FRONTMATTER_KEYS.lang] = "en";
   frontmatter[FRONTMATTER_KEYS.aliases] = [];
   frontmatter[FRONTMATTER_KEYS.eudicLinkId] = createEudicLinkId("word");
   frontmatter[FRONTMATTER_KEYS.eudicUrl] = "";
+  if (ensureEudicUri) {
+    frontmatter[FRONTMATTER_KEYS.eudicUri] = getExpectedEudicUri(frontmatter, file);
+  }
   frontmatter[FRONTMATTER_KEYS.syncStatus] = "dirty";
   frontmatter[FRONTMATTER_KEYS.studylistIds] = [];
   frontmatter[FRONTMATTER_KEYS.studylistNames] = [];
@@ -8350,11 +8361,11 @@ function getDefaultSyncEudicEnabled(frontmatter) {
   return frontmatter[FRONTMATTER_KEYS.eudicSync] === false ? false : true;
 }
 async function ensureManagedWordProperties(options) {
-  const { app, file, writeFrontmatter } = options;
+  const { app, file, writeFrontmatter, ensureEudicUri = true } = options;
   const markdown = await app.vault.cachedRead(file);
   if (!hasYamlFrontmatter(markdown)) {
     await writeFrontmatter(file, (frontmatter2) => {
-      writeDefaultWordFrontmatter(frontmatter2);
+      writeDefaultWordFrontmatter(frontmatter2, file, ensureEudicUri);
     });
     return {
       skipped: false,
@@ -8376,12 +8387,14 @@ async function ensureManagedWordProperties(options) {
   const shouldAddEudicLinkId = readEudicLinkId(frontmatter) === null;
   const shouldAddLang = readNullableString(frontmatter[FRONTMATTER_KEYS.lang]) === null;
   const shouldAddEudicUrl = !(FRONTMATTER_KEYS.eudicUrl in frontmatter);
+  const expectedEudicUri = getExpectedEudicUri(frontmatter, file);
+  const shouldUpdateEudicUri = ensureEudicUri && readNullableString(frontmatter[FRONTMATTER_KEYS.eudicUri]) !== expectedEudicUri;
   const shouldAddSyncStatus = readNullableString(frontmatter[FRONTMATTER_KEYS.syncStatus]) === null;
   const shouldNormalizeStudylistStatus = !isStudylistSyncStatusNormalized(frontmatter);
   const shouldAddStudylistIds = !Array.isArray(frontmatter[FRONTMATTER_KEYS.studylistIds]);
   const shouldAddStudylistNames = !Array.isArray(frontmatter[FRONTMATTER_KEYS.studylistNames]);
   const shouldAddSyncableFields = !isDisabled;
-  if (!shouldAddSyncEudicEnabled && !shouldUpdateAliases && !shouldAddEudicLinkId && !shouldAddEudicUrl && !shouldNormalizeStudylistStatus && !shouldAddStudylistIds && !shouldAddStudylistNames && (!shouldAddSyncableFields || !shouldAddLang && !shouldAddSyncStatus)) {
+  if (!shouldAddSyncEudicEnabled && !shouldUpdateAliases && !shouldAddEudicLinkId && !shouldAddEudicUrl && !shouldUpdateEudicUri && !shouldNormalizeStudylistStatus && !shouldAddStudylistIds && !shouldAddStudylistNames && (!shouldAddSyncableFields || !shouldAddLang && !shouldAddSyncStatus)) {
     return {
       skipped: isDisabled,
       changed: false,
@@ -8400,6 +8413,9 @@ async function ensureManagedWordProperties(options) {
     }
     if (shouldAddEudicUrl) {
       nextFrontmatter[FRONTMATTER_KEYS.eudicUrl] = "";
+    }
+    if (shouldUpdateEudicUri) {
+      nextFrontmatter[FRONTMATTER_KEYS.eudicUri] = expectedEudicUri;
     }
     if (shouldNormalizeStudylistStatus) {
       normalizeStudylistSyncStatus(nextFrontmatter);
@@ -8588,6 +8604,10 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
       isUnloaded: () => this.isUnloaded,
       onLayoutReady: () => {
         this.lastActiveWordPath = this.getActiveWordPath();
+        const activeFile = this.getActiveMarkdownFile();
+        if (activeFile && this.pathScope.isWordPath(activeFile.path)) {
+          void this.ensureWordEudicUri(activeFile);
+        }
         this.scheduleStartupKnownPathClear();
         this.runStartupTasks();
       },
@@ -8883,7 +8903,12 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
       this.app.workspace.on("layout-change", handleActiveContextChange)
     );
     this.registerEvent(
-      this.app.workspace.on("file-open", handleActiveContextChange)
+      this.app.workspace.on("file-open", (file) => {
+        if (file && this.pathScope.isWordPath(file.path)) {
+          void this.ensureWordEudicUri(file);
+        }
+        handleActiveContextChange();
+      })
     );
   }
   async loadSettings() {
@@ -9099,6 +9124,9 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     }
     if (this.pathScope.isWordPath(file.path)) {
       this.releaseWordStatusOverridesIfMetadataCaughtUp(file);
+      if (!this.startupKnownPaths.has((0, import_obsidian16.normalizePath)(file.path))) {
+        void this.ensureWordEudicUri(file);
+      }
       this.refreshUi();
       return;
     }
@@ -9210,6 +9238,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     this.clearPendingOpenWordStatusWrite(normalizedOldPath);
     if (isMarkdownFile3(file) && this.pathScope.isWordPath(normalizedNewPath)) {
       const ensured = await this.ensureManagedWordProperties(file);
+      await this.ensureWordEudicUri(file);
       if (!ensured.skipped) {
         const result = await this.referenceIndex.updateWord(file, ensured.markdown);
         await this.studylistService.handleWordModify(file, ensured.markdown);
@@ -9840,6 +9869,10 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     return (0, import_obsidian16.normalizePath)(file.path);
   }
   handleActiveWordChanged() {
+    const activeFile = this.getActiveMarkdownFile();
+    if (activeFile && this.pathScope.isWordPath(activeFile.path)) {
+      void this.ensureWordEudicUri(activeFile);
+    }
     const nextActiveWordPath = this.getActiveWordPath();
     if (nextActiveWordPath) {
       this.cancelAutoSyncTimer(nextActiveWordPath);
@@ -10221,6 +10254,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     await this.referenceIndex.refreshReferenceUsage(paths);
   }
   async ensureWordManagedFrontmatterForSync(file) {
+    await this.ensureWordEudicUri(file);
     if (!this.isMarkdownFileOpen(file)) {
       return this.ensureWordManagedFrontmatter(file);
     }
@@ -10234,6 +10268,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
   }
   async writeWordSyncFrontmatter(file, data) {
     const eudicUrlToSet = typeof data.eudicUrl === "string" && data.eudicUrl.trim() ? data.eudicUrl.trim() : null;
+    const eudicUriToSet = typeof data.eudicUri === "string" && data.eudicUri.trim() ? data.eudicUri.trim() : null;
     const view = this.getOpenMarkdownViewForFile(file);
     if (view) {
       const normalizedPath = (0, import_obsidian16.normalizePath)(file.path);
@@ -10258,7 +10293,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
           this.syncingEditorWordStatusPatchSignatures.delete(normalizedPath);
           throw error;
         }
-      } else if (eudicUrlToSet && readNullableString(getFrontmatter(this.app, file)[FRONTMATTER_KEYS.eudicUrl]) !== eudicUrlToSet) {
+      } else if (eudicUrlToSet && readNullableString(getFrontmatter(this.app, file)[FRONTMATTER_KEYS.eudicUrl]) !== eudicUrlToSet || eudicUriToSet && readNullableString(getFrontmatter(this.app, file)[FRONTMATTER_KEYS.eudicUri]) !== eudicUriToSet) {
         this.suppressPath(file.path);
         try {
           await view.save();
@@ -10275,7 +10310,8 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
           console.warn(`${PLUGIN_NAME}: failed to refresh editor after saving frontmatter for ${file.path}.`, error);
         }
       }
-      await this.waitForEudicUrlCacheSettle(file, eudicUrlToSet);
+      await this.waitForWordFrontmatterStringCacheSettle(file, FRONTMATTER_KEYS.eudicUrl, eudicUrlToSet);
+      await this.waitForWordFrontmatterStringCacheSettle(file, FRONTMATTER_KEYS.eudicUri, eudicUriToSet);
       if (data.syncStatus === "synced") {
         this.recordWordBodySyncedFromMarkdown(file, nextMarkdown);
       } else if (data.syncStatus === "dirty") {
@@ -10287,20 +10323,21 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     await this.writeFrontmatter(file, (frontmatter) => {
       applyWordSyncFrontmatterToObject(frontmatter, data);
     });
-    await this.waitForEudicUrlCacheSettle(file, eudicUrlToSet);
+    await this.waitForWordFrontmatterStringCacheSettle(file, FRONTMATTER_KEYS.eudicUrl, eudicUrlToSet);
+    await this.waitForWordFrontmatterStringCacheSettle(file, FRONTMATTER_KEYS.eudicUri, eudicUriToSet);
     if (data.syncStatus === "dirty") {
       this.setWordBodyStatusOverride(file, "dirty", data.lastError ?? null);
     } else if (data.syncStatus === "synced") {
       this.setWordBodyStatusOverride(file, "synced", null);
     }
   }
-  async waitForEudicUrlCacheSettle(file, eudicUrl) {
-    if (!eudicUrl) {
+  async waitForWordFrontmatterStringCacheSettle(file, key, value) {
+    if (!value) {
       return true;
     }
-    const settled = await waitForCachedFrontmatterString(this.app, file, FRONTMATTER_KEYS.eudicUrl, eudicUrl);
+    const settled = await waitForCachedFrontmatterString(this.app, file, key, value);
     if (!settled) {
-      console.warn(`${PLUGIN_NAME}: eudic_url was saved for ${file.path}, but Obsidian metadata cache did not refresh before timeout.`);
+      console.warn(`${PLUGIN_NAME}: ${key} was saved for ${file.path}, but Obsidian metadata cache did not refresh before timeout.`);
     }
     this.refreshUi();
     return settled;
@@ -10308,7 +10345,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
   async writeStudylistFrontmatter(file, mutate) {
     await this.writeFrontmatter(file, mutate);
   }
-  async ensureManagedWordProperties(file) {
+  async ensureManagedWordProperties(file, options = {}) {
     const openView = this.getOpenMarkdownViewForFile(file);
     if (openView) {
       return {
@@ -10320,6 +10357,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     return ensureManagedWordProperties({
       app: this.app,
       file,
+      ensureEudicUri: options.ensureEudicUri,
       writeFrontmatter: async (targetFile, mutate) => {
         await this.writeFrontmatter(targetFile, mutate);
       }
@@ -10331,14 +10369,14 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
       if (openPaths.has((0, import_obsidian16.normalizePath)(file.path))) {
         continue;
       }
-      await this.ensureWordManagedFrontmatter(file);
+      await this.ensureWordManagedFrontmatter(file, { ensureEudicUri: false });
     }
   }
-  async ensureWordManagedFrontmatter(file) {
+  async ensureWordManagedFrontmatter(file, options = {}) {
     if (this.isMarkdownFileOpen(file)) {
       return this.ensureWordManagedFrontmatterForSync(file);
     }
-    await this.ensureManagedWordProperties(file);
+    await this.ensureManagedWordProperties(file, options);
     const linkId = readEudicLinkId(getFrontmatter(this.app, file));
     if (linkId) {
       return linkId;
@@ -10348,6 +10386,18 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
       frontmatter[FRONTMATTER_KEYS.eudicLinkId] = nextLinkId;
     });
     return nextLinkId;
+  }
+  async ensureWordEudicUri(file) {
+    if (!this.pathScope.isWordPath(file.path)) {
+      return false;
+    }
+    const frontmatter = getFrontmatter(this.app, file);
+    const expectedEudicUri = getExpectedEudicUri(frontmatter, file);
+    if (readNullableString(frontmatter[FRONTMATTER_KEYS.eudicUri]) === expectedEudicUri) {
+      return false;
+    }
+    await this.writeWordSyncFrontmatter(file, { eudicUri: expectedEudicUri });
+    return true;
   }
   async ensureReferenceManagedFrontmatter(file) {
     if (!isMarkdownFile3(file) || !this.pathScope.isReferencePath(file.path)) {

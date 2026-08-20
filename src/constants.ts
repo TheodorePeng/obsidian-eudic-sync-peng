@@ -60,6 +60,7 @@ export const FRONTMATTER_KEYS = {
   lang: "lang",
   aliases: "aliases",
   eudicUrl: "eudic_url",
+  eudicUri: "eudic_uri",
   eudicLinkId: "eudic_link_id",
   syncEudicEnabled: "sync_eudic_enabled",
   eudicSync: "eudic_sync",

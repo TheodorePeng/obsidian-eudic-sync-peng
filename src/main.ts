@@ -34,6 +34,7 @@ import {
   findEudicBlockFenceForBody,
   renderEudicBlockToMarkdown,
 } from "./eudic-block";
+import { getExpectedEudicUri } from "./eudic-url";
 import { ReferenceNoteService, hasPendingReferenceBlocks } from "./reference-note-service";
 import { formatBoldMarkersInMarkdown } from "./markdown-bold-markers";
 import { waitForCachedFrontmatterString } from "./frontmatter-cache-settle";
@@ -271,6 +272,10 @@ export default class EudicSyncPlugin extends Plugin {
       isUnloaded: () => this.isUnloaded,
       onLayoutReady: () => {
         this.lastActiveWordPath = this.getActiveWordPath();
+        const activeFile = this.getActiveMarkdownFile();
+        if (activeFile && this.pathScope.isWordPath(activeFile.path)) {
+          void this.ensureWordEudicUri(activeFile);
+        }
         this.scheduleStartupKnownPathClear();
         this.runStartupTasks();
       },
@@ -604,7 +609,12 @@ export default class EudicSyncPlugin extends Plugin {
     );
 
     this.registerEvent(
-      this.app.workspace.on("file-open", handleActiveContextChange),
+      this.app.workspace.on("file-open", (file) => {
+        if (file && this.pathScope.isWordPath(file.path)) {
+          void this.ensureWordEudicUri(file);
+        }
+        handleActiveContextChange();
+      }),
     );
   }
 
@@ -857,6 +867,9 @@ export default class EudicSyncPlugin extends Plugin {
 
     if (this.pathScope.isWordPath(file.path)) {
       this.releaseWordStatusOverridesIfMetadataCaughtUp(file);
+      if (!this.startupKnownPaths.has(normalizePath(file.path))) {
+        void this.ensureWordEudicUri(file);
+      }
       this.refreshUi();
       return;
     }
@@ -987,6 +1000,7 @@ export default class EudicSyncPlugin extends Plugin {
 
     if (isMarkdownFile(file) && this.pathScope.isWordPath(normalizedNewPath)) {
       const ensured = await this.ensureManagedWordProperties(file);
+      await this.ensureWordEudicUri(file);
 
       if (!ensured.skipped) {
         const result = await this.referenceIndex.updateWord(file, ensured.markdown);
@@ -1721,6 +1735,11 @@ export default class EudicSyncPlugin extends Plugin {
   }
 
   private handleActiveWordChanged(): void {
+    const activeFile = this.getActiveMarkdownFile();
+    if (activeFile && this.pathScope.isWordPath(activeFile.path)) {
+      void this.ensureWordEudicUri(activeFile);
+    }
+
     const nextActiveWordPath = this.getActiveWordPath();
     if (nextActiveWordPath) {
       this.cancelAutoSyncTimer(nextActiveWordPath);
@@ -2189,6 +2208,8 @@ export default class EudicSyncPlugin extends Plugin {
   }
 
   private async ensureWordManagedFrontmatterForSync(file: TFile): Promise<string> {
+    await this.ensureWordEudicUri(file);
+
     if (!this.isMarkdownFileOpen(file)) {
       return this.ensureWordManagedFrontmatter(file);
     }
@@ -2205,6 +2226,7 @@ export default class EudicSyncPlugin extends Plugin {
 
   private async writeWordSyncFrontmatter(file: TFile, data: WordSyncFrontmatterPatchData): Promise<void> {
     const eudicUrlToSet = typeof data.eudicUrl === "string" && data.eudicUrl.trim() ? data.eudicUrl.trim() : null;
+    const eudicUriToSet = typeof data.eudicUri === "string" && data.eudicUri.trim() ? data.eudicUri.trim() : null;
     const view = this.getOpenMarkdownViewForFile(file);
     if (view) {
       const normalizedPath = normalizePath(file.path);
@@ -2232,8 +2254,10 @@ export default class EudicSyncPlugin extends Plugin {
           throw error;
         }
       } else if (
-        eudicUrlToSet &&
-        readNullableString(getFrontmatter(this.app, file)[FRONTMATTER_KEYS.eudicUrl]) !== eudicUrlToSet
+        (eudicUrlToSet &&
+          readNullableString(getFrontmatter(this.app, file)[FRONTMATTER_KEYS.eudicUrl]) !== eudicUrlToSet) ||
+        (eudicUriToSet &&
+          readNullableString(getFrontmatter(this.app, file)[FRONTMATTER_KEYS.eudicUri]) !== eudicUriToSet)
       ) {
         this.suppressPath(file.path);
         try {
@@ -2253,7 +2277,8 @@ export default class EudicSyncPlugin extends Plugin {
         }
       }
 
-      await this.waitForEudicUrlCacheSettle(file, eudicUrlToSet);
+      await this.waitForWordFrontmatterStringCacheSettle(file, FRONTMATTER_KEYS.eudicUrl, eudicUrlToSet);
+      await this.waitForWordFrontmatterStringCacheSettle(file, FRONTMATTER_KEYS.eudicUri, eudicUriToSet);
 
       if (data.syncStatus === "synced") {
         this.recordWordBodySyncedFromMarkdown(file, nextMarkdown);
@@ -2268,7 +2293,8 @@ export default class EudicSyncPlugin extends Plugin {
       applyWordSyncFrontmatterToObject(frontmatter, data);
     });
 
-    await this.waitForEudicUrlCacheSettle(file, eudicUrlToSet);
+    await this.waitForWordFrontmatterStringCacheSettle(file, FRONTMATTER_KEYS.eudicUrl, eudicUrlToSet);
+    await this.waitForWordFrontmatterStringCacheSettle(file, FRONTMATTER_KEYS.eudicUri, eudicUriToSet);
 
     if (data.syncStatus === "dirty") {
       this.setWordBodyStatusOverride(file, "dirty", data.lastError ?? null);
@@ -2277,14 +2303,18 @@ export default class EudicSyncPlugin extends Plugin {
     }
   }
 
-  private async waitForEudicUrlCacheSettle(file: TFile, eudicUrl: string | null): Promise<boolean> {
-    if (!eudicUrl) {
+  private async waitForWordFrontmatterStringCacheSettle(
+    file: TFile,
+    key: string,
+    value: string | null,
+  ): Promise<boolean> {
+    if (!value) {
       return true;
     }
 
-    const settled = await waitForCachedFrontmatterString(this.app, file, FRONTMATTER_KEYS.eudicUrl, eudicUrl);
+    const settled = await waitForCachedFrontmatterString(this.app, file, key, value);
     if (!settled) {
-      console.warn(`${PLUGIN_NAME}: eudic_url was saved for ${file.path}, but Obsidian metadata cache did not refresh before timeout.`);
+      console.warn(`${PLUGIN_NAME}: ${key} was saved for ${file.path}, but Obsidian metadata cache did not refresh before timeout.`);
     }
     this.refreshUi();
     return settled;
@@ -2294,7 +2324,10 @@ export default class EudicSyncPlugin extends Plugin {
     await this.writeFrontmatter(file, mutate);
   }
 
-  private async ensureManagedWordProperties(file: TFile) {
+  private async ensureManagedWordProperties(
+    file: TFile,
+    options: { ensureEudicUri?: boolean } = {},
+  ) {
     const openView = this.getOpenMarkdownViewForFile(file);
     if (openView) {
       return {
@@ -2307,6 +2340,7 @@ export default class EudicSyncPlugin extends Plugin {
     return ensureManagedWordProperties({
       app: this.app,
       file,
+      ensureEudicUri: options.ensureEudicUri,
       writeFrontmatter: async (targetFile, mutate) => {
         await this.writeFrontmatter(targetFile, mutate);
       },
@@ -2319,16 +2353,19 @@ export default class EudicSyncPlugin extends Plugin {
       if (openPaths.has(normalizePath(file.path))) {
         continue;
       }
-      await this.ensureWordManagedFrontmatter(file);
+      await this.ensureWordManagedFrontmatter(file, { ensureEudicUri: false });
     }
   }
 
-  private async ensureWordManagedFrontmatter(file: TFile): Promise<string> {
+  private async ensureWordManagedFrontmatter(
+    file: TFile,
+    options: { ensureEudicUri?: boolean } = {},
+  ): Promise<string> {
     if (this.isMarkdownFileOpen(file)) {
       return this.ensureWordManagedFrontmatterForSync(file);
     }
 
-    await this.ensureManagedWordProperties(file);
+    await this.ensureManagedWordProperties(file, options);
     const linkId = readEudicLinkId(getFrontmatter(this.app, file));
     if (linkId) {
       return linkId;
@@ -2339,6 +2376,21 @@ export default class EudicSyncPlugin extends Plugin {
       frontmatter[FRONTMATTER_KEYS.eudicLinkId] = nextLinkId;
     });
     return nextLinkId;
+  }
+
+  private async ensureWordEudicUri(file: TFile): Promise<boolean> {
+    if (!this.pathScope.isWordPath(file.path)) {
+      return false;
+    }
+
+    const frontmatter = getFrontmatter(this.app, file);
+    const expectedEudicUri = getExpectedEudicUri(frontmatter, file);
+    if (readNullableString(frontmatter[FRONTMATTER_KEYS.eudicUri]) === expectedEudicUri) {
+      return false;
+    }
+
+    await this.writeWordSyncFrontmatter(file, { eudicUri: expectedEudicUri });
+    return true;
   }
 
   private async ensureReferenceManagedFrontmatter(file: TAbstractFile): Promise<string | null> {

@@ -1,6 +1,7 @@
 import type { App, TFile } from "obsidian";
 import { FRONTMATTER_KEYS } from "./constants";
 import { createEudicLinkId, readEudicLinkId } from "./eudic-link";
+import { getExpectedEudicUri } from "./eudic-url";
 import {
   aliasesNeedRewrite,
   getFrontmatter,
@@ -21,18 +22,26 @@ interface EnsureWordFrontmatterOptions {
   app: App;
   file: TFile;
   writeFrontmatter: (file: TFile, mutate: FrontmatterMutator) => Promise<void>;
+  ensureEudicUri?: boolean;
 }
 
 function hasYamlFrontmatter(markdown: string): boolean {
   return /^---\s*\n[\s\S]*?\n---(?:\s*\n|$)/.test(markdown);
 }
 
-function writeDefaultWordFrontmatter(frontmatter: Record<string, unknown>): void {
+function writeDefaultWordFrontmatter(
+  frontmatter: Record<string, unknown>,
+  file: TFile,
+  ensureEudicUri: boolean,
+): void {
   frontmatter[FRONTMATTER_KEYS.syncEudicEnabled] = true;
   frontmatter[FRONTMATTER_KEYS.lang] = "en";
   frontmatter[FRONTMATTER_KEYS.aliases] = [];
   frontmatter[FRONTMATTER_KEYS.eudicLinkId] = createEudicLinkId("word");
   frontmatter[FRONTMATTER_KEYS.eudicUrl] = "";
+  if (ensureEudicUri) {
+    frontmatter[FRONTMATTER_KEYS.eudicUri] = getExpectedEudicUri(frontmatter, file);
+  }
   frontmatter[FRONTMATTER_KEYS.syncStatus] = "dirty";
   frontmatter[FRONTMATTER_KEYS.studylistIds] = [];
   frontmatter[FRONTMATTER_KEYS.studylistNames] = [];
@@ -51,12 +60,12 @@ function getDefaultSyncEudicEnabled(frontmatter: Record<string, unknown>): boole
 export async function ensureManagedWordProperties(
   options: EnsureWordFrontmatterOptions,
 ): Promise<EnsureWordFrontmatterResult> {
-  const { app, file, writeFrontmatter } = options;
+  const { app, file, writeFrontmatter, ensureEudicUri = true } = options;
   const markdown = await app.vault.cachedRead(file);
 
   if (!hasYamlFrontmatter(markdown)) {
     await writeFrontmatter(file, (frontmatter) => {
-      writeDefaultWordFrontmatter(frontmatter);
+      writeDefaultWordFrontmatter(frontmatter, file, ensureEudicUri);
     });
     return {
       skipped: false,
@@ -79,6 +88,9 @@ export async function ensureManagedWordProperties(
   const shouldAddEudicLinkId = readEudicLinkId(frontmatter) === null;
   const shouldAddLang = readNullableString(frontmatter[FRONTMATTER_KEYS.lang]) === null;
   const shouldAddEudicUrl = !(FRONTMATTER_KEYS.eudicUrl in frontmatter);
+  const expectedEudicUri = getExpectedEudicUri(frontmatter, file);
+  const shouldUpdateEudicUri =
+    ensureEudicUri && readNullableString(frontmatter[FRONTMATTER_KEYS.eudicUri]) !== expectedEudicUri;
   const shouldAddSyncStatus = readNullableString(frontmatter[FRONTMATTER_KEYS.syncStatus]) === null;
   const shouldNormalizeStudylistStatus = !isStudylistSyncStatusNormalized(frontmatter);
   const shouldAddStudylistIds = !Array.isArray(frontmatter[FRONTMATTER_KEYS.studylistIds]);
@@ -90,6 +102,7 @@ export async function ensureManagedWordProperties(
     !shouldUpdateAliases &&
     !shouldAddEudicLinkId &&
     !shouldAddEudicUrl &&
+    !shouldUpdateEudicUri &&
     !shouldNormalizeStudylistStatus &&
     !shouldAddStudylistIds &&
     !shouldAddStudylistNames &&
@@ -117,6 +130,10 @@ export async function ensureManagedWordProperties(
 
     if (shouldAddEudicUrl) {
       nextFrontmatter[FRONTMATTER_KEYS.eudicUrl] = "";
+    }
+
+    if (shouldUpdateEudicUri) {
+      nextFrontmatter[FRONTMATTER_KEYS.eudicUri] = expectedEudicUri;
     }
 
     if (shouldNormalizeStudylistStatus) {
