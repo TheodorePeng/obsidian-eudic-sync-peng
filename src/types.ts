@@ -23,6 +23,7 @@ export interface EudicSyncSettings {
   referenceFolder: string;
   authorizationToken: string;
   studylistCache: EudicStudylistCache;
+  newWordDefaultStudylists: EudicStudylistCategory[];
   noteOutputMode: EudicNoteOutputMode;
   noteOutputFormatVersion: number;
   enableAutoBoldMarkersOnEdit: boolean;

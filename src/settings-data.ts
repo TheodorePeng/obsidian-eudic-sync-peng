@@ -9,6 +9,7 @@ const IMPORTABLE_SETTINGS_KEYS = [
   "wordFolder",
   "referenceFolder",
   "authorizationToken",
+  "newWordDefaultStudylists",
   "noteOutputMode",
   "enableAutoBoldMarkersOnEdit",
   "boldMarkers",
@@ -157,6 +158,63 @@ function readStudylistCache(value: unknown): EudicStudylistCache {
   };
 }
 
+export function readStudylistCategories(
+  value: unknown,
+  fallback: EudicStudylistCache["categories"] = [],
+): EudicStudylistCache["categories"] {
+  if (!Array.isArray(value)) {
+    return fallback.map((category) => ({ ...category }));
+  }
+
+  const result: EudicStudylistCache["categories"] = [];
+  const seen = new Set<string>();
+  for (const entry of value) {
+    if (!isRecord(entry)) {
+      continue;
+    }
+
+    const id = readString(entry.id);
+    const language = readString(entry.language)?.toLocaleLowerCase() ?? null;
+    const name = readString(entry.name);
+    if (!id || !language || !name) {
+      continue;
+    }
+
+    const key = `${language}\u0000${id}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push({ id, language, name });
+  }
+  return result;
+}
+
+function hasExactStudylistCategories(value: unknown, expected: EudicStudylistCache["categories"]): boolean {
+  if (!Array.isArray(value) || value.length !== expected.length) {
+    return false;
+  }
+  return value.every((entry, index) => {
+    if (!isRecord(entry)) {
+      return false;
+    }
+    const category = expected[index];
+    return entry.id === category?.id && entry.language === category?.language && entry.name === category?.name;
+  });
+}
+
+export function refreshSelectedStudylistSnapshots(
+  selected: EudicStudylistCache["categories"],
+  cache: EudicStudylistCache,
+): EudicStudylistCache["categories"] {
+  const cachedByKey = new Map(
+    cache.categories.map((category) => [`${category.language.trim().toLocaleLowerCase()}\u0000${category.id.trim()}`, category]),
+  );
+  return readStudylistCategories(selected).map((category) => ({
+    ...(cachedByKey.get(`${category.language.toLocaleLowerCase()}\u0000${category.id}`) ?? category),
+  }));
+}
+
 function readNoteOutputMode(value: unknown): EudicNoteOutputMode {
   return value === "compatible" ? "compatible" : "minimal";
 }
@@ -178,7 +236,13 @@ function pickImportableSettings(settings: EudicSyncSettings): EudicSyncImportabl
 
   for (const key of IMPORTABLE_SETTINGS_KEYS) {
     const value = settings[key];
-    result[key] = (Array.isArray(value) ? [...value] : value) as EudicSyncImportableSettings[typeof key];
+    result[key] = (
+      key === "newWordDefaultStudylists"
+        ? settings.newWordDefaultStudylists.map((category) => ({ ...category }))
+        : Array.isArray(value)
+          ? [...value]
+          : value
+    ) as EudicSyncImportableSettings[typeof key];
   }
 
   return result as EudicSyncImportableSettings;
@@ -254,12 +318,18 @@ export function migrateLoadedSettings(rawData: unknown): SettingsLoadResult {
     rewriteLegacyExamplesFolderToReferences(readString(raw.referenceFolder) ?? "") ||
     derivedLegacyReferenceFolder ||
     DEFAULT_SETTINGS.referenceFolder;
+  const studylistCache = readStudylistCache(raw.studylistCache);
+  const newWordDefaultStudylists = refreshSelectedStudylistSnapshots(
+    readStudylistCategories(raw.newWordDefaultStudylists, DEFAULT_SETTINGS.newWordDefaultStudylists),
+    studylistCache,
+  );
 
   const settings: EudicSyncSettings = {
     wordFolder: normalizedWordFolder,
     referenceFolder: normalizedReferenceFolder,
     authorizationToken: readString(raw.authorizationToken) ?? DEFAULT_SETTINGS.authorizationToken,
-    studylistCache: readStudylistCache(raw.studylistCache),
+    studylistCache,
+    newWordDefaultStudylists,
     noteOutputMode: readNoteOutputMode(raw.noteOutputMode),
     noteOutputFormatVersion: isRecord(rawData)
       ? rawNoteOutputFormatVersion
@@ -318,6 +388,7 @@ export function migrateLoadedSettings(rawData: unknown): SettingsLoadResult {
     !("wordFolder" in raw) ||
     !("referenceFolder" in raw) ||
     !("studylistCache" in raw) ||
+    !hasExactStudylistCategories(raw.newWordDefaultStudylists, settings.newWordDefaultStudylists) ||
     "defaultStudylistSource" in raw ||
     !("noteOutputFormatVersion" in raw) ||
     !("enableAutoBoldMarkersOnEdit" in raw) ||

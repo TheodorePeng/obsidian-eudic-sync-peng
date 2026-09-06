@@ -49,6 +49,13 @@ The default folder examples are:
 - Additional blank lines beside those structures are preserved. For example, two source blank lines produce one visible blank line in Eudic.
 - Sync rendering never writes placeholders, literal `\n` text, or generated `<br>` tags back into the Obsidian Markdown file.
 
+## New word initialization
+
+- A new Markdown note created inside the configured word folder is initialized with the complete managed Properties set, including `lang: en`, a stable `eudic_link_id`, the current `eudic_uri`, dirty state, reference metadata, and paired studylist metadata.
+- “Default studylists for new words” in plugin settings controls which cached Eudic categories are assigned. The defaults are `略｜我的生词本` (`0`) and `Obsidian Sync` (`134223429171042864`). Choosing no defaults creates empty studylist arrays with a synced studylist state.
+- Changing this setting affects only future notes and clearly incomplete creation shells. It does not enroll existing normalized notes or push anything to Eudic.
+- Renaming a word note does not rewrite its Properties. The sync preflight refreshes `eudic_uri` from the final filename (or an explicit `word` property) immediately before an explicit sync.
+
 ## Install with BRAT
 
 1. Install the [BRAT](https://github.com/TfTHacker/obsidian42-brat) plugin from Obsidian Community Plugins.
@@ -142,6 +149,13 @@ Eudic Sync 是一个 Obsidian 插件，用于管理英语单词笔记，并将�
 - 分割线、`eudic-block` 围栏或独占一行的嵌入链接旁，第一个空行只用于保持 Obsidian 源码清爽，不会变成欧路词典中的额外留白。
 - 这些结构旁更多的空行会继续保留。例如，源码中的两个空行会在欧路词典中留下一个可见空白行。
 - 同步渲染不会把占位符、可见的 `\n` 字样或生成的 `<br>` 标签写回 Obsidian Markdown 文件。
+
+## 新词条初始化
+
+- 在已配置的单词笔记文件夹中新建 Markdown 文档时，插件会补齐完整的受管理 Properties，包括 `lang: en`、稳定的 `eudic_link_id`、与当前词条一致的 `eudic_uri`、dirty 状态、reference 元数据以及成对的生词本元数据。
+- 插件设置中的 “Default studylists for new words” 用于选择新词条默认加入的已有欧路生词本。预设为 `略｜我的生词本`（`0`）和 `Obsidian Sync`（`134223429171042864`）；若不选择任何默认项，新词条会写入空数组并将生词本状态设为 synced。
+- 修改此设置只影响以后新建的词条及明确识别出的创建残缺词条，不会把既有的规范词条追溯加入生词本，也不会自动向欧路词典推送。
+- 重命名单词笔记时不自动重写 Properties；用户明确执行同步后，插件会在同步前置阶段依据最终文件名（或显式 `word` 属性）刷新 `eudic_uri`。
 
 ## 通过 BRAT 安装
 

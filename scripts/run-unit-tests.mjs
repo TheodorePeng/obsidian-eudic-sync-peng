@@ -40,6 +40,7 @@ try {
       "export const editorInfoField = {};",
       "export const requestUrl = async () => { throw new Error('requestUrl is not available in unit tests.'); };",
       "export function normalizePath(path) { return String(path).replace(/\\\\/g, '/').replace(/\\/+/g, '/'); }",
+      "export function parseYaml(source) { const result = {}; let activeArray = null; const scalar = (raw) => { const value = raw.trim(); if (value === 'true') return true; if (value === 'false') return false; if (value === 'null' || value === '~') return null; if (value === '[]') return []; if (!value) return null; if ((value.startsWith('\\\"') && value.endsWith('\\\"')) || (value.startsWith(\"'\") && value.endsWith(\"'\"))) { try { return value.startsWith('\\\"') ? JSON.parse(value) : value.slice(1, -1).replace(/''/g, \"'\"); } catch {} } return value; }; for (const rawLine of String(source).split(/\\r?\\n/)) { if (!rawLine.trim() || rawLine.trimStart().startsWith('#')) continue; const item = rawLine.match(/^\\s+-\\s+(.*)$/); if (item && activeArray) { result[activeArray].push(scalar(item[1])); continue; } const property = rawLine.match(/^([^:#]+):(?:\\s*(.*))?$/); if (!property || /^\\s/.test(rawLine)) throw new Error('unsupported YAML in unit-test stub'); const key = property[1].trim(); const rawValue = property[2] ?? ''; if (!rawValue.trim()) { result[key] = []; activeArray = key; } else { result[key] = scalar(rawValue); activeArray = null; } } return result; }",
     ].join("\n"),
   );
 

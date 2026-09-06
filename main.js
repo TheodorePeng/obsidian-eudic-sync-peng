@@ -33,7 +33,7 @@ __export(main_exports, {
   default: () => EudicSyncPlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian16 = require("obsidian");
+var import_obsidian17 = require("obsidian");
 
 // src/auto-bold-markers-extension.ts
 var import_view = require("@codemirror/view");
@@ -687,6 +687,10 @@ var PLUGIN_ID = "eudic-sync";
 var PLUGIN_NAME = "Eudic Sync";
 var SUPPRESSED_WRITE_TTL_MS = 1500;
 var NOTE_OUTPUT_FORMAT_VERSION = 8;
+var DEFAULT_NEW_WORD_STUDYLISTS = [
+  { id: "0", language: "en", name: "\u7565\uFF5C\u6211\u7684\u751F\u8BCD\u672C" },
+  { id: "134223429171042864", language: "en", name: "Obsidian Sync" }
+];
 var DEFAULT_SEMANTIC_BLOCK_WORD_BOLD_KINDS = ["n.", "v.", "a.", "adj.", "adv.", "vt.", "vi."];
 var DEFAULT_SEMANTIC_BLOCK_WORD_LINK_KINDS = ["Cog.", "Syn.", "Syn./Cog.", "Ant."];
 var DEFAULT_SEMANTIC_BLOCK_KIND_PRESETS = [
@@ -715,6 +719,7 @@ var DEFAULT_SETTINGS = {
     categories: [],
     refreshedAt: null
   },
+  newWordDefaultStudylists: DEFAULT_NEW_WORD_STUDYLISTS.map((category) => ({ ...category })),
   noteOutputMode: "minimal",
   noteOutputFormatVersion: NOTE_OUTPUT_FORMAT_VERSION,
   enableAutoBoldMarkersOnEdit: false,
@@ -970,17 +975,6 @@ function readStringArray(value) {
   if (!Array.isArray(value)) return [];
   return value.filter((entry) => typeof entry === "string").map((entry) => entry.trim()).filter(Boolean);
 }
-function stringArraysEqual(left, right) {
-  if (left.length !== right.length) {
-    return false;
-  }
-  for (let index = 0; index < left.length; index += 1) {
-    if (left[index] !== right[index]) {
-      return false;
-    }
-  }
-  return true;
-}
 function getConfiguredWord(frontmatter, file) {
   return readNullableString(frontmatter[FRONTMATTER_KEYS.word]) ?? file.basename;
 }
@@ -1005,15 +999,6 @@ function normalizeAliasesValue(value, mainWord) {
 }
 function getNormalizedAliases(frontmatter, file) {
   return normalizeAliasesValue(frontmatter[FRONTMATTER_KEYS.aliases], getConfiguredWord(frontmatter, file));
-}
-function aliasesNeedRewrite(frontmatter, file) {
-  const rawAliases = frontmatter[FRONTMATTER_KEYS.aliases];
-  if (!Array.isArray(rawAliases)) {
-    return true;
-  }
-  const normalizedAliases = getNormalizedAliases(frontmatter, file);
-  const currentAliases = rawAliases.filter((entry) => typeof entry === "string").map((entry) => entry.trim()).filter(Boolean);
-  return !stringArraysEqual(currentAliases, normalizedAliases);
 }
 function readBodyStatus(frontmatter) {
   const rawStatus = readNullableString(frontmatter[FRONTMATTER_KEYS.syncStatus]);
@@ -1892,29 +1877,6 @@ function extractLeadingPresetKindFromList(markdown, presetKinds) {
   };
 }
 
-// src/eudic-url.ts
-var EUDIC_DICT_BASE_URL = "https://dict.eudic.net/dicts";
-function buildEudicQueryUrl(word, lang) {
-  const normalizedLang = lang?.trim() || "en";
-  return `${EUDIC_DICT_BASE_URL}/${encodeURIComponent(normalizedLang)}/${encodeURIComponent(word)}`;
-}
-function buildEudicDictionaryUri(word) {
-  return `eudic://dict/${encodeURIComponent(word.trim())}`;
-}
-function getExpectedEudicUri(frontmatter, file) {
-  return buildEudicDictionaryUri(getConfiguredWord(frontmatter, file));
-}
-function shouldFillEudicUrlBeforeFirstSync(frontmatter) {
-  const currentUrl = readNullableString(frontmatter[FRONTMATTER_KEYS.eudicUrl]);
-  if (!currentUrl) {
-    return true;
-  }
-  if (readNullableString(frontmatter[FRONTMATTER_KEYS.lastSyncedHash])) {
-    return false;
-  }
-  return currentUrl === buildEudicQueryUrl("Untitled", "en");
-}
-
 // src/reference-note-service.ts
 var import_obsidian4 = require("obsidian");
 
@@ -2021,7 +1983,7 @@ function buildReferenceEmbed(storedRef) {
   const stem = storedRef.split("/").pop() ?? storedRef;
   return `![[${storedRef}#${buildReferenceBlockAnchor(stem)}]]`;
 }
-function stringArraysEqual2(left, right) {
+function stringArraysEqual(left, right) {
   if (left.length !== right.length) {
     return false;
   }
@@ -2806,7 +2768,7 @@ function setsEqual(left, right) {
 function usageNeedsRewrite(frontmatter, referenceId, referencedBy) {
   const referencedByPaths = referencedBy.map((file) => file.path);
   const referencedByLinks = referencedBy.map((file) => buildWikiLink(file));
-  return readEudicLinkId(frontmatter) !== referenceId || readNumber(frontmatter[FRONTMATTER_KEYS.refCount]) !== referencedBy.length || !stringArraysEqual2(readStringArray(frontmatter[FRONTMATTER_KEYS.referencedBy]), referencedByPaths) || !stringArraysEqual2(readStringArray(frontmatter[FRONTMATTER_KEYS.referencedByLinks]), referencedByLinks) || readNullableString(frontmatter[FRONTMATTER_KEYS.usageUpdatedAt]) === null;
+  return readEudicLinkId(frontmatter) !== referenceId || readNumber(frontmatter[FRONTMATTER_KEYS.refCount]) !== referencedBy.length || !stringArraysEqual(readStringArray(frontmatter[FRONTMATTER_KEYS.referencedBy]), referencedByPaths) || !stringArraysEqual(readStringArray(frontmatter[FRONTMATTER_KEYS.referencedByLinks]), referencedByLinks) || readNullableString(frontmatter[FRONTMATTER_KEYS.usageUpdatedAt]) === null;
 }
 function readReferencedByWordPaths(frontmatter) {
   return readStringArray(frontmatter[FRONTMATTER_KEYS.referencedBy]);
@@ -3077,7 +3039,7 @@ var ReferenceGraphService = class {
     const frontmatter = getFrontmatter(this.options.app, file);
     const hasStableReferencePaths = Array.isArray(frontmatter[FRONTMATTER_KEYS.referencePaths]);
     const hasLegacyReferenceRefs = FRONTMATTER_KEYS.legacyReferenceRefs in frontmatter;
-    if (stringArraysEqual2(currentStoredReferenceRefs, storedReferencePaths) && hasStableReferencePaths && !hasLegacyReferenceRefs) {
+    if (stringArraysEqual(currentStoredReferenceRefs, storedReferencePaths) && hasStableReferencePaths && !hasLegacyReferenceRefs) {
       return false;
     }
     await this.options.writeFrontmatter(file, (nextFrontmatter) => {
@@ -3454,6 +3416,7 @@ var IMPORTABLE_SETTINGS_KEYS = [
   "wordFolder",
   "referenceFolder",
   "authorizationToken",
+  "newWordDefaultStudylists",
   "noteOutputMode",
   "enableAutoBoldMarkersOnEdit",
   "boldMarkers",
@@ -3548,6 +3511,51 @@ function readStudylistCache(value) {
     refreshedAt: readString(value.refreshedAt)
   };
 }
+function readStudylistCategories(value, fallback = []) {
+  if (!Array.isArray(value)) {
+    return fallback.map((category) => ({ ...category }));
+  }
+  const result = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const entry of value) {
+    if (!isRecord(entry)) {
+      continue;
+    }
+    const id = readString(entry.id);
+    const language = readString(entry.language)?.toLocaleLowerCase() ?? null;
+    const name = readString(entry.name);
+    if (!id || !language || !name) {
+      continue;
+    }
+    const key = `${language}\0${id}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push({ id, language, name });
+  }
+  return result;
+}
+function hasExactStudylistCategories(value, expected) {
+  if (!Array.isArray(value) || value.length !== expected.length) {
+    return false;
+  }
+  return value.every((entry, index) => {
+    if (!isRecord(entry)) {
+      return false;
+    }
+    const category = expected[index];
+    return entry.id === category?.id && entry.language === category?.language && entry.name === category?.name;
+  });
+}
+function refreshSelectedStudylistSnapshots(selected, cache) {
+  const cachedByKey = new Map(
+    cache.categories.map((category) => [`${category.language.trim().toLocaleLowerCase()}\0${category.id.trim()}`, category])
+  );
+  return readStudylistCategories(selected).map((category) => ({
+    ...cachedByKey.get(`${category.language.toLocaleLowerCase()}\0${category.id}`) ?? category
+  }));
+}
 function readNoteOutputMode(value) {
   return value === "compatible" ? "compatible" : "minimal";
 }
@@ -3564,7 +3572,7 @@ function pickImportableSettings(settings) {
   const result = {};
   for (const key of IMPORTABLE_SETTINGS_KEYS) {
     const value = settings[key];
-    result[key] = Array.isArray(value) ? [...value] : value;
+    result[key] = key === "newWordDefaultStudylists" ? settings.newWordDefaultStudylists.map((category) => ({ ...category })) : Array.isArray(value) ? [...value] : value;
   }
   return result;
 }
@@ -3620,11 +3628,17 @@ function migrateLoadedSettings(rawData) {
   );
   const normalizedWordFolder = normalizeFolderPath2(readString(raw.wordFolder) ?? "") || derivedLegacyWordFolder || DEFAULT_SETTINGS.wordFolder;
   const normalizedReferenceFolder = rewriteLegacyExamplesFolderToReferences(readString(raw.referenceFolder) ?? "") || derivedLegacyReferenceFolder || DEFAULT_SETTINGS.referenceFolder;
+  const studylistCache = readStudylistCache(raw.studylistCache);
+  const newWordDefaultStudylists = refreshSelectedStudylistSnapshots(
+    readStudylistCategories(raw.newWordDefaultStudylists, DEFAULT_SETTINGS.newWordDefaultStudylists),
+    studylistCache
+  );
   const settings = {
     wordFolder: normalizedWordFolder,
     referenceFolder: normalizedReferenceFolder,
     authorizationToken: readString(raw.authorizationToken) ?? DEFAULT_SETTINGS.authorizationToken,
-    studylistCache: readStudylistCache(raw.studylistCache),
+    studylistCache,
+    newWordDefaultStudylists,
     noteOutputMode: readNoteOutputMode(raw.noteOutputMode),
     noteOutputFormatVersion: isRecord(rawData) ? rawNoteOutputFormatVersion : NOTE_OUTPUT_FORMAT_VERSION,
     enableAutoBoldMarkersOnEdit: readBoolean(
@@ -3671,7 +3685,7 @@ function migrateLoadedSettings(rawData) {
     enableHeaderSyncButton: readBoolean(raw.enableHeaderSyncButton, DEFAULT_SETTINGS.enableHeaderSyncButton),
     enableStatusBarSyncButton: readBoolean(raw.enableStatusBarSyncButton, DEFAULT_SETTINGS.enableStatusBarSyncButton)
   };
-  const changed = hasLegacyPathKeys || !isRecord(rawData) || readString(raw.wordFolder) !== settings.wordFolder || readString(raw.referenceFolder) !== settings.referenceFolder || hasLegacyAutoSyncOnSave || !("wordFolder" in raw) || !("referenceFolder" in raw) || !("studylistCache" in raw) || "defaultStudylistSource" in raw || !("noteOutputFormatVersion" in raw) || !("enableAutoBoldMarkersOnEdit" in raw) || !("boldMarkers" in raw) || !("enableSemanticBlockWordBold" in raw) || !("semanticBlockWordBoldKinds" in raw) || !("enableSemanticBlockMarkerBold" in raw) || !("enableSemanticBlockWordLinks" in raw) || !("semanticBlockWordLinkKinds" in raw) || !("semanticBlockKindPresets" in raw) || !("enableAutoExtractPendingReferencesOnSave" in raw) || LEGACY_AUTO_EXTRACT_PENDING_REFERENCES_SETTING in raw || !("enableAutoSyncWordOnLeave" in raw) || !("referenceMetadataWriteMode" in raw) || raw.referenceMetadataWriteMode !== settings.referenceMetadataWriteMode;
+  const changed = hasLegacyPathKeys || !isRecord(rawData) || readString(raw.wordFolder) !== settings.wordFolder || readString(raw.referenceFolder) !== settings.referenceFolder || hasLegacyAutoSyncOnSave || !("wordFolder" in raw) || !("referenceFolder" in raw) || !("studylistCache" in raw) || !hasExactStudylistCategories(raw.newWordDefaultStudylists, settings.newWordDefaultStudylists) || "defaultStudylistSource" in raw || !("noteOutputFormatVersion" in raw) || !("enableAutoBoldMarkersOnEdit" in raw) || !("boldMarkers" in raw) || !("enableSemanticBlockWordBold" in raw) || !("semanticBlockWordBoldKinds" in raw) || !("enableSemanticBlockMarkerBold" in raw) || !("enableSemanticBlockWordLinks" in raw) || !("semanticBlockWordLinkKinds" in raw) || !("semanticBlockKindPresets" in raw) || !("enableAutoExtractPendingReferencesOnSave" in raw) || LEGACY_AUTO_EXTRACT_PENDING_REFERENCES_SETTING in raw || !("enableAutoSyncWordOnLeave" in raw) || !("referenceMetadataWriteMode" in raw) || raw.referenceMetadataWriteMode !== settings.referenceMetadataWriteMode;
   return {
     settings,
     changed,
@@ -3695,6 +3709,19 @@ function parseLines(value) {
 }
 function configureTextarea(text, rows) {
   text.inputEl.rows = rows;
+}
+function studylistCategoryKey(category) {
+  return `${category.language.toLocaleLowerCase()}\0${category.id}`;
+}
+function getDefaultStudylistOptions(cached, selected) {
+  const byKey = new Map(selected.map((category) => [studylistCategoryKey(category), category]));
+  for (const category of cached) {
+    byKey.set(studylistCategoryKey(category), category);
+  }
+  return Array.from(byKey.values()).sort((left, right) => {
+    const languageOrder = left.language.localeCompare(right.language);
+    return languageOrder || left.name.localeCompare(right.name);
+  });
 }
 function toErrorMessage(error) {
   if (error instanceof Error) {
@@ -3840,6 +3867,35 @@ var EudicSyncSettingTab = class extends import_obsidian8.PluginSettingTab {
     new import_obsidian8.Setting(syncOutputSection).setName("Studylist category authority").setDesc(
       "Obsidian chooses which existing Eudic studylists a word belongs to. Create, rename, and delete studylist categories in Eudic cloud first, then refresh them back into Obsidian. Empty studylist fields are safe by default: they are pushed only when the word is explicitly dirty."
     );
+    new import_obsidian8.Setting(syncOutputSection).setName("Default studylists for new words").setDesc(
+      "Selected cached categories are written only to newly created or clearly incomplete word notes. Existing normalized notes are not changed, and nothing is pushed to Eudic automatically."
+    );
+    const selectedDefaultKeys = new Set(settings.newWordDefaultStudylists.map(studylistCategoryKey));
+    const defaultStudylistOptions = getDefaultStudylistOptions(
+      settings.studylistCache.categories,
+      settings.newWordDefaultStudylists
+    );
+    if (defaultStudylistOptions.length === 0) {
+      new import_obsidian8.Setting(syncOutputSection).setName("No cached studylists").setDesc("Run \u201CRefresh Eudic studylists\u201D first, then reopen settings to choose defaults.");
+    }
+    for (const category of defaultStudylistOptions) {
+      const key = studylistCategoryKey(category);
+      const existsInCache = settings.studylistCache.categories.some(
+        (cachedCategory) => studylistCategoryKey(cachedCategory) === key
+      );
+      new import_obsidian8.Setting(syncOutputSection).setName(`${category.name} (${category.language})`).setDesc(existsInCache ? `Eudic studylist ID: ${category.id}` : `Cached category missing; saved snapshot ID: ${category.id}`).addToggle((toggle) => {
+        toggle.setValue(selectedDefaultKeys.has(key)).onChange(async (selected) => {
+          const next = settings.newWordDefaultStudylists.filter(
+            (current) => studylistCategoryKey(current) !== key
+          );
+          if (selected) {
+            next.push({ ...category });
+          }
+          await this.plugin.updateSettings({ newWordDefaultStudylists: next });
+          this.display();
+        });
+      });
+    }
     new import_obsidian8.Setting(syncOutputSection).setName("Reference metadata writeback").setDesc("Reference relationships are inferred from word-note embeds and written into visible reference properties for stable linking and repair.").addDropdown((dropdown) => {
       dropdown.addOption("auto", "Auto").addOption("manual", "Manual command only").addOption("off", "Off").setValue(settings.referenceMetadataWriteMode).onChange(async (value) => {
         await this.plugin.updateSettings({
@@ -3945,6 +4001,23 @@ var EudicSyncSettingTab = class extends import_obsidian8.PluginSettingTab {
         this.openImportSettingsPicker();
       });
     });
+  }
+};
+
+// src/serial-task-queue.ts
+var SerialTaskQueue = class {
+  constructor() {
+    this.tails = /* @__PURE__ */ new WeakMap();
+  }
+  enqueue(key, task) {
+    const previous = this.tails.get(key) ?? Promise.resolve();
+    const current = previous.catch(() => void 0).then(task);
+    const tail = current.then(
+      () => void 0,
+      () => void 0
+    );
+    this.tails.set(key, tail);
+    return current;
   }
 };
 
@@ -5784,12 +5857,22 @@ function formatYamlScalar(value, bare = false) {
   }
   return JSON.stringify(value);
 }
+function formatYamlArrayValue(value) {
+  return JSON.stringify(value);
+}
 function buildFields(data) {
   return [
+    { key: FRONTMATTER_KEYS.syncEudicEnabled, value: data.syncEudicEnabled, bare: true },
+    { key: FRONTMATTER_KEYS.lang, value: data.lang, bare: true },
+    { key: FRONTMATTER_KEYS.aliases, value: data.aliases },
+    { key: FRONTMATTER_KEYS.eudicLinkId, value: data.eudicLinkId },
     { key: FRONTMATTER_KEYS.eudicUrl, value: data.eudicUrl },
     { key: FRONTMATTER_KEYS.eudicUri, value: data.eudicUri },
-    { key: FRONTMATTER_KEYS.eudicLinkId, value: data.eudicLinkId },
     { key: FRONTMATTER_KEYS.syncStatus, value: data.syncStatus, bare: true },
+    { key: FRONTMATTER_KEYS.referencePaths, value: data.referencePaths },
+    { key: FRONTMATTER_KEYS.studylistIds, value: data.studylistIds },
+    { key: FRONTMATTER_KEYS.studylistNames, value: data.studylistNames },
+    { key: FRONTMATTER_KEYS.studylistSyncStatus, value: data.studylistSyncStatus, bare: true },
     { key: FRONTMATTER_KEYS.syncedAt, value: data.syncedAt },
     { key: FRONTMATTER_KEYS.lastSyncedHash, value: data.lastSyncedHash },
     { key: FRONTMATTER_KEYS.lastSyncedAliasesHash, value: data.lastSyncedAliasesHash },
@@ -5797,10 +5880,16 @@ function buildFields(data) {
   ];
 }
 function buildReplacementLines(data) {
-  return buildFields(data).filter((field) => field.value !== void 0 && field.value !== null).map(buildFieldLine);
+  return buildFields(data).filter((field) => field.value !== void 0 && field.value !== null).flatMap(buildFieldLines);
 }
-function buildFieldLine(field) {
-  return `${field.key}: ${formatYamlScalar(field.value, field.bare)}`;
+function buildFieldLines(field) {
+  if (Array.isArray(field.value)) {
+    return field.value.length === 0 ? [`${field.key}: []`] : [`${field.key}:`, ...field.value.map((value) => `  - ${formatYamlArrayValue(value)}`)];
+  }
+  if (typeof field.value === "boolean") {
+    return [`${field.key}: ${field.value ? "true" : "false"}`];
+  }
+  return [`${field.key}: ${formatYamlScalar(field.value, field.bare)}`];
 }
 function buildPatchedFrontmatterLines(lines, frontmatterEndLine, data) {
   const providedFields = buildFields(data).filter((field) => field.value !== void 0);
@@ -5815,19 +5904,19 @@ function buildPatchedFrontmatterLines(lines, frontmatterEndLine, data) {
       nextLines.push(line);
       continue;
     }
-    writtenKeys.add(field.key);
     let rangeEnd = index + 1;
     while (rangeEnd < frontmatterEndLine && getTopLevelKey(lines[rangeEnd] ?? "") === null) {
       rangeEnd += 1;
     }
-    if (field.value !== null) {
-      nextLines.push(buildFieldLine(field));
+    if (!writtenKeys.has(field.key) && field.value !== null) {
+      nextLines.push(...buildFieldLines(field));
     }
+    writtenKeys.add(field.key);
     index = rangeEnd - 1;
   }
   for (const field of providedFields) {
     if (!writtenKeys.has(field.key) && field.value !== null) {
-      nextLines.push(buildFieldLine(field));
+      nextLines.push(...buildFieldLines(field));
     }
   }
   return nextLines;
@@ -5856,7 +5945,7 @@ function applyWordSyncFrontmatterToObject(frontmatter, data) {
     if (field.value === null) {
       delete frontmatter[field.key];
     } else {
-      frontmatter[field.key] = field.value;
+      frontmatter[field.key] = Array.isArray(field.value) ? [...field.value] : field.value;
     }
   }
 }
@@ -6102,6 +6191,29 @@ var AliasSyncService = class {
     return null;
   }
 };
+
+// src/eudic-url.ts
+var EUDIC_DICT_BASE_URL = "https://dict.eudic.net/dicts";
+function buildEudicQueryUrl(word, lang) {
+  const normalizedLang = lang?.trim() || "en";
+  return `${EUDIC_DICT_BASE_URL}/${encodeURIComponent(normalizedLang)}/${encodeURIComponent(word)}`;
+}
+function buildEudicDictionaryUri(word) {
+  return `eudic://dict/${encodeURIComponent(word.trim())}`;
+}
+function getExpectedEudicUri(frontmatter, file) {
+  return buildEudicDictionaryUri(getConfiguredWord(frontmatter, file));
+}
+function shouldFillEudicUrlBeforeFirstSync(frontmatter) {
+  const currentUrl = readNullableString(frontmatter[FRONTMATTER_KEYS.eudicUrl]);
+  if (!currentUrl) {
+    return true;
+  }
+  if (readNullableString(frontmatter[FRONTMATTER_KEYS.lastSyncedHash])) {
+    return false;
+  }
+  return currentUrl === buildEudicQueryUrl("Untitled", "en");
+}
 
 // src/html-renderer.ts
 var import_obsidian12 = require("obsidian");
@@ -8336,22 +8448,35 @@ function resolveWordDirtySignatureDecision(state) {
 }
 
 // src/word-frontmatter.ts
-function hasYamlFrontmatter(markdown) {
-  return /^---\s*\n[\s\S]*?\n---(?:\s*\n|$)/.test(markdown);
-}
-function writeDefaultWordFrontmatter(frontmatter, file, ensureEudicUri) {
-  frontmatter[FRONTMATTER_KEYS.syncEudicEnabled] = true;
-  frontmatter[FRONTMATTER_KEYS.lang] = "en";
-  frontmatter[FRONTMATTER_KEYS.aliases] = [];
-  frontmatter[FRONTMATTER_KEYS.eudicLinkId] = createEudicLinkId("word");
-  frontmatter[FRONTMATTER_KEYS.eudicUrl] = "";
-  if (ensureEudicUri) {
-    frontmatter[FRONTMATTER_KEYS.eudicUri] = getExpectedEudicUri(frontmatter, file);
+var import_obsidian16 = require("obsidian");
+function parseFrontmatterFromMarkdown(markdown, file) {
+  const lines = markdown.replace(/^\uFEFF/, "").split("\n");
+  if ((lines[0] ?? "").replace(/\r$/, "").trim() !== "---") {
+    return {};
   }
-  frontmatter[FRONTMATTER_KEYS.syncStatus] = "dirty";
-  frontmatter[FRONTMATTER_KEYS.studylistIds] = [];
-  frontmatter[FRONTMATTER_KEYS.studylistNames] = [];
-  frontmatter[FRONTMATTER_KEYS.studylistSyncStatus] = "synced";
+  let endLine = -1;
+  for (let index = 1; index < lines.length; index += 1) {
+    if ((lines[index] ?? "").replace(/\r$/, "").trim() === "---") {
+      endLine = index;
+      break;
+    }
+  }
+  if (endLine < 0) {
+    throw new Error(`Malformed YAML frontmatter in ${file.path}: missing closing fence.`);
+  }
+  try {
+    const parsed = (0, import_obsidian16.parseYaml)(lines.slice(1, endLine).map((line) => line.replace(/\r$/, "")).join("\n"));
+    if (parsed === null || parsed === void 0) {
+      return {};
+    }
+    if (typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("frontmatter root must be a mapping");
+    }
+    return parsed;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Malformed YAML frontmatter in ${file.path}: ${message}`);
+  }
 }
 function readSyncEudicEnabled(frontmatter) {
   const value = frontmatter[FRONTMATTER_KEYS.syncEudicEnabled];
@@ -8360,83 +8485,204 @@ function readSyncEudicEnabled(frontmatter) {
 function getDefaultSyncEudicEnabled(frontmatter) {
   return frontmatter[FRONTMATTER_KEYS.eudicSync] === false ? false : true;
 }
-async function ensureManagedWordProperties(options) {
-  const { app, file, writeFrontmatter, ensureEudicUri = true } = options;
-  const markdown = await app.vault.cachedRead(file);
-  if (!hasYamlFrontmatter(markdown)) {
-    await writeFrontmatter(file, (frontmatter2) => {
-      writeDefaultWordFrontmatter(frontmatter2, file, ensureEudicUri);
-    });
-    return {
-      skipped: false,
-      changed: true,
-      markdown: await app.vault.cachedRead(file)
-    };
+function hasMissingCreationField(frontmatter) {
+  return typeof frontmatter[FRONTMATTER_KEYS.syncEudicEnabled] !== "boolean" || !Array.isArray(frontmatter[FRONTMATTER_KEYS.aliases]) || typeof frontmatter[FRONTMATTER_KEYS.eudicUrl] !== "string" || !Array.isArray(frontmatter[FRONTMATTER_KEYS.referencePaths]);
+}
+function isIncompleteCreationShell(frontmatter) {
+  return readNullableString(frontmatter[FRONTMATTER_KEYS.lang]) === null && hasMissingCreationField(frontmatter) && readNullableString(frontmatter[FRONTMATTER_KEYS.lastSyncedHash]) === null && readNullableString(frontmatter[FRONTMATTER_KEYS.syncedAt]) === null && readLooseStringArray(frontmatter[FRONTMATTER_KEYS.studylistIds], true).length === 0 && readLooseStringArray(frontmatter[FRONTMATTER_KEYS.studylistNames]).length === 0;
+}
+function getDefaultStudylistPairs(categories, language) {
+  const normalizedLanguage = language.trim().toLocaleLowerCase();
+  const seen = /* @__PURE__ */ new Set();
+  const ids = [];
+  const names = [];
+  for (const category of categories) {
+    const id = category.id.trim();
+    const name = category.name.trim();
+    if (!id || !name || category.language.trim().toLocaleLowerCase() !== normalizedLanguage || seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+    ids.push(id);
+    names.push(name);
   }
-  const frontmatter = getFrontmatter(app, file);
-  const syncEudicEnabled = readSyncEudicEnabled(frontmatter);
-  const defaultSyncEudicEnabled = getDefaultSyncEudicEnabled(frontmatter);
-  const shouldAddSyncEudicEnabled = syncEudicEnabled === null;
-  const nextSyncEudicEnabled = syncEudicEnabled ?? defaultSyncEudicEnabled;
+  return { ids, names };
+}
+function readLooseStringArray(value, allowNumbers = false) {
+  const values = Array.isArray(value) ? value : [value];
+  const seen = /* @__PURE__ */ new Set();
+  const result = [];
+  for (const entry of values) {
+    const normalized = typeof entry === "string" ? entry.trim() : allowNumbers && typeof entry === "number" && Number.isFinite(entry) ? String(entry) : "";
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    result.push(normalized);
+  }
+  return result;
+}
+function repairStudylistPair(frontmatter, language, catalog) {
+  const rawIds = frontmatter[FRONTMATTER_KEYS.studylistIds];
+  const rawNames = frontmatter[FRONTMATTER_KEYS.studylistNames];
+  const ids = readLooseStringArray(rawIds, true);
+  const names = readLooseStringArray(rawNames);
+  if (ids.length === 0 && names.length === 0) {
+    return null;
+  }
+  if (Array.isArray(rawIds) && Array.isArray(rawNames) && ids.length === names.length && ids.length > 0) {
+    return null;
+  }
+  const normalizedLanguage = language.trim().toLocaleLowerCase();
+  const available = catalog.filter(
+    (category) => category.language.trim().toLocaleLowerCase() === normalizedLanguage
+  );
+  const byId = new Map(available.map((category) => [category.id.trim(), category]));
+  const byName = new Map(available.map((category) => [category.name.trim(), category]));
+  if (ids.length > 0) {
+    const categories = ids.map((id) => byId.get(id));
+    if (categories.every((category) => category !== void 0)) {
+      return { ids, names: categories.map((category) => category.name.trim()) };
+    }
+  }
+  if (names.length > 0) {
+    const categories = names.map((name) => byName.get(name));
+    if (categories.every((category) => category !== void 0)) {
+      return { ids: categories.map((category) => category.id.trim()), names };
+    }
+  }
+  return null;
+}
+function isGeneratedMissingLangError(value) {
+  const error = readNullableString(value);
+  return error !== null && /^Missing 'lang' in .+\.$/.test(error);
+}
+function getNormalizedStudylistStatus(frontmatter) {
+  const copy = { ...frontmatter };
+  normalizeStudylistSyncStatus(copy);
+  return copy[FRONTMATTER_KEYS.studylistSyncStatus] === "dirty" ? "dirty" : "synced";
+}
+function reconcileManagedWordMarkdown(options) {
+  const {
+    file,
+    markdown,
+    ensureEudicUri = true,
+    trigger = "touch",
+    defaultStudylists = [],
+    studylistCatalog = []
+  } = options;
+  const frontmatter = parseFrontmatterFromMarkdown(markdown, file);
+  const existingSyncEnabled = readSyncEudicEnabled(frontmatter);
+  const nextSyncEnabled = existingSyncEnabled ?? getDefaultSyncEudicEnabled(frontmatter);
   const isDisabled = isWordSyncDisabledFrontmatter({
     ...frontmatter,
-    [FRONTMATTER_KEYS.syncEudicEnabled]: nextSyncEudicEnabled
+    [FRONTMATTER_KEYS.syncEudicEnabled]: nextSyncEnabled
   });
-  const normalizedAliases = getNormalizedAliases(frontmatter, file);
-  const shouldUpdateAliases = aliasesNeedRewrite(frontmatter, file);
-  const shouldAddEudicLinkId = readEudicLinkId(frontmatter) === null;
-  const shouldAddLang = readNullableString(frontmatter[FRONTMATTER_KEYS.lang]) === null;
-  const shouldAddEudicUrl = !(FRONTMATTER_KEYS.eudicUrl in frontmatter);
-  const expectedEudicUri = getExpectedEudicUri(frontmatter, file);
-  const shouldUpdateEudicUri = ensureEudicUri && readNullableString(frontmatter[FRONTMATTER_KEYS.eudicUri]) !== expectedEudicUri;
-  const shouldAddSyncStatus = readNullableString(frontmatter[FRONTMATTER_KEYS.syncStatus]) === null;
-  const shouldNormalizeStudylistStatus = !isStudylistSyncStatusNormalized(frontmatter);
-  const shouldAddStudylistIds = !Array.isArray(frontmatter[FRONTMATTER_KEYS.studylistIds]);
-  const shouldAddStudylistNames = !Array.isArray(frontmatter[FRONTMATTER_KEYS.studylistNames]);
-  const shouldAddSyncableFields = !isDisabled;
-  if (!shouldAddSyncEudicEnabled && !shouldUpdateAliases && !shouldAddEudicLinkId && !shouldAddEudicUrl && !shouldUpdateEudicUri && !shouldNormalizeStudylistStatus && !shouldAddStudylistIds && !shouldAddStudylistNames && (!shouldAddSyncableFields || !shouldAddLang && !shouldAddSyncStatus)) {
+  if (trigger === "startup") {
     return {
       skipped: isDisabled,
       changed: false,
-      markdown
+      markdown,
+      patchData: {},
+      lang: readNullableString(frontmatter[FRONTMATTER_KEYS.lang]),
+      eudicLinkId: readEudicLinkId(frontmatter),
+      eudicUri: readNullableString(frontmatter[FRONTMATTER_KEYS.eudicUri])
     };
   }
-  await writeFrontmatter(file, (nextFrontmatter) => {
-    if (shouldAddSyncEudicEnabled) {
-      nextFrontmatter[FRONTMATTER_KEYS.syncEudicEnabled] = defaultSyncEudicEnabled;
+  const missingLang = readNullableString(frontmatter[FRONTMATTER_KEYS.lang]) === null;
+  const language = readNullableString(frontmatter[FRONTMATTER_KEYS.lang]) ?? "en";
+  const hasExistingAssignment = readLooseStringArray(frontmatter[FRONTMATTER_KEYS.studylistIds], true).length > 0 || readLooseStringArray(frontmatter[FRONTMATTER_KEYS.studylistNames]).length > 0;
+  const shouldSeedDefaultStudylists = !isDisabled && !hasExistingAssignment && (trigger === "create" || trigger === "touch" && isIncompleteCreationShell(frontmatter));
+  const defaultPairs = getDefaultStudylistPairs(defaultStudylists, language);
+  const patchData = {};
+  if (existingSyncEnabled === null) {
+    patchData.syncEudicEnabled = nextSyncEnabled;
+  }
+  if (!Array.isArray(frontmatter[FRONTMATTER_KEYS.aliases])) {
+    patchData.aliases = normalizeAliasesValue(frontmatter[FRONTMATTER_KEYS.aliases], getConfiguredWord(frontmatter, file));
+  }
+  if (readEudicLinkId(frontmatter) === null) {
+    patchData.eudicLinkId = createEudicLinkId("word");
+  }
+  if (typeof frontmatter[FRONTMATTER_KEYS.eudicUrl] !== "string") {
+    patchData.eudicUrl = "";
+  }
+  if (ensureEudicUri) {
+    const expectedUri = getExpectedEudicUri(frontmatter, file);
+    if (readNullableString(frontmatter[FRONTMATTER_KEYS.eudicUri]) !== expectedUri) {
+      patchData.eudicUri = expectedUri;
     }
-    if (shouldUpdateAliases) {
-      nextFrontmatter[FRONTMATTER_KEYS.aliases] = normalizedAliases;
+  }
+  if (!Array.isArray(frontmatter[FRONTMATTER_KEYS.referencePaths])) {
+    patchData.referencePaths = [];
+  }
+  if (!isDisabled && missingLang) {
+    patchData.lang = "en";
+    if (isGeneratedMissingLangError(frontmatter[FRONTMATTER_KEYS.lastError])) {
+      patchData.lastError = null;
     }
-    if (shouldAddEudicLinkId) {
-      nextFrontmatter[FRONTMATTER_KEYS.eudicLinkId] = createEudicLinkId("word");
+  }
+  if (!isDisabled && readNullableString(frontmatter[FRONTMATTER_KEYS.syncStatus]) === null) {
+    patchData.syncStatus = "dirty";
+  }
+  if (shouldSeedDefaultStudylists) {
+    patchData.studylistIds = defaultPairs.ids;
+    patchData.studylistNames = defaultPairs.names;
+    patchData.studylistSyncStatus = defaultPairs.ids.length > 0 ? "dirty" : "synced";
+  } else {
+    const repairedPair = repairStudylistPair(frontmatter, language, studylistCatalog);
+    if (repairedPair) {
+      patchData.studylistIds = repairedPair.ids;
+      patchData.studylistNames = repairedPair.names;
+      patchData.studylistSyncStatus = "dirty";
+    } else if (!hasExistingAssignment) {
+      if (!Array.isArray(frontmatter[FRONTMATTER_KEYS.studylistIds])) {
+        patchData.studylistIds = [];
+      }
+      if (!Array.isArray(frontmatter[FRONTMATTER_KEYS.studylistNames])) {
+        patchData.studylistNames = [];
+      }
     }
-    if (shouldAddEudicUrl) {
-      nextFrontmatter[FRONTMATTER_KEYS.eudicUrl] = "";
+    if (patchData.studylistSyncStatus === void 0 && !isStudylistSyncStatusNormalized(frontmatter)) {
+      patchData.studylistSyncStatus = getNormalizedStudylistStatus(frontmatter);
     }
-    if (shouldUpdateEudicUri) {
-      nextFrontmatter[FRONTMATTER_KEYS.eudicUri] = expectedEudicUri;
-    }
-    if (shouldNormalizeStudylistStatus) {
-      normalizeStudylistSyncStatus(nextFrontmatter);
-    }
-    if (shouldAddStudylistIds) {
-      nextFrontmatter[FRONTMATTER_KEYS.studylistIds] = [];
-    }
-    if (shouldAddStudylistNames) {
-      nextFrontmatter[FRONTMATTER_KEYS.studylistNames] = [];
-    }
-    if (shouldAddSyncableFields && shouldAddLang) {
-      nextFrontmatter[FRONTMATTER_KEYS.lang] = "en";
-    }
-    if (shouldAddSyncableFields && shouldAddSyncStatus) {
-      nextFrontmatter[FRONTMATTER_KEYS.syncStatus] = "dirty";
-    }
-  });
+  }
+  const nextMarkdown = setWordSyncFrontmatterInMarkdown(markdown, patchData);
+  const nextFrontmatter = { ...frontmatter };
+  applyWordSyncFrontmatterToObject(nextFrontmatter, patchData);
   return {
     skipped: isDisabled,
+    changed: nextMarkdown !== markdown,
+    markdown: nextMarkdown,
+    patchData,
+    lang: readNullableString(nextFrontmatter[FRONTMATTER_KEYS.lang]),
+    eudicLinkId: readEudicLinkId(nextFrontmatter),
+    eudicUri: readNullableString(nextFrontmatter[FRONTMATTER_KEYS.eudicUri])
+  };
+}
+async function ensureManagedWordProperties(options) {
+  const { app, file, writeFrontmatter } = options;
+  const reconciled = reconcileManagedWordMarkdown({
+    file,
+    markdown: await app.vault.cachedRead(file),
+    ensureEudicUri: options.ensureEudicUri,
+    trigger: options.trigger,
+    defaultStudylists: options.defaultStudylists,
+    studylistCatalog: options.studylistCatalog
+  });
+  if (!reconciled.changed) {
+    return reconciled;
+  }
+  await writeFrontmatter(file, (frontmatter) => {
+    applyWordSyncFrontmatterToObject(frontmatter, reconciled.patchData);
+  });
+  return {
+    skipped: reconciled.skipped,
     changed: true,
-    markdown: await app.vault.cachedRead(file)
+    markdown: await app.vault.cachedRead(file),
+    lang: reconciled.lang,
+    eudicLinkId: reconciled.eudicLinkId,
+    eudicUri: reconciled.eudicUri
   };
 }
 
@@ -8444,7 +8690,7 @@ async function ensureManagedWordProperties(options) {
 var AUTO_SYNC_AFTER_LEAVE_DELAY_MS = 2e3;
 var EDITOR_CHANGE_DEBOUNCE_MS = 150;
 function isMarkdownFile3(file) {
-  return file instanceof import_obsidian16.TFile && file.extension === "md";
+  return file instanceof import_obsidian17.TFile && file.extension === "md";
 }
 function toErrorMessage7(error) {
   if (error instanceof Error) {
@@ -8452,7 +8698,7 @@ function toErrorMessage7(error) {
   }
   return String(error);
 }
-function hasYamlFrontmatter2(markdown) {
+function hasYamlFrontmatter(markdown) {
   return /^---\s*\n[\s\S]*?\n---(?:\s*\n|$)/.test(markdown);
 }
 function prependReferenceFrontmatter(markdown, linkId) {
@@ -8492,7 +8738,7 @@ async function copyTextToClipboard(text) {
     textarea.remove();
   }
 }
-var EudicSyncPlugin = class extends import_obsidian16.Plugin {
+var EudicSyncPlugin = class extends import_obsidian17.Plugin {
   constructor() {
     super(...arguments);
     this.settings = DEFAULT_SETTINGS;
@@ -8529,6 +8775,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     this.wordSyncSignatures = /* @__PURE__ */ new Map();
     this.wordCleanSyncSignatures = /* @__PURE__ */ new Map();
     this.pendingOpenWordStatusWrites = /* @__PURE__ */ new Map();
+    this.wordLifecycleQueue = new SerialTaskQueue();
     this.flushingOpenWordStatusWritePaths = /* @__PURE__ */ new Set();
     this.editorChangeTimers = /* @__PURE__ */ new Map();
     this.autoBodyDirtyPaths = /* @__PURE__ */ new Set();
@@ -8606,7 +8853,10 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
         this.lastActiveWordPath = this.getActiveWordPath();
         const activeFile = this.getActiveMarkdownFile();
         if (activeFile && this.pathScope.isWordPath(activeFile.path)) {
-          void this.ensureWordEudicUri(activeFile);
+          void this.enqueueWordLifecycle(
+            activeFile,
+            () => this.ensureManagedWordProperties(activeFile, { ensureEudicUri: false, trigger: "touch" })
+          ).catch((error) => this.reportWordReconcileError("layout-ready", activeFile, error));
         }
         this.scheduleStartupKnownPathClear();
         this.runStartupTasks();
@@ -8669,7 +8919,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     this.refreshUi();
     this.registerVaultEventsOnLayoutReady();
     for (const message of this.startupNotices) {
-      new import_obsidian16.Notice(message, 8e3);
+      new import_obsidian17.Notice(message, 8e3);
     }
   }
   onunload() {
@@ -8689,15 +8939,13 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     this.invalidateSemanticReferenceCaches();
     await this.saveData(this.settings);
     await this.rebuildReferenceIndex();
-    await this.ensureAllWordManagedFrontmatter();
-    await this.studylistService.ensureAllWordStudylistFrontmatter();
     this.studylistService.captureAllLocalSnapshots();
     if (previousSettings.enableAutoSyncWordOnLeave && !this.settings.enableAutoSyncWordOnLeave) {
       this.clearAutoSyncTimers();
     }
     if (previousSettings.noteOutputMode !== this.settings.noteOutputMode) {
       const markedCount = await this.markAllSyncWordsDirty();
-      new import_obsidian16.Notice(
+      new import_obsidian17.Notice(
         `${PLUGIN_NAME}: note output mode changed to ${this.settings.noteOutputMode}. Marked ${markedCount} word(s) dirty.`
       );
     }
@@ -8715,13 +8963,13 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
       el.empty();
       el.addClass("eudic-sync-block-preview");
       embedContainer?.classList.add("eudic-sync-block-embed");
-      const child = new import_obsidian16.MarkdownRenderChild(el);
+      const child = new import_obsidian17.MarkdownRenderChild(el);
       ctx.addChild(child);
       const semanticOptions = await this.getSemanticBlockTransformOptionsForSourcePath(
         ctx.sourcePath,
         this.getActiveWordFileForSemanticPreview()
       );
-      await import_obsidian16.MarkdownRenderer.render(
+      await import_obsidian17.MarkdownRenderer.render(
         this.app,
         renderEudicBlockToMarkdown(
           openingFence.kind,
@@ -8741,7 +8989,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
   }
   getActiveWordFileForSemanticPreview() {
     const activeFile = this.app.workspace.getActiveFile();
-    if (!(activeFile instanceof import_obsidian16.TFile) || activeFile.extension !== "md" || !this.pathScope.isWordPath(activeFile.path)) {
+    if (!(activeFile instanceof import_obsidian17.TFile) || activeFile.extension !== "md" || !this.pathScope.isWordPath(activeFile.path)) {
       return null;
     }
     return activeFile;
@@ -8781,10 +9029,6 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
         run: () => this.ensureAllWordManagedFrontmatter()
       },
       {
-        label: "startup.ensureStudylistFrontmatter",
-        run: () => this.studylistService.ensureAllWordStudylistFrontmatter()
-      },
-      {
         label: "startup.captureStudylistSnapshots",
         run: () => this.studylistService.captureAllLocalSnapshots()
       },
@@ -8804,12 +9048,12 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
   }
   handleStartupTaskError(label, error) {
     console.error(`${PLUGIN_NAME}: startup task failed (${label})`, error);
-    new import_obsidian16.Notice(`${PLUGIN_NAME}: startup task failed (${label}): ${toErrorMessage7(error)}`, 8e3);
+    new import_obsidian17.Notice(`${PLUGIN_NAME}: startup task failed (${label}): ${toErrorMessage7(error)}`, 8e3);
   }
   captureStartupKnownPaths() {
     this.startupKnownPaths.clear();
     for (const file of [...this.managedFiles.getWordFiles(), ...this.managedFiles.getReferenceFiles()]) {
-      this.startupKnownPaths.add((0, import_obsidian16.normalizePath)(file.path));
+      this.startupKnownPaths.add((0, import_obsidian17.normalizePath)(file.path));
     }
   }
   scheduleStartupKnownPathClear() {
@@ -8832,47 +9076,47 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
       await this.perf.measure("reference.rebuildAll", () => this.referenceIndex.rebuildAll());
     } catch (error) {
       console.error(`${PLUGIN_NAME}: failed to rebuild reference index`, error);
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: failed to rebuild Reference index: ${toErrorMessage7(error)}`, 8e3);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: failed to rebuild Reference index: ${toErrorMessage7(error)}`, 8e3);
     }
   }
   async rebuildReferenceIndexManually() {
     try {
       this.invalidateSemanticReferenceCaches();
       await this.perf.measure("reference.rebuildAll.manual", () => this.referenceIndex.rebuildAll());
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: rebuilt Reference graph.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: rebuilt Reference graph.`);
       this.refreshUi();
     } catch (error) {
       console.error(`${PLUGIN_NAME}: failed to rebuild reference index`, error);
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: failed to rebuild Reference index: ${toErrorMessage7(error)}`, 8e3);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: failed to rebuild Reference index: ${toErrorMessage7(error)}`, 8e3);
     }
   }
   async rebuildLegacyReferenceMetadata() {
     try {
       this.invalidateSemanticReferenceCaches();
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: repairing All Reference metadata...`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: repairing All Reference metadata...`);
       const result = await this.perf.measure(
         "reference.repairMetadata.manual",
         () => this.referenceIndex.repairAllReferenceMetadata({ write: true })
       );
       await this.markWordsDirtyByPaths(result.affectedWordPaths);
-      new import_obsidian16.Notice(
+      new import_obsidian17.Notice(
         `${PLUGIN_NAME}: repaired All Reference metadata (${result.scannedWordCount} word note(s) scanned, ${result.wordMetadataUpdated} word note(s), ${result.referenceMetadataUpdated} reference note(s) updated).`
       );
       this.refreshUi();
     } catch (error) {
       console.error(`${PLUGIN_NAME}: failed to repair reference metadata`, error);
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: failed to repair Reference metadata: ${toErrorMessage7(error)}`, 8e3);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: failed to repair Reference metadata: ${toErrorMessage7(error)}`, 8e3);
     }
   }
   async repairCurrentReferenceMetadata() {
     const file = this.getActiveMarkdownFile();
     if (!file || !this.pathScope.isReferencePath(file.path)) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: open a reference note in the configured References folder first.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: open a reference note in the configured References folder first.`);
       return;
     }
     try {
       this.invalidateSemanticReferenceCaches([file.path]);
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: repairing Reference metadata for "${file.basename}"...`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: repairing Reference metadata for "${file.basename}"...`);
       await this.ensureReferenceManagedFrontmatter(file);
       const result = await this.perf.measure(
         "reference.repairMetadata.current",
@@ -8882,13 +9126,13 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
         })
       );
       await this.markWordsDirtyByPaths(result.affectedWordPaths);
-      new import_obsidian16.Notice(
+      new import_obsidian17.Notice(
         `${PLUGIN_NAME}: repaired "${file.basename}" (${result.scannedWordCount} word note(s) scanned, ${result.wordPaths.length} referring word note(s), ${result.referenceMetadataUpdated} reference note updated).`
       );
       this.refreshUi();
     } catch (error) {
       console.error(`${PLUGIN_NAME}: failed to repair current reference metadata`, error);
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: failed to repair current Reference metadata: ${toErrorMessage7(error)}`, 8e3);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: failed to repair current Reference metadata: ${toErrorMessage7(error)}`, 8e3);
     }
   }
   registerWorkspaceEvents() {
@@ -8905,7 +9149,10 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     this.registerEvent(
       this.app.workspace.on("file-open", (file) => {
         if (file && this.pathScope.isWordPath(file.path)) {
-          void this.ensureWordEudicUri(file);
+          void this.enqueueWordLifecycle(
+            file,
+            () => this.ensureManagedWordProperties(file, { ensureEudicUri: false, trigger: "touch" })
+          ).catch((error) => this.reportWordReconcileError("file-open", file, error));
         }
         handleActiveContextChange();
       })
@@ -8921,7 +9168,11 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     }
   }
   async setStudylistCache(cache) {
-    this.settings = Object.assign({}, this.settings, { studylistCache: cache });
+    const newWordDefaultStudylists = refreshSelectedStudylistSnapshots(
+      this.settings.newWordDefaultStudylists,
+      cache
+    );
+    this.settings = Object.assign({}, this.settings, { studylistCache: cache, newWordDefaultStudylists });
     await this.saveData(this.settings);
   }
   async ensureCurrentNoteOutputFormatVersion() {
@@ -8943,7 +9194,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     for (const file of this.managedFiles.getWordFiles()) {
       const markdown = await this.app.vault.cachedRead(file);
       const signature = getWordSyncSignature(markdown);
-      const normalizedPath = (0, import_obsidian16.normalizePath)(file.path);
+      const normalizedPath = (0, import_obsidian17.normalizePath)(file.path);
       this.wordSyncSignatures.set(normalizedPath, signature);
       if (this.syncService.getWordContext(file)?.bodyStatus === "synced") {
         this.wordCleanSyncSignatures.set(normalizedPath, signature);
@@ -8954,7 +9205,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     if (!this.pathScope.isWordPath(file.path)) {
       return;
     }
-    const normalizedPath = (0, import_obsidian16.normalizePath)(file.path);
+    const normalizedPath = (0, import_obsidian17.normalizePath)(file.path);
     const context = this.getDisplayWordContext(file);
     if (context?.bodyStatus !== "synced") {
       return;
@@ -8970,7 +9221,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     this.nonRestorableBodyDirtyPaths.delete(normalizedPath);
   }
   recordWordBodySyncedFromMarkdown(file, markdown) {
-    const normalizedPath = (0, import_obsidian16.normalizePath)(file.path);
+    const normalizedPath = (0, import_obsidian17.normalizePath)(file.path);
     const signature = getWordSyncSignature(markdown);
     this.wordSyncSignatures.set(normalizedPath, signature);
     this.wordCleanSyncSignatures.set(normalizedPath, signature);
@@ -8981,7 +9232,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     this.setWordBodyStatusOverride(file, "synced", null);
   }
   handleEditorChange(file, _markdown, editor) {
-    const normalizedPath = (0, import_obsidian16.normalizePath)(file.path);
+    const normalizedPath = (0, import_obsidian17.normalizePath)(file.path);
     const existingTimer = this.editorChangeTimers.get(normalizedPath);
     if (existingTimer !== void 0) {
       window.clearTimeout(existingTimer);
@@ -9008,7 +9259,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     if (!this.syncService.canSyncFile(file)) {
       return;
     }
-    const normalizedPath = (0, import_obsidian16.normalizePath)(file.path);
+    const normalizedPath = (0, import_obsidian17.normalizePath)(file.path);
     const nextSignature = getWordSyncSignature(markdown);
     const expectedSyncPatchSignature = this.syncingEditorWordStatusPatchSignatures.get(normalizedPath);
     if (expectedSyncPatchSignature) {
@@ -9058,13 +9309,20 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
       (kind) => kind === "word" ? this.managedFiles.getWordFiles() : this.managedFiles.getReferenceFiles()
     );
     if (resolved.error || !resolved.file) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: ${resolved.error ?? "Failed to resolve the managed Obsidian link."}`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: ${resolved.error ?? "Failed to resolve the managed Obsidian link."}`);
       return;
     }
     const leaf = this.app.workspace.getMostRecentLeaf() ?? this.app.workspace.getLeaf(false);
     await leaf.openFile(resolved.file);
   }
   async handleModify(file) {
+    if (isMarkdownFile3(file) && this.pathScope.isWordPath(file.path)) {
+      await this.enqueueWordLifecycle(
+        file,
+        () => this.perf.measure("event.modify", () => this.handleModifyInternal(file))
+      );
+      return;
+    }
     await this.perf.measure("event.modify", () => this.handleModifyInternal(file));
   }
   async handleModifyInternal(file) {
@@ -9078,7 +9336,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     }
     if (this.pathScope.isWordPath(file.path)) {
       const markdown = await this.app.vault.cachedRead(file);
-      const normalizedPath = (0, import_obsidian16.normalizePath)(file.path);
+      const normalizedPath = (0, import_obsidian17.normalizePath)(file.path);
       const isOpenWord = this.isMarkdownFileOpen(file);
       const nextWordSyncSignature = getWordSyncSignature(markdown);
       await this.studylistService.handleWordModify(file, markdown);
@@ -9124,9 +9382,6 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     }
     if (this.pathScope.isWordPath(file.path)) {
       this.releaseWordStatusOverridesIfMetadataCaughtUp(file);
-      if (!this.startupKnownPaths.has((0, import_obsidian16.normalizePath)(file.path))) {
-        void this.ensureWordEudicUri(file);
-      }
       this.refreshUi();
       return;
     }
@@ -9135,20 +9390,38 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     }
   }
   async handleCreate(file) {
-    await this.perf.measure("event.create", () => this.handleCreateInternal(file));
+    try {
+      if (isMarkdownFile3(file) && this.pathScope.isWordPath(file.path)) {
+        await this.enqueueWordLifecycle(
+          file,
+          () => this.perf.measure("event.create", () => this.handleCreateInternal(file))
+        );
+        return;
+      }
+      await this.perf.measure("event.create", () => this.handleCreateInternal(file));
+    } catch (error) {
+      if (isMarkdownFile3(file) && this.isStaleMissingWordFileError(file, error)) {
+        return;
+      }
+      if (isMarkdownFile3(file)) {
+        this.reportWordReconcileError("create", file, error);
+        return;
+      }
+      throw error;
+    }
   }
   async handleCreateInternal(file) {
     if (!isMarkdownFile3(file)) {
       return;
     }
     this.managedFiles.update(file);
-    const normalizedPath = (0, import_obsidian16.normalizePath)(file.path);
+    const normalizedPath = (0, import_obsidian17.normalizePath)(file.path);
     if (this.startupKnownPaths.delete(normalizedPath)) {
       this.refreshUi();
       return;
     }
     if (this.pathScope.isWordPath(file.path)) {
-      const ensured = await this.ensureManagedWordProperties(file);
+      const ensured = await this.ensureManagedWordProperties(file, { trigger: "create" });
       if (ensured.skipped) {
         const affectedReferencePaths = this.referenceIndex.removeWord(file.path);
         this.scheduleReferenceUsageRefresh(affectedReferencePaths);
@@ -9160,7 +9433,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
       this.scheduleReferenceUsageRefresh(result.affectedReferencePaths);
       await this.syncService.markWordDirty(file);
       this.setWordBodyDirtyOverride(file, null);
-      this.wordSyncSignatures.set((0, import_obsidian16.normalizePath)(file.path), getWordSyncSignature(ensured.markdown));
+      this.wordSyncSignatures.set((0, import_obsidian17.normalizePath)(file.path), getWordSyncSignature(ensured.markdown));
       this.refreshUi();
       return;
     }
@@ -9173,7 +9446,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     }
   }
   async handleDelete(file) {
-    const normalizedPath = (0, import_obsidian16.normalizePath)(file.path);
+    const normalizedPath = (0, import_obsidian17.normalizePath)(file.path);
     await this.perf.measure("event.delete", () => this.handleDeleteInternal(normalizedPath));
   }
   async handleDeleteInternal(normalizedPath) {
@@ -9207,8 +9480,8 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     await this.perf.measure("event.rename", () => this.handleRenameInternal(file, oldPath));
   }
   async handleRenameInternal(file, oldPath) {
-    const normalizedOldPath = (0, import_obsidian16.normalizePath)(oldPath);
-    const normalizedNewPath = (0, import_obsidian16.normalizePath)(file.path);
+    const normalizedOldPath = (0, import_obsidian17.normalizePath)(oldPath);
+    const normalizedNewPath = (0, import_obsidian17.normalizePath)(file.path);
     this.managedFiles.rename(file, normalizedOldPath);
     this.startupKnownPaths.delete(normalizedOldPath);
     this.startupKnownPaths.delete(normalizedNewPath);
@@ -9237,18 +9510,15 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     this.wordCleanSyncSignatures.delete(normalizedOldPath);
     this.clearPendingOpenWordStatusWrite(normalizedOldPath);
     if (isMarkdownFile3(file) && this.pathScope.isWordPath(normalizedNewPath)) {
-      const ensured = await this.ensureManagedWordProperties(file);
-      await this.ensureWordEudicUri(file);
-      if (!ensured.skipped) {
-        const result = await this.referenceIndex.updateWord(file, ensured.markdown);
-        await this.studylistService.handleWordModify(file, ensured.markdown);
+      const openView = this.getOpenMarkdownViewForFile(file);
+      const markdown = openView?.editor.getValue() ?? await this.app.vault.cachedRead(file);
+      const result = await this.referenceIndex.updateWord(file, markdown);
+      if (!result.disabled) {
         for (const referencePath of result.affectedReferencePaths) {
           affectedReferencePaths.add(referencePath);
         }
         shouldRepairAffectedReferenceMetadata = true;
-        await this.syncService.markWordDirty(file);
-        this.setWordBodyDirtyOverride(file, null);
-        this.wordSyncSignatures.set((0, import_obsidian16.normalizePath)(file.path), getWordSyncSignature(ensured.markdown));
+        this.wordSyncSignatures.set((0, import_obsidian17.normalizePath)(file.path), getWordSyncSignature(markdown));
       } else {
         for (const referencePath of this.referenceIndex.removeWord(normalizedNewPath)) {
           affectedReferencePaths.add(referencePath);
@@ -9290,7 +9560,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
   async markAllSyncWordsDirty() {
     let markedCount = 0;
     for (const file of this.managedFiles.getWordFiles()) {
-      await this.ensureWordManagedFrontmatter(file);
+      await this.ensureWordManagedFrontmatterForSync(file);
       if (!this.syncService.canSyncFile(file)) {
         continue;
       }
@@ -9304,11 +9574,11 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
   async syncCurrentWord() {
     const file = this.getActiveMarkdownFile();
     if (!file || !this.pathScope.isWordPath(file.path)) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: open a word note in the configured word notes folder first.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: open a word note in the configured word notes folder first.`);
       return;
     }
     if (!this.syncService.canSyncFile(file)) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: this word note is disabled for Eudic sync.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: this word note is disabled for Eudic sync.`);
       return;
     }
     await this.syncFile(file, { force: true, source: "manual" });
@@ -9325,7 +9595,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
   }
   async saveActiveViewForFile(file) {
     const view = this.getActiveMarkdownView();
-    if (!view?.file || (0, import_obsidian16.normalizePath)(view.file.path) !== (0, import_obsidian16.normalizePath)(file.path)) {
+    if (!view?.file || (0, import_obsidian17.normalizePath)(view.file.path) !== (0, import_obsidian17.normalizePath)(file.path)) {
       return;
     }
     await view.save();
@@ -9333,23 +9603,23 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
   async resyncAliasesForCurrentWord() {
     const file = this.getActiveMarkdownFile();
     if (!file || !this.syncService.canSyncFile(file)) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: open a word note in the configured word notes folder first.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: open a word note in the configured word notes folder first.`);
       return;
     }
     if (this.syncOrchestrator.isSyncInFlight(file)) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: "${file.basename}" is already syncing.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: "${file.basename}" is already syncing.`);
       return;
     }
     this.syncOrchestrator.beginSync(file);
     try {
       const result = await this.syncService.resyncAliases(file);
       this.setWordStatusOverride(file, result.status, result.error ?? null);
-      new import_obsidian16.Notice(getResyncAliasesNoticeText(result));
+      new import_obsidian17.Notice(getResyncAliasesNoticeText(result));
     } catch (error) {
       const message = toErrorMessage7(error);
       const context = this.getDisplayWordContext(file);
       this.setWordStatusOverride(file, context?.effectiveStatus ?? "dirty", message);
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: failed to resync aliases for "${file.basename}": ${message}`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: failed to resync aliases for "${file.basename}": ${message}`);
     } finally {
       this.syncOrchestrator.endSync(file);
     }
@@ -9357,17 +9627,17 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
   async deleteCurrentWordNoteInEudic() {
     const file = this.getActiveMarkdownFile();
     if (!file || !this.syncService.canSyncFile(file)) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: open a word note in the configured word notes folder first.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: open a word note in the configured word notes folder first.`);
       return;
     }
     const context = this.getDisplayWordContext(file);
     if (!context?.lang) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: missing '${FRONTMATTER_KEYS.lang}' in "${file.basename}".`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: missing '${FRONTMATTER_KEYS.lang}' in "${file.basename}".`);
       return;
     }
-    const normalizedPath = (0, import_obsidian16.normalizePath)(file.path);
+    const normalizedPath = (0, import_obsidian17.normalizePath)(file.path);
     if (this.syncOrchestrator.isSyncInFlight(file) || this.inFlightDeletePaths.has(normalizedPath)) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: "${file.basename}" is busy.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: "${file.basename}" is busy.`);
       return;
     }
     const confirmed = await confirmDeleteEudicNote(
@@ -9388,9 +9658,9 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
       const result = await this.syncService.deleteCurrentWordNote(file);
       this.setWordBodyDirtyOverride(file, null);
       this.refreshUi();
-      new import_obsidian16.Notice(getDeleteNoteNoticeText(result));
+      new import_obsidian17.Notice(getDeleteNoteNoticeText(result));
     } catch (error) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: failed to delete the Eudic note: ${toErrorMessage7(error)}`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: failed to delete the Eudic note: ${toErrorMessage7(error)}`);
     } finally {
       this.inFlightDeletePaths.delete(normalizedPath);
       this.refreshUi();
@@ -9398,7 +9668,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
   }
   async deleteTypedWordNoteInEudic() {
     if (this.typedDeleteInFlight) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: a typed Eudic note deletion is already in progress.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: a typed Eudic note deletion is already in progress.`);
       return;
     }
     const selection = await promptDeleteTypedWordNote(this.app, this.syncService.getAvailableWordLanguages());
@@ -9428,9 +9698,9 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
         this.setWordBodyDirtyOverride(file, null);
       }
       this.refreshUi();
-      new import_obsidian16.Notice(getDeleteNoteNoticeText(result));
+      new import_obsidian17.Notice(getDeleteNoteNoticeText(result));
     } catch (error) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: failed to delete the Eudic note: ${toErrorMessage7(error)}`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: failed to delete the Eudic note: ${toErrorMessage7(error)}`);
     } finally {
       this.typedDeleteInFlight = false;
     }
@@ -9440,9 +9710,9 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
       await this.ensureAllWordManagedFrontmatter();
       const result = await this.perf.measure("studylist.refreshFromEudic", () => this.studylistService.refreshFromEudic());
       await this.reconcileWordSyncStatuses(result.updatedFiles);
-      new import_obsidian16.Notice(getStudylistRefreshNoticeText(result), 8e3);
+      new import_obsidian17.Notice(getStudylistRefreshNoticeText(result), 8e3);
     } catch (error) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: failed to refresh Eudic studylists: ${toErrorMessage7(error)}`, 8e3);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: failed to refresh Eudic studylists: ${toErrorMessage7(error)}`, 8e3);
     }
   }
   async pullStudylistAssignmentsFromEudic() {
@@ -9450,19 +9720,19 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
       await this.ensureAllWordManagedFrontmatter();
       const result = await this.perf.measure("studylist.pullAssignmentsFromEudic", () => this.studylistService.pullAssignmentsFromEudic());
       await this.reconcileWordSyncStatuses(result.updatedFiles);
-      new import_obsidian16.Notice(getStudylistRefreshNoticeText(result), 8e3);
+      new import_obsidian17.Notice(getStudylistRefreshNoticeText(result), 8e3);
     } catch (error) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: failed to pull studylist assignments from Eudic: ${toErrorMessage7(error)}`, 8e3);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: failed to pull studylist assignments from Eudic: ${toErrorMessage7(error)}`, 8e3);
     }
   }
   async pullCurrentWordStudylistAssignmentFromEudic() {
     const file = this.getActiveMarkdownFile();
     if (!file) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: open a word note first.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: open a word note first.`);
       return;
     }
     try {
-      await this.ensureWordManagedFrontmatter(file);
+      await this.ensureWordManagedFrontmatterForSync(file);
       const status = this.studylistService.getCurrentWordStudylistStatus(file);
       if (status === "dirty") {
         const confirmed = await confirmEudicAction(
@@ -9481,19 +9751,19 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
       }
       const result = await this.studylistService.pullCurrentWordAssignmentFromEudic(file, status === "dirty");
       await this.reconcileWordSyncStatuses([file]);
-      new import_obsidian16.Notice(
+      new import_obsidian17.Notice(
         `${PLUGIN_NAME}: pulled studylist assignment for "${result.word}" (${result.names.length} list(s), ${result.updated ? "updated" : "unchanged"}).`,
         8e3
       );
     } catch (error) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: failed to pull current word studylist assignment from Eudic: ${toErrorMessage7(error)}`, 8e3);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: failed to pull current word studylist assignment from Eudic: ${toErrorMessage7(error)}`, 8e3);
     }
   }
   async pushAllDirtyStudylistAssignmentsToEudic() {
     await this.ensureAllWordManagedFrontmatter();
     const dirtyFiles = this.studylistService.collectDirtyStudylistWords();
     if (dirtyFiles.length === 0) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: no dirty studylist assignments to push.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: no dirty studylist assignments to push.`);
       return;
     }
     await this.pushStudylistAssignmentsWithConfirmation(dirtyFiles, "Push all dirty studylist assignments?");
@@ -9501,18 +9771,18 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
   async pushCurrentWordStudylistAssignmentToEudic() {
     const file = this.getActiveMarkdownFile();
     if (!file) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: open a word note first.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: open a word note first.`);
       return;
     }
-    await this.ensureWordManagedFrontmatter(file);
+    await this.ensureWordManagedFrontmatterForSync(file);
     const pushFile = this.studylistService.getCurrentWordForPush(file);
     if (!pushFile) {
       const lastError = this.studylistService.getCurrentWordStudylistLastError(file);
       if (lastError) {
-        new import_obsidian16.Notice(`${PLUGIN_NAME}: cannot push studylist assignment: ${lastError}`, 8e3);
+        new import_obsidian17.Notice(`${PLUGIN_NAME}: cannot push studylist assignment: ${lastError}`, 8e3);
         return;
       }
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: current word has no pushable studylist assignment.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: current word has no pushable studylist assignment.`);
       return;
     }
     await this.pushStudylistAssignmentsWithConfirmation([pushFile], `Push studylist assignment for "${pushFile.basename}"?`);
@@ -9521,7 +9791,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     try {
       const preview = await this.studylistService.previewPush(files);
       if (preview.total === 0) {
-        new import_obsidian16.Notice(`${PLUGIN_NAME}: no pushable studylist assignments.`);
+        new import_obsidian17.Notice(`${PLUGIN_NAME}: no pushable studylist assignments.`);
         return;
       }
       if (preview.added + preview.removed > 0) {
@@ -9542,9 +9812,9 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
       }
       const result = await this.studylistService.pushAssignments(preview.files);
       await this.reconcileWordSyncStatuses(preview.files);
-      new import_obsidian16.Notice(getStudylistPushNoticeText(result), 8e3);
+      new import_obsidian17.Notice(getStudylistPushNoticeText(result), 8e3);
     } catch (error) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: failed to push studylist assignments: ${toErrorMessage7(error)}`, 8e3);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: failed to push studylist assignments: ${toErrorMessage7(error)}`, 8e3);
     }
   }
   async reconcileWordSyncStatuses(files) {
@@ -9566,51 +9836,51 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     try {
       await this.ensureAllWordManagedFrontmatter();
       const updatedWords = await this.perf.measure("studylist.rebuildLocalMetadata", () => this.studylistService.rebuildLocalMetadata());
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: repaired word properties and rebuilt local studylist metadata for ${updatedWords} word(s).`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: repaired word properties and rebuilt local studylist metadata for ${updatedWords} word(s).`);
     } catch (error) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: failed to rebuild local studylist metadata: ${toErrorMessage7(error)}`, 8e3);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: failed to rebuild local studylist metadata: ${toErrorMessage7(error)}`, 8e3);
     }
   }
   async repairStudylistNamesIdsForAllWordNotes() {
     try {
       await this.ensureAllWordManagedFrontmatter();
       const result = await this.perf.measure("studylist.repairNamesIds", () => this.studylistService.repairNamesIdsForAllWords());
-      new import_obsidian16.Notice(
+      new import_obsidian17.Notice(
         `${PLUGIN_NAME}: Studylist names/ids repair complete: ${result.updated} updated, ${result.unresolved} unresolved. No Eudic cloud changes were made.`,
         8e3
       );
       this.refreshUi();
     } catch (error) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: failed to repair studylist names/ids: ${toErrorMessage7(error)}`, 8e3);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: failed to repair studylist names/ids: ${toErrorMessage7(error)}`, 8e3);
     }
   }
   async copyManagedUrlForCurrentNote() {
     const file = this.getActiveMarkdownFile();
     if (!file) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: open a managed word or reference note first.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: open a managed word or reference note first.`);
       return;
     }
     try {
       const url = await this.getManagedUrlForFile(file);
       if (!url) {
-        new import_obsidian16.Notice(`${PLUGIN_NAME}: open a managed word or reference note first.`);
+        new import_obsidian17.Notice(`${PLUGIN_NAME}: open a managed word or reference note first.`);
         return;
       }
       await copyTextToClipboard(url);
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: copied managed URL for "${file.basename}".`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: copied managed URL for "${file.basename}".`);
     } catch (error) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: failed to copy managed URL: ${toErrorMessage7(error)}`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: failed to copy managed URL: ${toErrorMessage7(error)}`);
     }
   }
   async formatCurrentEudicNoteBoldMarkers() {
     const view = this.getActiveMarkdownView();
     const file = view?.file ?? null;
     if (!view || !file || !this.canFormatBoldMarkers(file)) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: open a managed word or reference note first.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: open a managed word or reference note first.`);
       return;
     }
     if (this.settings.boldMarkers.length === 0) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: no bold markers are configured.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: no bold markers are configured.`);
       return;
     }
     let changedNotes = 0;
@@ -9639,11 +9909,11 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     }
     if (changedNotes === 0) {
       const noChangeTarget = this.pathScope.isWordPath(file.path) ? `"${file.basename}" or its linked references` : `"${file.basename}"`;
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: no bold markers to format in ${noChangeTarget}.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: no bold markers to format in ${noChangeTarget}.`);
       return;
     }
     const referenceSummary = this.pathScope.isWordPath(file.path) ? `, including ${referenceNotesChanged} linked reference note(s)` : "";
-    new import_obsidian16.Notice(
+    new import_obsidian17.Notice(
       `${PLUGIN_NAME}: formatted ${replacements} bold marker(s) in ${changedNotes} note(s)${referenceSummary}.`,
       8e3
     );
@@ -9651,7 +9921,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
   }
   async formatAllEudicNoteBoldMarkers() {
     if (this.settings.boldMarkers.length === 0) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: no bold markers are configured.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: no bold markers are configured.`);
       return;
     }
     let changed = 0;
@@ -9671,7 +9941,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
       changed += 1;
       replacements += result.replacements;
     }
-    new import_obsidian16.Notice(
+    new import_obsidian17.Notice(
       `${PLUGIN_NAME}: formatted ${replacements} bold marker(s) in ${changed} note(s), skipped ${skipped} unchanged note(s).`,
       8e3
     );
@@ -9707,11 +9977,11 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     const collectedDirtyWords = await this.syncService.collectDirtyWords();
     const dirtyWords = collectedDirtyWords.filter((file) => !this.syncOrchestrator.isSyncInFlight(file));
     if (collectedDirtyWords.length === 0) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: no dirty words to sync.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: no dirty words to sync.`);
       return;
     }
     if (dirtyWords.length === 0) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: all dirty words are already syncing.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: all dirty words are already syncing.`);
       return;
     }
     const batchFiles = [];
@@ -9721,7 +9991,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
       }
     }
     if (batchFiles.length === 0) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: all dirty words are already syncing.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: all dirty words are already syncing.`);
       return;
     }
     this.refreshUi();
@@ -9737,7 +10007,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
       }
       const aliasSummary = batchResult.aliasUploaded > 0 ? ` aliases updated ${batchResult.aliasUploaded}.` : " aliases unchanged.";
       const summary = `${PLUGIN_NAME}: processed ${batchResult.total} dirty word(s), uploaded ${batchResult.uploaded}, unchanged ${batchResult.skipped}, failed ${batchResult.failed}.${aliasSummary}`;
-      new import_obsidian16.Notice(summary, 8e3);
+      new import_obsidian17.Notice(summary, 8e3);
     } finally {
       for (const file of batchFiles) {
         this.syncOrchestrator.endSync(file);
@@ -9749,7 +10019,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     await this.withActiveWordView(async (view) => {
       const result = await this.referenceNoteService.createReferenceFromSelection(view);
       await view.save();
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: created ${result.createdCount} reference from the current selection.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: created ${result.createdCount} reference from the current selection.`);
       this.refreshUi();
     });
   }
@@ -9757,7 +10027,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     await this.withActiveWordView(async (view) => {
       const result = await this.referenceNoteService.createReferenceFromCurrentParagraph(view);
       await view.save();
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: created ${result.createdCount} reference from the current paragraph.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: created ${result.createdCount} reference from the current paragraph.`);
       this.refreshUi();
     });
   }
@@ -9765,11 +10035,11 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     await this.withActiveWordView(async (view) => {
       const result = await this.referenceNoteService.extractPendingReferences(view);
       if (!result.changed) {
-        new import_obsidian16.Notice(`${PLUGIN_NAME}: no pending reference blocks found.`);
+        new import_obsidian17.Notice(`${PLUGIN_NAME}: no pending reference blocks found.`);
         return;
       }
       await view.save();
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: extracted ${result.createdCount} pending reference(s).`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: extracted ${result.createdCount} pending reference(s).`);
       this.refreshUi();
     });
   }
@@ -9777,7 +10047,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     await this.withActiveWordView(async (view) => {
       const result = await this.referenceNoteService.extractCurrentEudicBlockToReference(view);
       await view.save();
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: extracted ${result.createdCount} Eudic block reference.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: extracted ${result.createdCount} Eudic block reference.`);
       this.refreshUi();
     });
   }
@@ -9795,7 +10065,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
       }
       view.editor.replaceSelection(buildEudicBlock(kind, body), "eudic-sync");
       await view.save();
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: wrapped the current selection as an "${kind}" Eudic block.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: wrapped the current selection as an "${kind}" Eudic block.`);
       this.refreshUi();
     });
   }
@@ -9811,7 +10081,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
       editor.replaceRange(insertion.insertText, insertion.from, insertion.to, "eudic-sync");
       editor.setCursor(insertion.cursor);
       editor.focus();
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: inserted a new Eudic block. Type the Eudic block kind after kind=.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: inserted a new Eudic block. Type the Eudic block kind after kind=.`);
       this.refreshUi();
     });
   }
@@ -9832,30 +10102,30 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     const view = this.getActiveMarkdownView();
     const file = view?.file ?? null;
     if (!view || !file || !this.canFormatBoldMarkers(file)) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: open a managed word or reference note first.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: open a managed word or reference note first.`);
       return;
     }
     try {
       await run(view, file);
     } catch (error) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: ${toErrorMessage7(error)}`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: ${toErrorMessage7(error)}`);
     }
   }
   async withActiveWordView(run) {
     const view = this.getActiveMarkdownView();
     const file = view?.file ?? null;
     if (!view || !file || !this.syncService.canSyncFile(file)) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: open a word note in the configured word notes folder first.`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: open a word note in the configured word notes folder first.`);
       return;
     }
     try {
       await run(view, file);
     } catch (error) {
-      new import_obsidian16.Notice(`${PLUGIN_NAME}: ${toErrorMessage7(error)}`);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: ${toErrorMessage7(error)}`);
     }
   }
   getActiveMarkdownView() {
-    return this.app.workspace.getActiveViewOfType(import_obsidian16.MarkdownView);
+    return this.app.workspace.getActiveViewOfType(import_obsidian17.MarkdownView);
   }
   getActiveMarkdownFile() {
     const view = this.getActiveMarkdownView();
@@ -9866,12 +10136,15 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     if (!file || !this.syncService.canSyncFile(file)) {
       return null;
     }
-    return (0, import_obsidian16.normalizePath)(file.path);
+    return (0, import_obsidian17.normalizePath)(file.path);
   }
   handleActiveWordChanged() {
     const activeFile = this.getActiveMarkdownFile();
     if (activeFile && this.pathScope.isWordPath(activeFile.path)) {
-      void this.ensureWordEudicUri(activeFile);
+      void this.enqueueWordLifecycle(
+        activeFile,
+        () => this.ensureManagedWordProperties(activeFile, { ensureEudicUri: false, trigger: "touch" })
+      ).catch((error) => this.reportWordReconcileError("active-word", activeFile, error));
     }
     const nextActiveWordPath = this.getActiveWordPath();
     if (nextActiveWordPath) {
@@ -9890,24 +10163,24 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     const paths = /* @__PURE__ */ new Set();
     for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
       const view = leaf.view;
-      if (view instanceof import_obsidian16.MarkdownView && view.file) {
-        paths.add((0, import_obsidian16.normalizePath)(view.file.path));
+      if (view instanceof import_obsidian17.MarkdownView && view.file) {
+        paths.add((0, import_obsidian17.normalizePath)(view.file.path));
       }
     }
     return paths;
   }
   getOpenMarkdownViewForFile(file) {
-    const normalizedPath = (0, import_obsidian16.normalizePath)(file.path);
+    const normalizedPath = (0, import_obsidian17.normalizePath)(file.path);
     for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
       const view = leaf.view;
-      if (view instanceof import_obsidian16.MarkdownView && view.file && (0, import_obsidian16.normalizePath)(view.file.path) === normalizedPath) {
+      if (view instanceof import_obsidian17.MarkdownView && view.file && (0, import_obsidian17.normalizePath)(view.file.path) === normalizedPath) {
         return view;
       }
     }
     return null;
   }
   isMarkdownFileOpen(file) {
-    return this.getOpenMarkdownFilePaths().has((0, import_obsidian16.normalizePath)(file.path));
+    return this.getOpenMarkdownFilePaths().has((0, import_obsidian17.normalizePath)(file.path));
   }
   refreshUi() {
     this.vaultEventController.refreshUi();
@@ -9952,7 +10225,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     this.setWordBodyStatusOverride(file, "dirty", lastError);
   }
   getWordDirtySignatureDecision(path, nextSignature) {
-    const normalizedPath = (0, import_obsidian16.normalizePath)(path);
+    const normalizedPath = (0, import_obsidian17.normalizePath)(path);
     return resolveWordDirtySignatureDecision({
       cleanSignature: this.wordCleanSyncSignatures.get(normalizedPath),
       previousSignature: this.wordSyncSignatures.get(normalizedPath),
@@ -9960,7 +10233,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     });
   }
   markOpenEditorWordBodyDirty(file, editor, lastError, options = {}) {
-    const normalizedPath = (0, import_obsidian16.normalizePath)(file.path);
+    const normalizedPath = (0, import_obsidian17.normalizePath)(file.path);
     const patch = buildSyncStatusPatch(editor.getValue(), "dirty");
     try {
       applySyncStatusPatchToEditor(editor, "dirty");
@@ -9994,7 +10267,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     }
   }
   clearAutoWordBodyDirty(file, editor) {
-    const normalizedPath = (0, import_obsidian16.normalizePath)(file.path);
+    const normalizedPath = (0, import_obsidian17.normalizePath)(file.path);
     this.clearPendingOpenWordBodyWrite(normalizedPath);
     if (this.restorableEditorBodyDirtyPaths.has(normalizedPath)) {
       if (this.nonRestorableBodyDirtyPaths.has(normalizedPath)) {
@@ -10022,7 +10295,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     this.refreshUi();
   }
   releaseWordStatusOverridesIfMetadataCaughtUp(file) {
-    const normalizedPath = (0, import_obsidian16.normalizePath)(file.path);
+    const normalizedPath = (0, import_obsidian17.normalizePath)(file.path);
     const override = this.wordStatusOverrides.get(normalizedPath);
     const context = this.syncService.getWordContext(file);
     if (!override || !context) {
@@ -10036,7 +10309,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     }
   }
   clearWordStatusOverride(path) {
-    const normalizedPath = (0, import_obsidian16.normalizePath)(path);
+    const normalizedPath = (0, import_obsidian17.normalizePath)(path);
     this.autoBodyDirtyPaths.delete(normalizedPath);
     this.restorableEditorBodyDirtyPaths.delete(normalizedPath);
     this.nonRestorableBodyDirtyPaths.delete(normalizedPath);
@@ -10053,7 +10326,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     return changed;
   }
   trimPendingOpenWordStatusWrite(path) {
-    const normalizedPath = (0, import_obsidian16.normalizePath)(path);
+    const normalizedPath = (0, import_obsidian17.normalizePath)(path);
     const pending = this.pendingOpenWordStatusWrites.get(normalizedPath);
     if (!pending) {
       return;
@@ -10063,7 +10336,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     }
   }
   clearPendingOpenWordBodyWrite(path) {
-    const normalizedPath = (0, import_obsidian16.normalizePath)(path);
+    const normalizedPath = (0, import_obsidian17.normalizePath)(path);
     const pending = this.pendingOpenWordStatusWrites.get(normalizedPath);
     if (!pending) {
       return;
@@ -10073,12 +10346,12 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     this.trimPendingOpenWordStatusWrite(normalizedPath);
   }
   clearPendingOpenWordStatusWrite(path) {
-    const normalizedPath = (0, import_obsidian16.normalizePath)(path);
+    const normalizedPath = (0, import_obsidian17.normalizePath)(path);
     this.pendingOpenWordStatusWrites.delete(normalizedPath);
     this.flushingOpenWordStatusWritePaths.delete(normalizedPath);
   }
   hasPendingOpenWordBodyWrite(path) {
-    return this.pendingOpenWordStatusWrites.get((0, import_obsidian16.normalizePath)(path))?.bodyDirty === true;
+    return this.pendingOpenWordStatusWrites.get((0, import_obsidian17.normalizePath)(path))?.bodyDirty === true;
   }
   clearEditorChangeTimers() {
     for (const timer of this.editorChangeTimers.values()) {
@@ -10095,7 +10368,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     }
   }
   async flushPendingWordStatusWriteByPath(path) {
-    const normalizedPath = (0, import_obsidian16.normalizePath)(path);
+    const normalizedPath = (0, import_obsidian17.normalizePath)(path);
     const file = this.managedFiles.getFile(normalizedPath) ?? this.app.vault.getFileByPath(normalizedPath);
     if (!file) {
       this.clearPendingOpenWordStatusWrite(normalizedPath);
@@ -10104,7 +10377,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     await this.flushPendingWordStatusWrite(file);
   }
   async flushPendingWordStatusWrite(file) {
-    const normalizedPath = (0, import_obsidian16.normalizePath)(file.path);
+    const normalizedPath = (0, import_obsidian17.normalizePath)(file.path);
     const pending = this.pendingOpenWordStatusWrites.get(normalizedPath);
     if (!pending) {
       return;
@@ -10155,7 +10428,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     if (!this.settings.enableAutoSyncWordOnLeave) {
       return;
     }
-    const normalizedPath = (0, import_obsidian16.normalizePath)(path);
+    const normalizedPath = (0, import_obsidian17.normalizePath)(path);
     const file = this.managedFiles.getFile(normalizedPath) ?? this.app.vault.getFileByPath(normalizedPath);
     if (!file || !this.syncService.canSyncFile(file)) {
       return;
@@ -10172,7 +10445,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     this.leaveAutoSyncTimers.set(normalizedPath, timer);
   }
   async runAutoSyncForLeftWord(path) {
-    const normalizedPath = (0, import_obsidian16.normalizePath)(path);
+    const normalizedPath = (0, import_obsidian17.normalizePath)(path);
     if (!this.settings.enableAutoSyncWordOnLeave || this.getActiveWordPath() === normalizedPath) {
       return;
     }
@@ -10220,7 +10493,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     }
   }
   cancelAutoSyncTimer(path) {
-    const normalizedPath = (0, import_obsidian16.normalizePath)(path);
+    const normalizedPath = (0, import_obsidian17.normalizePath)(path);
     const timer = this.leaveAutoSyncTimers.get(normalizedPath);
     if (timer === void 0) {
       return;
@@ -10246,32 +10519,39 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
   }
   async refreshReferenceUsage(referencePaths) {
     const openPaths = this.getOpenMarkdownFilePaths();
-    const paths = referencePaths ? Array.from(referencePaths).filter((path) => !openPaths.has((0, import_obsidian16.normalizePath)(path))) : void 0;
+    const paths = referencePaths ? Array.from(referencePaths).filter((path) => !openPaths.has((0, import_obsidian17.normalizePath)(path))) : void 0;
     if (paths && paths.length === 0) {
       return;
     }
     this.invalidateSemanticReferenceCaches(paths);
     await this.referenceIndex.refreshReferenceUsage(paths);
   }
+  enqueueWordLifecycle(file, task) {
+    return this.wordLifecycleQueue.enqueue(file, task);
+  }
+  isStaleMissingWordFileError(file, error) {
+    return this.app.vault.getAbstractFileByPath(file.path) !== file && /(?:ENOENT|no such file|not found)/i.test(toErrorMessage7(error));
+  }
+  reportWordReconcileError(label, file, error) {
+    if (this.isStaleMissingWordFileError(file, error)) {
+      return;
+    }
+    const message = toErrorMessage7(error);
+    console.error(`${PLUGIN_NAME}: managed word reconciliation failed (${label}) for ${file.path}`, error);
+    new import_obsidian17.Notice(`${PLUGIN_NAME}: failed to repair properties for ${file.path}: ${message}`, 8e3);
+  }
   async ensureWordManagedFrontmatterForSync(file) {
-    await this.ensureWordEudicUri(file);
-    if (!this.isMarkdownFileOpen(file)) {
-      return this.ensureWordManagedFrontmatter(file);
-    }
-    const existingLinkId = readEudicLinkId(getFrontmatter(this.app, file));
-    if (existingLinkId) {
-      return existingLinkId;
-    }
-    const nextLinkId = createEudicLinkId("word");
-    await this.writeWordSyncFrontmatter(file, { eudicLinkId: nextLinkId });
-    return nextLinkId;
+    return this.enqueueWordLifecycle(
+      file,
+      () => this.ensureWordManagedFrontmatter(file, { ensureEudicUri: true, trigger: "touch" })
+    );
   }
   async writeWordSyncFrontmatter(file, data) {
     const eudicUrlToSet = typeof data.eudicUrl === "string" && data.eudicUrl.trim() ? data.eudicUrl.trim() : null;
     const eudicUriToSet = typeof data.eudicUri === "string" && data.eudicUri.trim() ? data.eudicUri.trim() : null;
     const view = this.getOpenMarkdownViewForFile(file);
     if (view) {
-      const normalizedPath = (0, import_obsidian16.normalizePath)(file.path);
+      const normalizedPath = (0, import_obsidian17.normalizePath)(file.path);
       const currentMarkdown = view.editor.getValue();
       const nextMarkdown = setWordSyncFrontmatterInMarkdown(currentMarkdown, data);
       const nextSignature = getWordSyncSignature(nextMarkdown);
@@ -10348,36 +10628,75 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
   async ensureManagedWordProperties(file, options = {}) {
     const openView = this.getOpenMarkdownViewForFile(file);
     if (openView) {
+      const reconciled2 = reconcileManagedWordMarkdown({
+        file,
+        markdown: openView.editor.getValue(),
+        ensureEudicUri: options.ensureEudicUri,
+        trigger: options.trigger,
+        defaultStudylists: this.settings.newWordDefaultStudylists,
+        studylistCatalog: this.settings.studylistCache.categories
+      });
+      if (reconciled2.changed) {
+        this.suppressPath(file.path);
+        try {
+          applyWordSyncFrontmatterPatchToEditor(openView.editor, reconciled2.patchData);
+          await openView.save();
+          openView.editor.refresh();
+        } catch (error) {
+          this.clearSuppression(file.path);
+          throw error;
+        }
+      }
+      await this.waitForManagedWordIdentityCache(file, reconciled2);
+      this.refreshUi();
       return {
-        skipped: this.syncService?.getWordContext(file) === null,
-        changed: false,
+        ...reconciled2,
         markdown: openView.editor.getValue()
       };
     }
-    return ensureManagedWordProperties({
+    const reconciled = await ensureManagedWordProperties({
       app: this.app,
       file,
       ensureEudicUri: options.ensureEudicUri,
+      trigger: options.trigger,
+      defaultStudylists: this.settings.newWordDefaultStudylists,
+      studylistCatalog: this.settings.studylistCache.categories,
       writeFrontmatter: async (targetFile, mutate) => {
         await this.writeFrontmatter(targetFile, mutate);
       }
     });
+    if (options.trigger !== "startup") {
+      await this.waitForManagedWordIdentityCache(file, reconciled);
+    }
+    return reconciled;
+  }
+  async waitForManagedWordIdentityCache(file, values) {
+    const expectedStrings = [
+      [FRONTMATTER_KEYS.lang, values.lang],
+      [FRONTMATTER_KEYS.eudicLinkId, values.eudicLinkId],
+      [FRONTMATTER_KEYS.eudicUri, values.eudicUri]
+    ];
+    for (const [key, value] of expectedStrings) {
+      if (this.app.vault.getAbstractFileByPath(file.path) !== file) {
+        return;
+      }
+      if (value) {
+        await this.waitForWordFrontmatterStringCacheSettle(file, key, value);
+      }
+    }
   }
   async ensureAllWordManagedFrontmatter() {
     const openPaths = this.getOpenMarkdownFilePaths();
     for (const file of this.managedFiles.getWordFiles()) {
-      if (openPaths.has((0, import_obsidian16.normalizePath)(file.path))) {
+      if (openPaths.has((0, import_obsidian17.normalizePath)(file.path))) {
         continue;
       }
-      await this.ensureWordManagedFrontmatter(file, { ensureEudicUri: false });
+      await this.ensureManagedWordProperties(file, { ensureEudicUri: false, trigger: "startup" });
     }
   }
   async ensureWordManagedFrontmatter(file, options = {}) {
-    if (this.isMarkdownFileOpen(file)) {
-      return this.ensureWordManagedFrontmatterForSync(file);
-    }
-    await this.ensureManagedWordProperties(file, options);
-    const linkId = readEudicLinkId(getFrontmatter(this.app, file));
+    const ensured = await this.ensureManagedWordProperties(file, options);
+    const linkId = ensured.eudicLinkId ?? readEudicLinkId(getFrontmatter(this.app, file));
     if (linkId) {
       return linkId;
     }
@@ -10387,18 +10706,6 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     });
     return nextLinkId;
   }
-  async ensureWordEudicUri(file) {
-    if (!this.pathScope.isWordPath(file.path)) {
-      return false;
-    }
-    const frontmatter = getFrontmatter(this.app, file);
-    const expectedEudicUri = getExpectedEudicUri(frontmatter, file);
-    if (readNullableString(frontmatter[FRONTMATTER_KEYS.eudicUri]) === expectedEudicUri) {
-      return false;
-    }
-    await this.writeWordSyncFrontmatter(file, { eudicUri: expectedEudicUri });
-    return true;
-  }
   async ensureReferenceManagedFrontmatter(file) {
     if (!isMarkdownFile3(file) || !this.pathScope.isReferencePath(file.path)) {
       return null;
@@ -10407,7 +10714,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     const existingLinkId = readEudicLinkId(frontmatter);
     const nextLinkId = existingLinkId ?? createEudicLinkId("reference");
     const markdown = await this.app.vault.cachedRead(file);
-    if (hasYamlFrontmatter2(markdown)) {
+    if (hasYamlFrontmatter(markdown)) {
       if (existingLinkId === nextLinkId) {
         return nextLinkId;
       }
@@ -10422,7 +10729,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
   async ensureAllReferenceManagedFrontmatter() {
     const openPaths = this.getOpenMarkdownFilePaths();
     for (const file of this.managedFiles.getReferenceFiles()) {
-      if (openPaths.has((0, import_obsidian16.normalizePath)(file.path))) {
+      if (openPaths.has((0, import_obsidian17.normalizePath)(file.path))) {
         continue;
       }
       await this.ensureReferenceManagedFrontmatter(file);
@@ -10430,7 +10737,7 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
   }
   async getManagedUrlForFile(file) {
     if (this.pathScope.isWordPath(file.path)) {
-      const linkId = await this.ensureWordManagedFrontmatter(file);
+      const linkId = await this.ensureWordManagedFrontmatterForSync(file);
       return buildManagedFileProtocolUrl(
         this.app,
         this.pathScope,
@@ -10477,16 +10784,16 @@ var EudicSyncPlugin = class extends import_obsidian16.Plugin {
     }
   }
   suppressPath(path) {
-    const normalizedPath = (0, import_obsidian16.normalizePath)(path);
+    const normalizedPath = (0, import_obsidian17.normalizePath)(path);
     this.suppressedWrites.set(normalizedPath, {
       expiresAt: Date.now() + SUPPRESSED_WRITE_TTL_MS
     });
   }
   clearSuppression(path) {
-    this.suppressedWrites.delete((0, import_obsidian16.normalizePath)(path));
+    this.suppressedWrites.delete((0, import_obsidian17.normalizePath)(path));
   }
   consumeSuppressedWrite(path) {
-    const normalizedPath = (0, import_obsidian16.normalizePath)(path);
+    const normalizedPath = (0, import_obsidian17.normalizePath)(path);
     const entry = this.suppressedWrites.get(normalizedPath);
     if (!entry) {
       return false;

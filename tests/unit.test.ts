@@ -6,7 +6,13 @@ import {
   normalizeEudicBlockKindsFromBody,
   transformEudicBlocksToMarkdown,
 } from "../src/eudic-block";
-import { DEFAULT_SETTINGS, NOTE_OUTPUT_FORMAT_VERSION } from "../src/constants";
+import { DEFAULT_NEW_WORD_STUDYLISTS, DEFAULT_SETTINGS, NOTE_OUTPUT_FORMAT_VERSION } from "../src/constants";
+import {
+  buildExportSettingsPayload,
+  migrateLoadedSettings,
+  readImportedSettingsPayload,
+  refreshSelectedStudylistSnapshots,
+} from "../src/settings-data";
 import { ManagedFileRegistry } from "../src/managed-file-registry";
 import { protectLeadingThematicBreakFromFrontmatter } from "../src/render-markdown-frontmatter";
 import { SemanticBlockAutomationResolver } from "../src/semantic-block-automation-resolver";
@@ -58,7 +64,8 @@ import {
   getExpectedEudicUri,
   shouldFillEudicUrlBeforeFirstSync,
 } from "../src/eudic-url";
-import { ensureManagedWordProperties } from "../src/word-frontmatter";
+import { ensureManagedWordProperties, reconcileManagedWordMarkdown } from "../src/word-frontmatter";
+import { SerialTaskQueue } from "../src/serial-task-queue";
 import { waitForCachedFrontmatterString } from "../src/frontmatter-cache-settle";
 import { transformMarkdownForEudicRender } from "../src/html-renderer";
 import { withRetry } from "../src/retry";
@@ -68,7 +75,7 @@ import { getSemanticSettingsSignature, SyncRenderCache } from "../src/sync-rende
 import { StartupCoordinator } from "../src/startup-coordinator";
 import { SyncService } from "../src/sync-service";
 import { EudicApiClient } from "../src/eudic-api";
-import type { EudicStudylistCache } from "../src/types";
+import type { EudicStudylistCache, EudicSyncSettings } from "../src/types";
 import type { NoteOutputBlock } from "../src/note-output/model";
 import type { App, Editor, EditorPosition, TAbstractFile, TFile } from "obsidian";
 
@@ -78,6 +85,61 @@ assert.equal(DEFAULT_SETTINGS.enableAutoBoldMarkersOnEdit, false);
 assert.equal(DEFAULT_SETTINGS.enableSemanticBlockMarkerBold, false);
 assert.equal(NOTE_OUTPUT_FORMAT_VERSION, 8);
 assert.equal(DEFAULT_SETTINGS.referenceMetadataWriteMode, "auto");
+assert.deepEqual(DEFAULT_SETTINGS.newWordDefaultStudylists, DEFAULT_NEW_WORD_STUDYLISTS);
+
+const migratedDefaults = migrateLoadedSettings({
+  ...DEFAULT_SETTINGS,
+  newWordDefaultStudylists: undefined,
+});
+assert.equal(migratedDefaults.changed, true);
+assert.deepEqual(migratedDefaults.settings.newWordDefaultStudylists, DEFAULT_NEW_WORD_STUDYLISTS);
+const normalizedStudylistSettings = migrateLoadedSettings({
+  ...DEFAULT_SETTINGS,
+  newWordDefaultStudylists: [
+    { id: " 0 ", language: " EN ", name: " 略｜我的生词本 " },
+    { id: "0", language: "en", name: "duplicate" },
+    { id: "", language: "en", name: "invalid" },
+  ],
+});
+assert.equal(normalizedStudylistSettings.changed, true);
+assert.deepEqual(normalizedStudylistSettings.settings.newWordDefaultStudylists, [
+  { id: "0", language: "en", name: "略｜我的生词本" },
+]);
+assert.equal(migrateLoadedSettings(normalizedStudylistSettings.settings).changed, false);
+const refreshedDefaultSnapshots = refreshSelectedStudylistSnapshots(
+  [
+    { id: "0", language: "en", name: "Old name" },
+    { id: "missing", language: "en", name: "Preserved snapshot" },
+  ],
+  {
+    categories: [{ id: "0", language: "en", name: "Current cached name" }],
+    refreshedAt: "2026-09-06T00:00:00Z",
+  },
+);
+assert.deepEqual(refreshedDefaultSnapshots, [
+  { id: "0", language: "en", name: "Current cached name" },
+  { id: "missing", language: "en", name: "Preserved snapshot" },
+]);
+const settingsForBackup = {
+  ...DEFAULT_SETTINGS,
+  authorizationToken: "placeholder",
+  newWordDefaultStudylists: [{ id: "custom", language: "en", name: "Custom" }],
+} satisfies EudicSyncSettings;
+const settingsBackup = buildExportSettingsPayload(settingsForBackup);
+assert.deepEqual(settingsBackup.settings.newWordDefaultStudylists, settingsForBackup.newWordDefaultStudylists);
+assert.deepEqual(
+  readImportedSettingsPayload(settingsBackup).settings.newWordDefaultStudylists,
+  settingsForBackup.newWordDefaultStudylists,
+);
+const legacySettingsBackup = {
+  ...settingsBackup,
+  settings: { ...settingsBackup.settings } as Partial<typeof settingsBackup.settings>,
+};
+delete legacySettingsBackup.settings.newWordDefaultStudylists;
+assert.deepEqual(
+  readImportedSettingsPayload(legacySettingsBackup).settings.newWordDefaultStudylists,
+  DEFAULT_NEW_WORD_STUDYLISTS,
+);
 
 const syncedWordMarkdown = [
   "---",
@@ -1304,6 +1366,24 @@ ensureFrontmatterByPath.set(ensureAppleFile.path, {
   word: "pear",
   eudic_uri: "eudic://dict/apple",
 });
+ensureMarkdownByPath.set(ensureAppleFile.path, [
+  "---",
+  "sync_eudic_enabled: true",
+  "lang: en",
+  "word: pear",
+  "aliases: []",
+  "eudic_link_id: word-apple",
+  "eudic_url: \"\"",
+  "eudic_uri: eudic://dict/apple",
+  "sync_status: dirty",
+  "reference_paths: []",
+  "eudic_studylist_ids: []",
+  "eudic_studylist_names: []",
+  "studylist_sync_status: synced",
+  "---",
+  "",
+  "Body",
+].join("\n"));
 const ensureRenamedWordResult = await ensureManagedWordProperties({
   app: ensureApp,
   file: ensureAppleFile,
@@ -1328,7 +1408,22 @@ ensureFrontmatterByPath.set(ensureDeferredUriFile.path, {
   eudic_studylist_names: [],
   studylist_sync_status: "synced",
 });
-ensureMarkdownByPath.set(ensureDeferredUriFile.path, ["---", "sync_status: dirty", "---", "", "Body"].join("\n"));
+ensureMarkdownByPath.set(ensureDeferredUriFile.path, [
+  "---",
+  "sync_eudic_enabled: true",
+  "lang: en",
+  "aliases: []",
+  "eudic_link_id: word-deferred",
+  "eudic_url: \"\"",
+  "sync_status: dirty",
+  "reference_paths: []",
+  "eudic_studylist_ids: []",
+  "eudic_studylist_names: []",
+  "studylist_sync_status: synced",
+  "---",
+  "",
+  "Body",
+].join("\n"));
 const ensureDeferredUriResult = await ensureManagedWordProperties({
   app: ensureApp,
   file: ensureDeferredUriFile,
@@ -1341,6 +1436,325 @@ const ensureDeferredUriResult = await ensureManagedWordProperties({
 });
 assert.equal(ensureDeferredUriResult.changed, false);
 assert.equal(ensureFrontmatterByPath.get(ensureDeferredUriFile.path)?.eudic_uri, undefined);
+
+const renamedBeforeSyncMarkdown = [
+  "---",
+  "sync_eudic_enabled: true",
+  "lang: en",
+  "aliases: []",
+  "eudic_link_id: w-renamed-before-sync",
+  "eudic_url: \"\"",
+  "eudic_uri: eudic://dict/Untitled",
+  "sync_status: dirty",
+  "reference_paths: []",
+  "eudic_studylist_ids: []",
+  "eudic_studylist_names: []",
+  "studylist_sync_status: synced",
+  "---",
+  "Body",
+].join("\n");
+const renamedOpenResult = reconcileManagedWordMarkdown({
+  file: mockFile("Words/renamed.md"),
+  markdown: renamedBeforeSyncMarkdown,
+  trigger: "touch",
+  ensureEudicUri: false,
+});
+assert.equal(renamedOpenResult.changed, false);
+assert.equal(renamedOpenResult.markdown.includes("eudic_uri: eudic://dict/Untitled"), true);
+const renamedSyncPreflightResult = reconcileManagedWordMarkdown({
+  file: mockFile("Words/renamed.md"),
+  markdown: renamedOpenResult.markdown,
+  trigger: "touch",
+  ensureEudicUri: true,
+});
+assert.equal(renamedSyncPreflightResult.changed, true);
+assert.equal(renamedSyncPreflightResult.markdown.includes("eudic_uri: eudic://dict/renamed"), true);
+
+const defaultNewWordLists = DEFAULT_NEW_WORD_STUDYLISTS.map((category) => ({ ...category }));
+const newWordBody = "Unique body marker\nSecond line.";
+const reconciledNewWord = reconcileManagedWordMarkdown({
+  file: mockFile("Eudic/Words/rapid.md"),
+  markdown: newWordBody,
+  trigger: "create",
+  defaultStudylists: defaultNewWordLists,
+});
+assert.equal(reconciledNewWord.changed, true);
+assert.equal(reconciledNewWord.markdown.endsWith(newWordBody), true);
+for (const expectedLine of [
+  "sync_eudic_enabled: true",
+  "lang: en",
+  "aliases: []",
+  "eudic_url: \"\"",
+  "eudic_uri: eudic://dict/rapid",
+  "sync_status: dirty",
+  "reference_paths: []",
+  '  - "0"',
+  '  - "134223429171042864"',
+  '  - "略｜我的生词本"',
+  '  - "Obsidian Sync"',
+  "studylist_sync_status: dirty",
+]) {
+  assert.equal(reconciledNewWord.markdown.includes(expectedLine), true, expectedLine);
+}
+assert.match(reconciledNewWord.markdown, /eudic_link_id: w-[A-Za-z0-9-]+/);
+let openNewWordMarkdown = newWordBody;
+let openNewWordTransactions = 0;
+const openNewWordEditor = {
+  getValue: () => openNewWordMarkdown,
+  replaceRange: (replacement: string, from: EditorPosition, to?: EditorPosition) => {
+    openNewWordTransactions += 1;
+    assert.equal(to, undefined);
+    assert.deepEqual(from, { line: 0, ch: 0 });
+    openNewWordMarkdown = `${replacement}${openNewWordMarkdown}`;
+  },
+} as unknown as Editor;
+assert.equal(applyWordSyncFrontmatterPatchToEditor(openNewWordEditor, reconciledNewWord.patchData), true);
+assert.equal(openNewWordTransactions, 1);
+assert.equal(openNewWordMarkdown, reconciledNewWord.markdown);
+assert.equal(openNewWordMarkdown.endsWith(newWordBody), true);
+assert.equal(
+  reconcileManagedWordMarkdown({
+    file: mockFile("Eudic/Words/rapid.md"),
+    markdown: reconciledNewWord.markdown,
+    trigger: "touch",
+    defaultStudylists: defaultNewWordLists,
+  }).changed,
+  false,
+);
+
+const newWordWithoutDefaultLists = reconcileManagedWordMarkdown({
+  file: mockFile("Eudic/Words/empty-defaults.md"),
+  markdown: "Body",
+  trigger: "create",
+  defaultStudylists: [],
+});
+assert.equal(newWordWithoutDefaultLists.markdown.includes("eudic_studylist_ids: []"), true);
+assert.equal(newWordWithoutDefaultLists.markdown.includes("eudic_studylist_names: []"), true);
+assert.equal(newWordWithoutDefaultLists.markdown.includes("studylist_sync_status: synced"), true);
+
+const explicitlyDisabledWord = reconcileManagedWordMarkdown({
+  file: mockFile("Eudic/Words/disabled.md"),
+  markdown: ["---", "sync_eudic_enabled: false", "custom: keep", "---", "", "Disabled body"].join("\n"),
+  trigger: "create",
+  defaultStudylists: defaultNewWordLists,
+});
+assert.equal(explicitlyDisabledWord.skipped, true);
+assert.equal(explicitlyDisabledWord.markdown.includes("sync_eudic_enabled: false"), true);
+assert.equal(explicitlyDisabledWord.markdown.includes("custom: keep"), true);
+assert.equal(explicitlyDisabledWord.markdown.includes("略｜我的生词本"), false);
+assert.equal(explicitlyDisabledWord.markdown.includes("lang: en"), false);
+
+const customWordMarkdown = [
+  "---",
+  "sync_eudic_enabled: true",
+  "lang: fr",
+  "word: déjà vu",
+  "aliases:",
+  '  - "deja vu"',
+  "eudic_link_id: w-stable-custom",
+  "eudic_url: https://example.test/custom",
+  "eudic_uri: eudic://dict/stale",
+  "sync_status: synced",
+  "reference_paths:",
+  '  - "References/custom.md"',
+  "eudic_studylist_ids:",
+  '  - "custom-id"',
+  "eudic_studylist_names:",
+  '  - "Custom list"',
+  "studylist_sync_status: synced",
+  "custom_property: keep-me",
+  "---",
+  "",
+  "Custom body",
+].join("\n");
+const reconciledCustomWord = reconcileManagedWordMarkdown({
+  file: mockFile("Eudic/Words/filename.md"),
+  markdown: customWordMarkdown,
+  trigger: "touch",
+  defaultStudylists: defaultNewWordLists,
+});
+assert.equal(reconciledCustomWord.markdown.includes("lang: fr"), true);
+assert.equal(reconciledCustomWord.markdown.includes("eudic_link_id: w-stable-custom"), true);
+assert.equal(reconciledCustomWord.markdown.includes("eudic_url: https://example.test/custom"), true);
+assert.match(reconciledCustomWord.markdown, /eudic_uri: "?eudic:\/\/dict\/d%C3%A9j%C3%A0%20vu"?/);
+assert.equal(reconciledCustomWord.markdown.includes('  - "custom-id"'), true);
+assert.equal(reconciledCustomWord.markdown.includes("custom_property: keep-me"), true);
+
+const laterBefore = [
+  "---",
+  "eudic_link_id: w-existing-later",
+  "eudic_uri: eudic://dict/Untitled",
+  "sync_status: dirty",
+  "last_error: \"Missing 'lang' in Words/later.md.\"",
+  "---",
+  "",
+  "Later body must stay unchanged.",
+].join("\n");
+const reconciledLater = reconcileManagedWordMarkdown({
+  file: mockFile("Words/later.md"),
+  markdown: laterBefore,
+  trigger: "touch",
+  defaultStudylists: defaultNewWordLists,
+});
+assert.equal(reconciledLater.markdown.includes("lang: en"), true);
+assert.equal(reconciledLater.markdown.includes("eudic_link_id: w-existing-later"), true);
+assert.equal(reconciledLater.markdown.includes("eudic_uri: eudic://dict/later"), true);
+assert.equal(reconciledLater.markdown.includes("last_error:"), false);
+assert.equal(reconciledLater.markdown.endsWith("Later body must stay unchanged."), true);
+assert.equal(reconciledLater.markdown.includes('  - "0"'), true);
+const unrelatedErrorWord = reconcileManagedWordMarkdown({
+  file: mockFile("Words/unrelated-error.md"),
+  markdown: ["---", "last_error: Network timeout", "---", "Body"].join("\n"),
+  trigger: "touch",
+  defaultStudylists: defaultNewWordLists,
+});
+assert.equal(unrelatedErrorWord.markdown.includes("last_error: Network timeout"), true);
+
+const normalExistingEmptyLists = [
+  "---",
+  "sync_eudic_enabled: true",
+  "lang: en",
+  "aliases: []",
+  "eudic_link_id: w-normal",
+  "eudic_url: \"\"",
+  "eudic_uri: eudic://dict/normal",
+  "sync_status: dirty",
+  "reference_paths: []",
+  "eudic_studylist_ids: []",
+  "eudic_studylist_names: []",
+  "studylist_sync_status: synced",
+  "---",
+  "",
+  "Normal body",
+].join("\n");
+assert.equal(
+  reconcileManagedWordMarkdown({
+    file: mockFile("Words/normal.md"),
+    markdown: normalExistingEmptyLists,
+    trigger: "touch",
+    defaultStudylists: defaultNewWordLists,
+  }).changed,
+  false,
+);
+assert.equal(
+  reconcileManagedWordMarkdown({
+    file: mockFile("Words/startup-incomplete.md"),
+    markdown: "Body that startup must not rewrite",
+    trigger: "startup",
+    ensureEudicUri: false,
+    defaultStudylists: defaultNewWordLists,
+  }).changed,
+  false,
+);
+
+const mismatchedStudylist = reconcileManagedWordMarkdown({
+  file: mockFile("Words/paired.md"),
+  markdown: [
+    "---",
+    "sync_eudic_enabled: true",
+    "lang: en",
+    "aliases: []",
+    "eudic_link_id: w-paired",
+    "eudic_url: \"\"",
+    "eudic_uri: eudic://dict/paired",
+    "sync_status: dirty",
+    "reference_paths: []",
+    "eudic_studylist_ids:",
+    '  - "0"',
+    "eudic_studylist_names: []",
+    "studylist_sync_status: synced",
+    "---",
+    "",
+    "Paired body",
+  ].join("\n"),
+  trigger: "touch",
+  defaultStudylists: defaultNewWordLists,
+  studylistCatalog: defaultNewWordLists,
+});
+assert.equal(mismatchedStudylist.markdown.includes('  - "略｜我的生词本"'), true);
+assert.equal(mismatchedStudylist.markdown.includes("studylist_sync_status: dirty"), true);
+assert.equal(mismatchedStudylist.markdown.includes("Obsidian Sync"), false);
+
+const crlfBody = "First body line\r\nSecond body line\r\n";
+const reconciledCrlf = reconcileManagedWordMarkdown({
+  file: mockFile("Words/crlf.md"),
+  markdown: crlfBody,
+  trigger: "create",
+  defaultStudylists: defaultNewWordLists,
+});
+assert.equal(reconciledCrlf.markdown.endsWith(crlfBody), true);
+assert.equal(reconciledCrlf.markdown.slice(0, -crlfBody.length).includes("\r\n"), true);
+const reconciledEmptyFile = reconcileManagedWordMarkdown({
+  file: mockFile("Words/empty.md"),
+  markdown: "",
+  trigger: "create",
+  defaultStudylists: defaultNewWordLists,
+});
+assert.equal(reconciledEmptyFile.markdown.endsWith("---\n\n"), true);
+
+const malformedMarkdown = "---\nlang: en\nBody without closing fence";
+assert.throws(
+  () => reconcileManagedWordMarkdown({
+    file: mockFile("Words/malformed.md"),
+    markdown: malformedMarkdown,
+    trigger: "touch",
+    defaultStudylists: defaultNewWordLists,
+  }),
+  /missing closing fence/,
+);
+const invalidYamlMarkdown = "---\n  invalid-indented: value\n---\nBody";
+assert.throws(
+  () => reconcileManagedWordMarkdown({
+    file: mockFile("Words/invalid-yaml.md"),
+    markdown: invalidYamlMarkdown,
+    trigger: "touch",
+  }),
+  /Malformed YAML frontmatter/,
+);
+const duplicateManagedKey = reconcileManagedWordMarkdown({
+  file: mockFile("Words/duplicate.md"),
+  markdown: [
+    "---",
+    "eudic_uri: eudic://dict/duplicate",
+    "eudic_uri: eudic://dict/stale",
+    "---",
+    "Body",
+  ].join("\n"),
+  trigger: "touch",
+});
+assert.equal((duplicateManagedKey.markdown.match(/^eudic_uri:/gm) ?? []).length, 1);
+assert.equal(duplicateManagedKey.markdown.includes("eudic_uri: eudic://dict/duplicate"), true);
+
+const lifecycleQueue = new SerialTaskQueue<object>();
+const racedFile = { path: "Words/Untitled.md", basename: "Untitled" };
+let releaseCreate: (() => void) | undefined;
+const createGate = new Promise<void>((resolve) => {
+  releaseCreate = resolve;
+});
+const raceWrites: string[] = [];
+const createTask = lifecycleQueue.enqueue(racedFile, async () => {
+  await createGate;
+  raceWrites.push(`create:${racedFile.basename}`);
+});
+racedFile.path = "Words/final-name.md";
+racedFile.basename = "final-name";
+const renameTask = lifecycleQueue.enqueue(racedFile, async () => {
+  raceWrites.push(`rename:${racedFile.basename}`);
+});
+releaseCreate?.();
+await Promise.all([createTask, renameTask]);
+assert.deepEqual(raceWrites, ["create:final-name", "rename:final-name"]);
+
+const failureQueue = new SerialTaskQueue<object>();
+const failureKey = {};
+await assert.rejects(failureQueue.enqueue(failureKey, async () => {
+  throw new Error("intentional queue failure");
+}), /intentional queue failure/);
+let ranAfterFailure = false;
+await failureQueue.enqueue(failureKey, async () => {
+  ranAfterFailure = true;
+});
+assert.equal(ranAfterFailure, true);
 
 const originalOverwriteNotePreservingAttachments = EudicApiClient.prototype.overwriteNotePreservingAttachments;
 try {

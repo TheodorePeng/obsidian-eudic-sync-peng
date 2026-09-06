@@ -3,6 +3,7 @@ import { PLUGIN_NAME } from "./constants";
 import { FolderInputSuggest } from "./folder-suggest";
 import { buildExportSettingsPayload, normalizeFolderPath, readImportedSettingsPayload } from "./settings-data";
 import type EudicSyncPlugin from "./main";
+import type { EudicStudylistCategory } from "./types";
 
 function normalizePathInput(value: string): string {
   const normalized = normalizeFolderPath(value);
@@ -25,6 +26,24 @@ function parseLines(value: string): string[] {
 
 function configureTextarea(text: { inputEl: HTMLTextAreaElement }, rows: number): void {
   text.inputEl.rows = rows;
+}
+
+function studylistCategoryKey(category: EudicStudylistCategory): string {
+  return `${category.language.toLocaleLowerCase()}\u0000${category.id}`;
+}
+
+function getDefaultStudylistOptions(
+  cached: EudicStudylistCategory[],
+  selected: EudicStudylistCategory[],
+): EudicStudylistCategory[] {
+  const byKey = new Map(selected.map((category) => [studylistCategoryKey(category), category]));
+  for (const category of cached) {
+    byKey.set(studylistCategoryKey(category), category);
+  }
+  return Array.from(byKey.values()).sort((left, right) => {
+    const languageOrder = left.language.localeCompare(right.language);
+    return languageOrder || left.name.localeCompare(right.name);
+  });
 }
 
 function toErrorMessage(error: unknown): string {
@@ -224,6 +243,46 @@ export class EudicSyncSettingTab extends PluginSettingTab {
       .setDesc(
         "Obsidian chooses which existing Eudic studylists a word belongs to. Create, rename, and delete studylist categories in Eudic cloud first, then refresh them back into Obsidian. Empty studylist fields are safe by default: they are pushed only when the word is explicitly dirty.",
       );
+
+    new Setting(syncOutputSection)
+      .setName("Default studylists for new words")
+      .setDesc(
+        "Selected cached categories are written only to newly created or clearly incomplete word notes. Existing normalized notes are not changed, and nothing is pushed to Eudic automatically.",
+      );
+
+    const selectedDefaultKeys = new Set(settings.newWordDefaultStudylists.map(studylistCategoryKey));
+    const defaultStudylistOptions = getDefaultStudylistOptions(
+      settings.studylistCache.categories,
+      settings.newWordDefaultStudylists,
+    );
+    if (defaultStudylistOptions.length === 0) {
+      new Setting(syncOutputSection)
+        .setName("No cached studylists")
+        .setDesc("Run “Refresh Eudic studylists” first, then reopen settings to choose defaults.");
+    }
+    for (const category of defaultStudylistOptions) {
+      const key = studylistCategoryKey(category);
+      const existsInCache = settings.studylistCache.categories.some(
+        (cachedCategory) => studylistCategoryKey(cachedCategory) === key,
+      );
+      new Setting(syncOutputSection)
+        .setName(`${category.name} (${category.language})`)
+        .setDesc(existsInCache ? `Eudic studylist ID: ${category.id}` : `Cached category missing; saved snapshot ID: ${category.id}`)
+        .addToggle((toggle) => {
+          toggle
+            .setValue(selectedDefaultKeys.has(key))
+            .onChange(async (selected) => {
+              const next = settings.newWordDefaultStudylists.filter(
+                (current) => studylistCategoryKey(current) !== key,
+              );
+              if (selected) {
+                next.push({ ...category });
+              }
+              await this.plugin.updateSettings({ newWordDefaultStudylists: next });
+              this.display();
+            });
+        });
+    }
 
     new Setting(syncOutputSection)
       .setName("Reference metadata writeback")

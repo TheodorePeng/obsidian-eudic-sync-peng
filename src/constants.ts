@@ -8,6 +8,10 @@ export const EUDIC_STUDYLIST_CATEGORY_API_URL = "https://api.frdic.com/api/open/
 export const EUDIC_STUDYLIST_WORDS_API_URL = "https://api.frdic.com/api/open/v1/studylist/words";
 export const EUDIC_STUDYLIST_WORD_API_URL = "https://api.frdic.com/api/open/v1/studylist/word";
 export const NOTE_OUTPUT_FORMAT_VERSION = 8;
+export const DEFAULT_NEW_WORD_STUDYLISTS = [
+  { id: "0", language: "en", name: "略｜我的生词本" },
+  { id: "134223429171042864", language: "en", name: "Obsidian Sync" },
+] as const;
 export const DEFAULT_SEMANTIC_BLOCK_WORD_BOLD_KINDS = ["n.", "v.", "a.", "adj.", "adv.", "vt.", "vi."] as const;
 export const DEFAULT_SEMANTIC_BLOCK_WORD_LINK_KINDS = ["Cog.", "Syn.", "Syn./Cog.", "Ant."] as const;
 export const DEFAULT_SEMANTIC_BLOCK_KIND_PRESETS = [
@@ -38,6 +42,7 @@ export const DEFAULT_SETTINGS: EudicSyncSettings = {
     categories: [],
     refreshedAt: null,
   },
+  newWordDefaultStudylists: DEFAULT_NEW_WORD_STUDYLISTS.map((category) => ({ ...category })),
   noteOutputMode: "minimal",
   noteOutputFormatVersion: NOTE_OUTPUT_FORMAT_VERSION,
   enableAutoBoldMarkersOnEdit: false,

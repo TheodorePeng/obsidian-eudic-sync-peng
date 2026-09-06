@@ -3,6 +3,9 @@ import { FRONTMATTER_KEYS } from "./constants";
 import type { EudicSyncStatus } from "./types";
 
 export interface WordSyncFrontmatterPatchData {
+  syncEudicEnabled?: boolean | null;
+  lang?: string | null;
+  aliases?: string[] | null;
   eudicUrl?: string | null;
   eudicUri?: string | null;
   syncStatus?: EudicSyncStatus;
@@ -11,11 +14,17 @@ export interface WordSyncFrontmatterPatchData {
   lastSyncedAliasesHash?: string | null;
   lastError?: string | null;
   eudicLinkId?: string | null;
+  referencePaths?: string[] | null;
+  studylistIds?: string[] | null;
+  studylistNames?: string[] | null;
+  studylistSyncStatus?: EudicSyncStatus | null;
 }
+
+type WordSyncFieldValue = string | boolean | string[] | null | undefined;
 
 interface WordSyncField {
   key: string;
-  value: string | null | undefined;
+  value: WordSyncFieldValue;
   bare?: boolean;
 }
 
@@ -82,12 +91,23 @@ function formatYamlScalar(value: string, bare = false): string {
   return JSON.stringify(value);
 }
 
+function formatYamlArrayValue(value: string): string {
+  return JSON.stringify(value);
+}
+
 function buildFields(data: WordSyncFrontmatterPatchData): WordSyncField[] {
   return [
+    { key: FRONTMATTER_KEYS.syncEudicEnabled, value: data.syncEudicEnabled, bare: true },
+    { key: FRONTMATTER_KEYS.lang, value: data.lang, bare: true },
+    { key: FRONTMATTER_KEYS.aliases, value: data.aliases },
+    { key: FRONTMATTER_KEYS.eudicLinkId, value: data.eudicLinkId },
     { key: FRONTMATTER_KEYS.eudicUrl, value: data.eudicUrl },
     { key: FRONTMATTER_KEYS.eudicUri, value: data.eudicUri },
-    { key: FRONTMATTER_KEYS.eudicLinkId, value: data.eudicLinkId },
     { key: FRONTMATTER_KEYS.syncStatus, value: data.syncStatus, bare: true },
+    { key: FRONTMATTER_KEYS.referencePaths, value: data.referencePaths },
+    { key: FRONTMATTER_KEYS.studylistIds, value: data.studylistIds },
+    { key: FRONTMATTER_KEYS.studylistNames, value: data.studylistNames },
+    { key: FRONTMATTER_KEYS.studylistSyncStatus, value: data.studylistSyncStatus, bare: true },
     { key: FRONTMATTER_KEYS.syncedAt, value: data.syncedAt },
     { key: FRONTMATTER_KEYS.lastSyncedHash, value: data.lastSyncedHash },
     { key: FRONTMATTER_KEYS.lastSyncedAliasesHash, value: data.lastSyncedAliasesHash },
@@ -98,11 +118,19 @@ function buildFields(data: WordSyncFrontmatterPatchData): WordSyncField[] {
 function buildReplacementLines(data: WordSyncFrontmatterPatchData): string[] {
   return buildFields(data)
     .filter((field) => field.value !== undefined && field.value !== null)
-    .map(buildFieldLine);
+    .flatMap(buildFieldLines);
 }
 
-function buildFieldLine(field: WordSyncField): string {
-  return `${field.key}: ${formatYamlScalar(field.value as string, field.bare)}`;
+function buildFieldLines(field: WordSyncField): string[] {
+  if (Array.isArray(field.value)) {
+    return field.value.length === 0
+      ? [`${field.key}: []`]
+      : [`${field.key}:`, ...field.value.map((value) => `  - ${formatYamlArrayValue(value)}`)];
+  }
+  if (typeof field.value === "boolean") {
+    return [`${field.key}: ${field.value ? "true" : "false"}`];
+  }
+  return [`${field.key}: ${formatYamlScalar(field.value as string, field.bare)}`];
 }
 
 function buildPatchedFrontmatterLines(
@@ -125,21 +153,21 @@ function buildPatchedFrontmatterLines(
       continue;
     }
 
-    writtenKeys.add(field.key);
     let rangeEnd = index + 1;
     while (rangeEnd < frontmatterEndLine && getTopLevelKey(lines[rangeEnd] ?? "") === null) {
       rangeEnd += 1;
     }
 
-    if (field.value !== null) {
-      nextLines.push(buildFieldLine(field));
+    if (!writtenKeys.has(field.key) && field.value !== null) {
+      nextLines.push(...buildFieldLines(field));
     }
+    writtenKeys.add(field.key);
     index = rangeEnd - 1;
   }
 
   for (const field of providedFields) {
     if (!writtenKeys.has(field.key) && field.value !== null) {
-      nextLines.push(buildFieldLine(field));
+      nextLines.push(...buildFieldLines(field));
     }
   }
 
@@ -178,7 +206,7 @@ export function applyWordSyncFrontmatterToObject(
     if (field.value === null) {
       delete frontmatter[field.key];
     } else {
-      frontmatter[field.key] = field.value;
+      frontmatter[field.key] = Array.isArray(field.value) ? [...field.value] : field.value;
     }
   }
 }

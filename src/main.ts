@@ -34,7 +34,6 @@ import {
   findEudicBlockFenceForBody,
   renderEudicBlockToMarkdown,
 } from "./eudic-block";
-import { getExpectedEudicUri } from "./eudic-url";
 import { ReferenceNoteService, hasPendingReferenceBlocks } from "./reference-note-service";
 import { formatBoldMarkersInMarkdown } from "./markdown-bold-markers";
 import { waitForCachedFrontmatterString } from "./frontmatter-cache-settle";
@@ -47,7 +46,8 @@ import { resolveManagedReferencePaths } from "./reference-links";
 import { SemanticBlockAutomationResolver } from "./semantic-block-automation-resolver";
 import type { SemanticBlockTransformOptions } from "./semantic-block-transform";
 import { EudicSyncSettingTab } from "./settings";
-import { migrateLoadedSettings } from "./settings-data";
+import { migrateLoadedSettings, refreshSelectedStudylistSnapshots } from "./settings-data";
+import { SerialTaskQueue } from "./serial-task-queue";
 import { EudicSyncSaveHookController } from "./save-hook-controller";
 import { StudylistService } from "./studylist-service";
 import { StartupCoordinator, type StartupTask } from "./startup-coordinator";
@@ -76,7 +76,11 @@ import type {
 import { EudicSyncUiController } from "./ui-controller";
 import { EudicSyncVaultEventController } from "./vault-event-controller";
 import { resolveWordDirtySignatureDecision } from "./word-dirty-signature-state";
-import { ensureManagedWordProperties } from "./word-frontmatter";
+import {
+  ensureManagedWordProperties,
+  reconcileManagedWordMarkdown,
+  type ManagedWordReconcileTrigger,
+} from "./word-frontmatter";
 import { getWordSyncSignature } from "./word-sync-signature";
 import { WordStatusOverrideStore } from "./word-status";
 
@@ -188,6 +192,7 @@ export default class EudicSyncPlugin extends Plugin {
   private readonly wordSyncSignatures = new Map<string, string>();
   private readonly wordCleanSyncSignatures = new Map<string, string>();
   private readonly pendingOpenWordStatusWrites = new Map<string, PendingOpenWordStatusWrite>();
+  private readonly wordLifecycleQueue = new SerialTaskQueue<TFile>();
   private readonly flushingOpenWordStatusWritePaths = new Set<string>();
   private readonly editorChangeTimers = new Map<string, number>();
   private readonly autoBodyDirtyPaths = new Set<string>();
@@ -274,7 +279,9 @@ export default class EudicSyncPlugin extends Plugin {
         this.lastActiveWordPath = this.getActiveWordPath();
         const activeFile = this.getActiveMarkdownFile();
         if (activeFile && this.pathScope.isWordPath(activeFile.path)) {
-          void this.ensureWordEudicUri(activeFile);
+          void this.enqueueWordLifecycle(activeFile, () =>
+            this.ensureManagedWordProperties(activeFile, { ensureEudicUri: false, trigger: "touch" }),
+          ).catch((error) => this.reportWordReconcileError("layout-ready", activeFile, error));
         }
         this.scheduleStartupKnownPathClear();
         this.runStartupTasks();
@@ -362,8 +369,6 @@ export default class EudicSyncPlugin extends Plugin {
     this.invalidateSemanticReferenceCaches();
     await this.saveData(this.settings);
     await this.rebuildReferenceIndex();
-    await this.ensureAllWordManagedFrontmatter();
-    await this.studylistService.ensureAllWordStudylistFrontmatter();
     this.studylistService.captureAllLocalSnapshots();
 
     if (previousSettings.enableAutoSyncWordOnLeave && !this.settings.enableAutoSyncWordOnLeave) {
@@ -471,10 +476,6 @@ export default class EudicSyncPlugin extends Plugin {
       {
         label: "startup.ensureWordFrontmatter",
         run: () => this.ensureAllWordManagedFrontmatter(),
-      },
-      {
-        label: "startup.ensureStudylistFrontmatter",
-        run: () => this.studylistService.ensureAllWordStudylistFrontmatter(),
       },
       {
         label: "startup.captureStudylistSnapshots",
@@ -611,7 +612,9 @@ export default class EudicSyncPlugin extends Plugin {
     this.registerEvent(
       this.app.workspace.on("file-open", (file) => {
         if (file && this.pathScope.isWordPath(file.path)) {
-          void this.ensureWordEudicUri(file);
+          void this.enqueueWordLifecycle(file, () =>
+            this.ensureManagedWordProperties(file, { ensureEudicUri: false, trigger: "touch" }),
+          ).catch((error) => this.reportWordReconcileError("file-open", file, error));
         }
         handleActiveContextChange();
       }),
@@ -630,7 +633,11 @@ export default class EudicSyncPlugin extends Plugin {
   }
 
   private async setStudylistCache(cache: EudicStudylistCache): Promise<void> {
-    this.settings = Object.assign({}, this.settings, { studylistCache: cache });
+    const newWordDefaultStudylists = refreshSelectedStudylistSnapshots(
+      this.settings.newWordDefaultStudylists,
+      cache,
+    );
+    this.settings = Object.assign({}, this.settings, { studylistCache: cache, newWordDefaultStudylists });
     await this.saveData(this.settings);
   }
 
@@ -796,6 +803,12 @@ export default class EudicSyncPlugin extends Plugin {
   }
 
   private async handleModify(file: TAbstractFile): Promise<void> {
+    if (isMarkdownFile(file) && this.pathScope.isWordPath(file.path)) {
+      await this.enqueueWordLifecycle(file, () =>
+        this.perf.measure("event.modify", () => this.handleModifyInternal(file)),
+      );
+      return;
+    }
     await this.perf.measure("event.modify", () => this.handleModifyInternal(file));
   }
 
@@ -867,9 +880,6 @@ export default class EudicSyncPlugin extends Plugin {
 
     if (this.pathScope.isWordPath(file.path)) {
       this.releaseWordStatusOverridesIfMetadataCaughtUp(file);
-      if (!this.startupKnownPaths.has(normalizePath(file.path))) {
-        void this.ensureWordEudicUri(file);
-      }
       this.refreshUi();
       return;
     }
@@ -880,7 +890,24 @@ export default class EudicSyncPlugin extends Plugin {
   }
 
   private async handleCreate(file: TAbstractFile): Promise<void> {
-    await this.perf.measure("event.create", () => this.handleCreateInternal(file));
+    try {
+      if (isMarkdownFile(file) && this.pathScope.isWordPath(file.path)) {
+        await this.enqueueWordLifecycle(file, () =>
+          this.perf.measure("event.create", () => this.handleCreateInternal(file)),
+        );
+        return;
+      }
+      await this.perf.measure("event.create", () => this.handleCreateInternal(file));
+    } catch (error) {
+      if (isMarkdownFile(file) && this.isStaleMissingWordFileError(file, error)) {
+        return;
+      }
+      if (isMarkdownFile(file)) {
+        this.reportWordReconcileError("create", file, error);
+        return;
+      }
+      throw error;
+    }
   }
 
   private async handleCreateInternal(file: TAbstractFile): Promise<void> {
@@ -896,7 +923,7 @@ export default class EudicSyncPlugin extends Plugin {
     }
 
     if (this.pathScope.isWordPath(file.path)) {
-      const ensured = await this.ensureManagedWordProperties(file);
+      const ensured = await this.ensureManagedWordProperties(file, { trigger: "create" });
 
       if (ensured.skipped) {
         const affectedReferencePaths = this.referenceIndex.removeWord(file.path);
@@ -999,19 +1026,16 @@ export default class EudicSyncPlugin extends Plugin {
     this.clearPendingOpenWordStatusWrite(normalizedOldPath);
 
     if (isMarkdownFile(file) && this.pathScope.isWordPath(normalizedNewPath)) {
-      const ensured = await this.ensureManagedWordProperties(file);
-      await this.ensureWordEudicUri(file);
+      const openView = this.getOpenMarkdownViewForFile(file);
+      const markdown = openView?.editor.getValue() ?? await this.app.vault.cachedRead(file);
+      const result = await this.referenceIndex.updateWord(file, markdown);
 
-      if (!ensured.skipped) {
-        const result = await this.referenceIndex.updateWord(file, ensured.markdown);
-        await this.studylistService.handleWordModify(file, ensured.markdown);
+      if (!result.disabled) {
         for (const referencePath of result.affectedReferencePaths) {
           affectedReferencePaths.add(referencePath);
         }
         shouldRepairAffectedReferenceMetadata = true;
-        await this.syncService.markWordDirty(file);
-        this.setWordBodyDirtyOverride(file, null);
-        this.wordSyncSignatures.set(normalizePath(file.path), getWordSyncSignature(ensured.markdown));
+        this.wordSyncSignatures.set(normalizePath(file.path), getWordSyncSignature(markdown));
       } else {
         for (const referencePath of this.referenceIndex.removeWord(normalizedNewPath)) {
           affectedReferencePaths.add(referencePath);
@@ -1060,7 +1084,7 @@ export default class EudicSyncPlugin extends Plugin {
     let markedCount = 0;
 
     for (const file of this.managedFiles.getWordFiles()) {
-      await this.ensureWordManagedFrontmatter(file);
+      await this.ensureWordManagedFrontmatterForSync(file);
       if (!this.syncService.canSyncFile(file)) {
         continue;
       }
@@ -1257,7 +1281,7 @@ export default class EudicSyncPlugin extends Plugin {
     }
 
     try {
-      await this.ensureWordManagedFrontmatter(file);
+      await this.ensureWordManagedFrontmatterForSync(file);
       const status = this.studylistService.getCurrentWordStudylistStatus(file);
       if (status === "dirty") {
         const confirmed = await confirmEudicAction(
@@ -1304,7 +1328,7 @@ export default class EudicSyncPlugin extends Plugin {
       return;
     }
 
-    await this.ensureWordManagedFrontmatter(file);
+    await this.ensureWordManagedFrontmatterForSync(file);
     const pushFile = this.studylistService.getCurrentWordForPush(file);
     if (!pushFile) {
       const lastError = this.studylistService.getCurrentWordStudylistLastError(file);
@@ -1737,7 +1761,9 @@ export default class EudicSyncPlugin extends Plugin {
   private handleActiveWordChanged(): void {
     const activeFile = this.getActiveMarkdownFile();
     if (activeFile && this.pathScope.isWordPath(activeFile.path)) {
-      void this.ensureWordEudicUri(activeFile);
+      void this.enqueueWordLifecycle(activeFile, () =>
+        this.ensureManagedWordProperties(activeFile, { ensureEudicUri: false, trigger: "touch" }),
+      ).catch((error) => this.reportWordReconcileError("active-word", activeFile, error));
     }
 
     const nextActiveWordPath = this.getActiveWordPath();
@@ -2207,21 +2233,30 @@ export default class EudicSyncPlugin extends Plugin {
     await this.referenceIndex.refreshReferenceUsage(paths);
   }
 
+  private enqueueWordLifecycle<Result>(file: TFile, task: () => Promise<Result>): Promise<Result> {
+    return this.wordLifecycleQueue.enqueue(file, task);
+  }
+
+  private isStaleMissingWordFileError(file: TFile, error: unknown): boolean {
+    return (
+      this.app.vault.getAbstractFileByPath(file.path) !== file &&
+      /(?:ENOENT|no such file|not found)/i.test(toErrorMessage(error))
+    );
+  }
+
+  private reportWordReconcileError(label: string, file: TFile, error: unknown): void {
+    if (this.isStaleMissingWordFileError(file, error)) {
+      return;
+    }
+    const message = toErrorMessage(error);
+    console.error(`${PLUGIN_NAME}: managed word reconciliation failed (${label}) for ${file.path}`, error);
+    new Notice(`${PLUGIN_NAME}: failed to repair properties for ${file.path}: ${message}`, 8000);
+  }
+
   private async ensureWordManagedFrontmatterForSync(file: TFile): Promise<string> {
-    await this.ensureWordEudicUri(file);
-
-    if (!this.isMarkdownFileOpen(file)) {
-      return this.ensureWordManagedFrontmatter(file);
-    }
-
-    const existingLinkId = readEudicLinkId(getFrontmatter(this.app, file));
-    if (existingLinkId) {
-      return existingLinkId;
-    }
-
-    const nextLinkId = createEudicLinkId("word");
-    await this.writeWordSyncFrontmatter(file, { eudicLinkId: nextLinkId });
-    return nextLinkId;
+    return this.enqueueWordLifecycle(file, () =>
+      this.ensureWordManagedFrontmatter(file, { ensureEudicUri: true, trigger: "touch" }),
+    );
   }
 
   private async writeWordSyncFrontmatter(file: TFile, data: WordSyncFrontmatterPatchData): Promise<void> {
@@ -2326,25 +2361,72 @@ export default class EudicSyncPlugin extends Plugin {
 
   private async ensureManagedWordProperties(
     file: TFile,
-    options: { ensureEudicUri?: boolean } = {},
+    options: { ensureEudicUri?: boolean; trigger?: ManagedWordReconcileTrigger } = {},
   ) {
     const openView = this.getOpenMarkdownViewForFile(file);
     if (openView) {
+      const reconciled = reconcileManagedWordMarkdown({
+        file,
+        markdown: openView.editor.getValue(),
+        ensureEudicUri: options.ensureEudicUri,
+        trigger: options.trigger,
+        defaultStudylists: this.settings.newWordDefaultStudylists,
+        studylistCatalog: this.settings.studylistCache.categories,
+      });
+      if (reconciled.changed) {
+        this.suppressPath(file.path);
+        try {
+          applyWordSyncFrontmatterPatchToEditor(openView.editor, reconciled.patchData);
+          await openView.save();
+          openView.editor.refresh();
+        } catch (error) {
+          this.clearSuppression(file.path);
+          throw error;
+        }
+      }
+
+      await this.waitForManagedWordIdentityCache(file, reconciled);
+      this.refreshUi();
       return {
-        skipped: this.syncService?.getWordContext(file) === null,
-        changed: false,
+        ...reconciled,
         markdown: openView.editor.getValue(),
       };
     }
 
-    return ensureManagedWordProperties({
+    const reconciled = await ensureManagedWordProperties({
       app: this.app,
       file,
       ensureEudicUri: options.ensureEudicUri,
+      trigger: options.trigger,
+      defaultStudylists: this.settings.newWordDefaultStudylists,
+      studylistCatalog: this.settings.studylistCache.categories,
       writeFrontmatter: async (targetFile, mutate) => {
         await this.writeFrontmatter(targetFile, mutate);
       },
     });
+    if (options.trigger !== "startup") {
+      await this.waitForManagedWordIdentityCache(file, reconciled);
+    }
+    return reconciled;
+  }
+
+  private async waitForManagedWordIdentityCache(
+    file: TFile,
+    values: { lang: string | null; eudicLinkId: string | null; eudicUri: string | null },
+  ): Promise<void> {
+    const expectedStrings: Array<[string, string | null]> = [
+      [FRONTMATTER_KEYS.lang, values.lang],
+      [FRONTMATTER_KEYS.eudicLinkId, values.eudicLinkId],
+      [FRONTMATTER_KEYS.eudicUri, values.eudicUri],
+    ];
+    for (const [key, value] of expectedStrings) {
+      if (this.app.vault.getAbstractFileByPath(file.path) !== file) {
+        return;
+      }
+      if (value) {
+        await this.waitForWordFrontmatterStringCacheSettle(file, key, value);
+      }
+    }
   }
 
   private async ensureAllWordManagedFrontmatter(): Promise<void> {
@@ -2353,20 +2435,16 @@ export default class EudicSyncPlugin extends Plugin {
       if (openPaths.has(normalizePath(file.path))) {
         continue;
       }
-      await this.ensureWordManagedFrontmatter(file, { ensureEudicUri: false });
+      await this.ensureManagedWordProperties(file, { ensureEudicUri: false, trigger: "startup" });
     }
   }
 
   private async ensureWordManagedFrontmatter(
     file: TFile,
-    options: { ensureEudicUri?: boolean } = {},
+    options: { ensureEudicUri?: boolean; trigger?: ManagedWordReconcileTrigger } = {},
   ): Promise<string> {
-    if (this.isMarkdownFileOpen(file)) {
-      return this.ensureWordManagedFrontmatterForSync(file);
-    }
-
-    await this.ensureManagedWordProperties(file, options);
-    const linkId = readEudicLinkId(getFrontmatter(this.app, file));
+    const ensured = await this.ensureManagedWordProperties(file, options);
+    const linkId = ensured.eudicLinkId ?? readEudicLinkId(getFrontmatter(this.app, file));
     if (linkId) {
       return linkId;
     }
@@ -2376,21 +2454,6 @@ export default class EudicSyncPlugin extends Plugin {
       frontmatter[FRONTMATTER_KEYS.eudicLinkId] = nextLinkId;
     });
     return nextLinkId;
-  }
-
-  private async ensureWordEudicUri(file: TFile): Promise<boolean> {
-    if (!this.pathScope.isWordPath(file.path)) {
-      return false;
-    }
-
-    const frontmatter = getFrontmatter(this.app, file);
-    const expectedEudicUri = getExpectedEudicUri(frontmatter, file);
-    if (readNullableString(frontmatter[FRONTMATTER_KEYS.eudicUri]) === expectedEudicUri) {
-      return false;
-    }
-
-    await this.writeWordSyncFrontmatter(file, { eudicUri: expectedEudicUri });
-    return true;
   }
 
   private async ensureReferenceManagedFrontmatter(file: TAbstractFile): Promise<string | null> {
@@ -2429,7 +2492,7 @@ export default class EudicSyncPlugin extends Plugin {
 
   private async getManagedUrlForFile(file: TFile): Promise<string | null> {
     if (this.pathScope.isWordPath(file.path)) {
-      const linkId = await this.ensureWordManagedFrontmatter(file);
+      const linkId = await this.ensureWordManagedFrontmatterForSync(file);
       return buildManagedFileProtocolUrl(this.app, this.pathScope, file, linkId, (kind) =>
         kind === "word" ? this.managedFiles.getWordFiles() : this.managedFiles.getReferenceFiles(),
       );
