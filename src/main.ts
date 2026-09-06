@@ -62,6 +62,7 @@ import { SyncService } from "./sync-service";
 import {
   getDeleteNoteNoticeText,
   getResyncAliasesNoticeText,
+  getStudylistCatalogRefreshNoticeText,
   getStudylistPushNoticeText,
   getStudylistRefreshNoticeText,
 } from "./sync-notice-text";
@@ -71,6 +72,7 @@ import type {
   EudicSyncSettings,
   EudicSyncStatus,
   FrontmatterMutator,
+  StudylistCatalogRefreshSummary,
   WordNoteContext,
 } from "./types";
 import { EudicSyncUiController } from "./ui-controller";
@@ -1251,12 +1253,14 @@ export default class EudicSyncPlugin extends Plugin {
     }
   }
 
+  async refreshStudylistCatalog(): Promise<StudylistCatalogRefreshSummary> {
+    return this.perf.measure("studylist.refreshCatalogFromEudic", () => this.studylistService.refreshCatalogFromEudic());
+  }
+
   private async refreshEudicStudylists(): Promise<void> {
     try {
-      await this.ensureAllWordManagedFrontmatter();
-      const result = await this.perf.measure("studylist.refreshFromEudic", () => this.studylistService.refreshFromEudic());
-      await this.reconcileWordSyncStatuses(result.updatedFiles);
-      new Notice(getStudylistRefreshNoticeText(result), 8000);
+      const result = await this.refreshStudylistCatalog();
+      new Notice(getStudylistCatalogRefreshNoticeText(result), 8000);
     } catch (error) {
       new Notice(`${PLUGIN_NAME}: failed to refresh Eudic studylists: ${toErrorMessage(error)}`, 8000);
     }

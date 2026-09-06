@@ -9,7 +9,7 @@ import {
 } from "./note-metadata";
 import type { ManagedFileRegistry } from "./managed-file-registry";
 import type { PathScope } from "./path-scope";
-import { StudylistCatalogResolver } from "./studylist-catalog-resolver";
+import { StudylistCatalogResolver, updateStudylistCacheForLanguage } from "./studylist-catalog-resolver";
 import {
   isStudylistSyncStatusNormalized,
   normalizeStudylistSyncStatus,
@@ -29,6 +29,7 @@ import type {
   StudylistPullWordResult,
   StudylistPushSummary,
   StudylistPushWordResult,
+  StudylistCatalogRefreshSummary,
   StudylistRefreshSummary,
 } from "./types";
 
@@ -297,6 +298,21 @@ export class StudylistService {
 
   async refreshStudylistCatalogForLanguage(language: string): Promise<void> {
     await this.catalog.refreshLanguage(language);
+  }
+
+  async refreshCatalogFromEudic(): Promise<StudylistCatalogRefreshSummary> {
+    const languages = this.getManagedLanguages();
+    let cache = this.options.getStudylistCache();
+    for (const language of languages) {
+      const categories = await this.apiClient.getStudylistCategories(language);
+      cache = updateStudylistCacheForLanguage(cache, language, categories);
+    }
+    await this.options.setStudylistCache(cache);
+    return {
+      categories: cache.categories.length,
+      languages,
+      cache,
+    };
   }
 
   applyWordModifyAnalysisToFrontmatter(

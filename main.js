@@ -3693,6 +3693,72 @@ function migrateLoadedSettings(rawData) {
   };
 }
 
+// src/studylist-settings-model.ts
+function getStudylistCategoryKey(category) {
+  return `${category.language.trim().toLocaleLowerCase()}\0${category.id.trim()}`;
+}
+function matchesQuery(category, query) {
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  if (!normalizedQuery) {
+    return true;
+  }
+  return [category.name, category.language, category.id].some((value) => value.toLocaleLowerCase().includes(normalizedQuery));
+}
+function compareItems(left, right) {
+  if (left.selected !== right.selected) {
+    return left.selected ? -1 : 1;
+  }
+  return left.category.name.localeCompare(right.category.name);
+}
+function buildStudylistSelectionGroups(cached, selected, query) {
+  const selectedKeys = new Set(selected.map(getStudylistCategoryKey));
+  const cachedKeys = new Set(cached.map(getStudylistCategoryKey));
+  const availableGroups = /* @__PURE__ */ new Map();
+  for (const category of cached) {
+    if (!matchesQuery(category, query)) {
+      continue;
+    }
+    const language = category.language.trim().toLocaleLowerCase();
+    const items = availableGroups.get(language) ?? [];
+    items.push({
+      key: getStudylistCategoryKey(category),
+      category: { ...category },
+      selected: selectedKeys.has(getStudylistCategoryKey(category)),
+      available: true
+    });
+    availableGroups.set(language, items);
+  }
+  const groups = Array.from(availableGroups.entries()).sort(([left], [right]) => left.localeCompare(right)).map(([language, items]) => ({
+    key: `language:${language}`,
+    label: language,
+    unavailable: false,
+    items: items.sort(compareItems)
+  }));
+  const unavailableItems = selected.filter((category) => !cachedKeys.has(getStudylistCategoryKey(category)) && matchesQuery(category, query)).map((category) => ({
+    key: getStudylistCategoryKey(category),
+    category: { ...category },
+    selected: true,
+    available: false
+  })).sort(compareItems);
+  if (unavailableItems.length > 0) {
+    groups.push({
+      key: "unavailable",
+      label: "Unavailable in Eudic",
+      unavailable: true,
+      items: unavailableItems
+    });
+  }
+  return groups;
+}
+function getStudylistSelectionSummary(selected) {
+  if (selected.length === 0) {
+    return "None selected";
+  }
+  const visibleNames = selected.slice(0, 2).map((category) => category.name);
+  const remaining = selected.length - visibleNames.length;
+  return `${selected.length} selected: ${visibleNames.join(", ")}${remaining > 0 ? ` +${remaining} more` : ""}`;
+}
+
 // src/settings.ts
 function normalizePathInput(value) {
   const normalized = normalizeFolderPath2(value);
@@ -3709,19 +3775,6 @@ function parseLines(value) {
 }
 function configureTextarea(text, rows) {
   text.inputEl.rows = rows;
-}
-function studylistCategoryKey(category) {
-  return `${category.language.toLocaleLowerCase()}\0${category.id}`;
-}
-function getDefaultStudylistOptions(cached, selected) {
-  const byKey = new Map(selected.map((category) => [studylistCategoryKey(category), category]));
-  for (const category of cached) {
-    byKey.set(studylistCategoryKey(category), category);
-  }
-  return Array.from(byKey.values()).sort((left, right) => {
-    const languageOrder = left.language.localeCompare(right.language);
-    return languageOrder || left.name.localeCompare(right.name);
-  });
 }
 function toErrorMessage(error) {
   if (error instanceof Error) {
@@ -3746,6 +3799,151 @@ function downloadJsonFile(filename, content) {
   link.remove();
   window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
+function formatStudylistCatalogStatus(refreshedAt) {
+  if (!refreshedAt) {
+    return "Catalog has not been refreshed yet";
+  }
+  const refreshedDate = new Date(refreshedAt);
+  if (Number.isNaN(refreshedDate.getTime())) {
+    return `Catalog updated ${refreshedAt}`;
+  }
+  return `Catalog updated ${refreshedDate.toLocaleString()}`;
+}
+var DefaultStudylistsModal = class extends import_obsidian8.Modal {
+  constructor(app, plugin, selected, onChanged) {
+    super(app);
+    this.plugin = plugin;
+    this.onChanged = onChanged;
+    this.draftByKey = /* @__PURE__ */ new Map();
+    this.query = "";
+    this.refreshButtonEl = null;
+    this.refreshing = false;
+    this.saving = false;
+    for (const category of selected) {
+      this.draftByKey.set(getStudylistCategoryKey(category), { ...category });
+    }
+  }
+  onOpen() {
+    this.modalEl.addClass("eudic-sync-studylist-modal");
+    this.setTitle("Default studylists for new words");
+    this.contentEl.createDiv({
+      cls: "eudic-sync-studylist-modal-description",
+      text: "Choose the Eudic studylists assigned to newly created or clearly incomplete word notes. This does not change existing notes or push anything to Eudic."
+    });
+    new import_obsidian8.Setting(this.contentEl).setClass("eudic-sync-studylist-toolbar").addSearch((search) => {
+      search.setPlaceholder("Search name, language, or ID").onChange((value) => {
+        this.query = value;
+        this.renderList();
+      });
+    }).addButton((button) => {
+      button.setButtonText("Refresh from Eudic").setTooltip("Refresh only the Eudic studylist catalog").onClick(() => {
+        void this.refreshCatalog();
+      });
+      this.refreshButtonEl = button.buttonEl;
+    });
+    this.statusEl = this.contentEl.createDiv({ cls: "eudic-sync-studylist-status" });
+    this.listEl = this.contentEl.createDiv({ cls: "eudic-sync-studylist-list" });
+    new import_obsidian8.Setting(this.contentEl).setClass("eudic-sync-studylist-actions").addButton((button) => {
+      button.setButtonText("Cancel").onClick(() => this.close());
+    }).addButton((button) => {
+      button.setButtonText("Save").setCta().onClick(() => {
+        if (!this.saving) {
+          void this.save();
+        }
+      });
+    });
+    this.setStatus(formatStudylistCatalogStatus(this.plugin.settings.studylistCache.refreshedAt));
+    this.renderList();
+    void this.refreshCatalog();
+  }
+  onClose() {
+    this.contentEl.empty();
+    this.onChanged();
+  }
+  setStatus(text, isError = false) {
+    this.statusEl.setText(text);
+    this.statusEl.toggleClass("is-error", isError);
+  }
+  renderList() {
+    this.listEl.empty();
+    const groups = buildStudylistSelectionGroups(
+      this.plugin.settings.studylistCache.categories,
+      Array.from(this.draftByKey.values()),
+      this.query
+    );
+    if (groups.length === 0) {
+      this.listEl.createDiv({
+        cls: "eudic-sync-studylist-empty",
+        text: this.query ? "No studylists match this search." : "No cached studylists. Refresh from Eudic to load them."
+      });
+      return;
+    }
+    for (const group of groups) {
+      const groupEl = this.listEl.createDiv({ cls: "eudic-sync-studylist-group" });
+      groupEl.toggleClass("is-unavailable", group.unavailable);
+      groupEl.createEl("h4", { text: group.label });
+      if (group.unavailable) {
+        groupEl.createDiv({
+          cls: "eudic-sync-studylist-group-warning",
+          text: "These saved selections were not found in the latest catalog. They are preserved until you remove them."
+        });
+      }
+      for (const item of group.items) {
+        new import_obsidian8.Setting(groupEl).setName(item.category.name).setDesc(`Eudic studylist ID: ${item.category.id}`).addToggle((toggle) => {
+          toggle.setValue(item.selected).onChange((selected) => {
+            if (selected) {
+              this.draftByKey.set(item.key, { ...item.category });
+            } else {
+              this.draftByKey.delete(item.key);
+            }
+            this.renderList();
+          });
+        });
+      }
+    }
+  }
+  async refreshCatalog() {
+    if (this.refreshing) {
+      return;
+    }
+    this.refreshing = true;
+    this.refreshButtonEl?.setAttribute("disabled", "true");
+    this.setStatus("Refreshing the studylist catalog\u2026");
+    try {
+      const result = await this.plugin.refreshStudylistCatalog();
+      const refreshedDraft = refreshSelectedStudylistSnapshots(Array.from(this.draftByKey.values()), result.cache);
+      this.draftByKey.clear();
+      for (const category of refreshedDraft) {
+        this.draftByKey.set(getStudylistCategoryKey(category), category);
+      }
+      this.setStatus(formatStudylistCatalogStatus(result.cache.refreshedAt));
+      this.renderList();
+      this.onChanged();
+    } catch (error) {
+      const message = toErrorMessage(error);
+      this.setStatus(`Refresh failed: ${message}`, true);
+      new import_obsidian8.Notice(`${PLUGIN_NAME}: failed to refresh Eudic studylist catalog: ${message}`, 8e3);
+    } finally {
+      this.refreshing = false;
+      this.refreshButtonEl?.removeAttribute("disabled");
+    }
+  }
+  async save() {
+    this.saving = true;
+    try {
+      const selected = refreshSelectedStudylistSnapshots(
+        Array.from(this.draftByKey.values()),
+        this.plugin.settings.studylistCache
+      );
+      await this.plugin.updateSettings({ newWordDefaultStudylists: selected });
+      this.close();
+    } catch (error) {
+      new import_obsidian8.Notice(`${PLUGIN_NAME}: failed to save default studylists: ${toErrorMessage(error)}`, 8e3);
+    } finally {
+      this.saving = false;
+    }
+  }
+};
 var EudicSyncSettingTab = class extends import_obsidian8.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
@@ -3868,34 +4066,14 @@ var EudicSyncSettingTab = class extends import_obsidian8.PluginSettingTab {
       "Obsidian chooses which existing Eudic studylists a word belongs to. Create, rename, and delete studylist categories in Eudic cloud first, then refresh them back into Obsidian. Empty studylist fields are safe by default: they are pushed only when the word is explicitly dirty."
     );
     new import_obsidian8.Setting(syncOutputSection).setName("Default studylists for new words").setDesc(
-      "Selected cached categories are written only to newly created or clearly incomplete word notes. Existing normalized notes are not changed, and nothing is pushed to Eudic automatically."
-    );
-    const selectedDefaultKeys = new Set(settings.newWordDefaultStudylists.map(studylistCategoryKey));
-    const defaultStudylistOptions = getDefaultStudylistOptions(
-      settings.studylistCache.categories,
-      settings.newWordDefaultStudylists
-    );
-    if (defaultStudylistOptions.length === 0) {
-      new import_obsidian8.Setting(syncOutputSection).setName("No cached studylists").setDesc("Run \u201CRefresh Eudic studylists\u201D first, then reopen settings to choose defaults.");
-    }
-    for (const category of defaultStudylistOptions) {
-      const key = studylistCategoryKey(category);
-      const existsInCache = settings.studylistCache.categories.some(
-        (cachedCategory) => studylistCategoryKey(cachedCategory) === key
-      );
-      new import_obsidian8.Setting(syncOutputSection).setName(`${category.name} (${category.language})`).setDesc(existsInCache ? `Eudic studylist ID: ${category.id}` : `Cached category missing; saved snapshot ID: ${category.id}`).addToggle((toggle) => {
-        toggle.setValue(selectedDefaultKeys.has(key)).onChange(async (selected) => {
-          const next = settings.newWordDefaultStudylists.filter(
-            (current) => studylistCategoryKey(current) !== key
-          );
-          if (selected) {
-            next.push({ ...category });
-          }
-          await this.plugin.updateSettings({ newWordDefaultStudylists: next });
+      `${getStudylistSelectionSummary(settings.newWordDefaultStudylists)}. ${formatStudylistCatalogStatus(settings.studylistCache.refreshedAt)}. Defaults affect only new or clearly incomplete word notes.`
+    ).addButton((button) => {
+      button.setButtonText("Manage\u2026").onClick(() => {
+        new DefaultStudylistsModal(this.app, this.plugin, this.plugin.settings.newWordDefaultStudylists, () => {
           this.display();
-        });
+        }).open();
       });
-    }
+    });
     new import_obsidian8.Setting(syncOutputSection).setName("Reference metadata writeback").setDesc("Reference relationships are inferred from word-note embeds and written into visible reference properties for stable linking and repair.").addDropdown((dropdown) => {
       dropdown.addOption("auto", "Auto").addOption("manual", "Manual command only").addOption("off", "Off").setValue(settings.referenceMetadataWriteMode).onChange(async (value) => {
         await this.plugin.updateSettings({
@@ -5289,6 +5467,20 @@ var StudylistService = class {
   }
   async refreshStudylistCatalogForLanguage(language) {
     await this.catalog.refreshLanguage(language);
+  }
+  async refreshCatalogFromEudic() {
+    const languages = this.getManagedLanguages();
+    let cache = this.options.getStudylistCache();
+    for (const language of languages) {
+      const categories = await this.apiClient.getStudylistCategories(language);
+      cache = updateStudylistCacheForLanguage(cache, language, categories);
+    }
+    await this.options.setStudylistCache(cache);
+    return {
+      categories: cache.categories.length,
+      languages,
+      cache
+    };
   }
   applyWordModifyAnalysisToFrontmatter(frontmatter, analysis) {
     frontmatter[FRONTMATTER_KEYS.studylistIds] = analysis.ids;
@@ -8094,6 +8286,9 @@ function getDeleteNoteNoticeText(result) {
 function getStudylistRefreshNoticeText(result) {
   return `${PLUGIN_NAME}: refreshed ${result.categories} Eudic studylist(s), scanned ${result.words} cloud word assignment(s), updated ${result.updatedWords} local word(s).`;
 }
+function getStudylistCatalogRefreshNoticeText(result) {
+  return `${PLUGIN_NAME}: refreshed ${result.categories} Eudic studylist(s) for ${result.languages.length} language(s).`;
+}
 function getStudylistPushNoticeText(result) {
   return `${PLUGIN_NAME}: pushed ${result.succeeded}/${result.total} studylist assignment(s), added ${result.added}, removed ${result.removed}, failed ${result.failed}.`;
 }
@@ -9705,12 +9900,13 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
       this.typedDeleteInFlight = false;
     }
   }
+  async refreshStudylistCatalog() {
+    return this.perf.measure("studylist.refreshCatalogFromEudic", () => this.studylistService.refreshCatalogFromEudic());
+  }
   async refreshEudicStudylists() {
     try {
-      await this.ensureAllWordManagedFrontmatter();
-      const result = await this.perf.measure("studylist.refreshFromEudic", () => this.studylistService.refreshFromEudic());
-      await this.reconcileWordSyncStatuses(result.updatedFiles);
-      new import_obsidian17.Notice(getStudylistRefreshNoticeText(result), 8e3);
+      const result = await this.refreshStudylistCatalog();
+      new import_obsidian17.Notice(getStudylistCatalogRefreshNoticeText(result), 8e3);
     } catch (error) {
       new import_obsidian17.Notice(`${PLUGIN_NAME}: failed to refresh Eudic studylists: ${toErrorMessage7(error)}`, 8e3);
     }

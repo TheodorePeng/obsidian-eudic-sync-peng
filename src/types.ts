@@ -18,6 +18,12 @@ export interface EudicStudylistCache {
   refreshedAt: string | null;
 }
 
+export interface StudylistCatalogRefreshSummary {
+  categories: number;
+  languages: string[];
+  cache: EudicStudylistCache;
+}
+
 export interface EudicSyncSettings {
   wordFolder: string;
   referenceFolder: string;

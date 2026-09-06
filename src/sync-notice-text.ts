@@ -2,6 +2,7 @@ import { PLUGIN_NAME } from "./constants";
 import type {
   DeleteEudicNoteResult,
   ResyncAliasesResult,
+  StudylistCatalogRefreshSummary,
   StudylistPushSummary,
   StudylistRefreshSummary,
   SyncWordResult,
@@ -64,6 +65,10 @@ export function getDeleteNoteNoticeText(result: DeleteEudicNoteResult): string {
 
 export function getStudylistRefreshNoticeText(result: StudylistRefreshSummary): string {
   return `${PLUGIN_NAME}: refreshed ${result.categories} Eudic studylist(s), scanned ${result.words} cloud word assignment(s), updated ${result.updatedWords} local word(s).`;
+}
+
+export function getStudylistCatalogRefreshNoticeText(result: StudylistCatalogRefreshSummary): string {
+  return `${PLUGIN_NAME}: refreshed ${result.categories} Eudic studylist(s) for ${result.languages.length} language(s).`;
 }
 
 export function getStudylistPushNoticeText(result: StudylistPushSummary): string {
