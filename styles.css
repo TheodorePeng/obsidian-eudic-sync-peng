@@ -150,6 +150,50 @@
   margin-block: 0.15rem;
 }
 
+.markdown-source-view.mod-cm6
+  .cm-preview-code-block.cm-lang-eudic-block
+  > .embed-actions
+  > .edit-block-button {
+  min-width: 32px;
+  min-height: 32px;
+  border-radius: var(--radius-s);
+  cursor: pointer;
+  opacity: 0.55 !important;
+  transition: opacity var(--anim-duration-fast, 120ms) ease-in-out;
+}
+
+.markdown-source-view.mod-cm6
+  .cm-preview-code-block.cm-lang-eudic-block:hover
+  > .embed-actions
+  > .edit-block-button,
+.markdown-source-view.mod-cm6
+  .cm-preview-code-block.cm-lang-eudic-block
+  > .embed-actions
+  > .edit-block-button:hover,
+.markdown-source-view.mod-cm6
+  .cm-preview-code-block.cm-lang-eudic-block
+  > .embed-actions
+  > .edit-block-button:focus-visible {
+  opacity: 1 !important;
+}
+
+.markdown-source-view.mod-cm6
+  .cm-preview-code-block.cm-lang-eudic-block
+  > .embed-actions
+  > .eudic-sync-block-edit-button:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
+}
+
+@media (hover: none) {
+  .markdown-source-view.mod-cm6
+    .cm-preview-code-block.cm-lang-eudic-block
+    > .embed-actions
+    > .edit-block-button {
+    opacity: 1 !important;
+  }
+}
+
 .eudic-sync-block-preview > :first-child {
   margin-top: 0;
 }

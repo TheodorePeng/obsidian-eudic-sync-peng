@@ -44,6 +44,12 @@ import { PerformanceMonitor } from "./performance-monitor";
 import { ReferenceGraphService } from "./reference-index-service";
 import { resolveManagedReferencePaths } from "./reference-links";
 import { SemanticBlockAutomationResolver } from "./semantic-block-automation-resolver";
+import {
+  activateEudicBlockEdit,
+  activateEudicBlockEditFromKeyboard,
+  enhanceNativeEudicBlockEditButton,
+  findNativeEudicBlockEditButton,
+} from "./semantic-block-edit-interaction";
 import type { SemanticBlockTransformOptions } from "./semantic-block-transform";
 import { EudicSyncSettingTab } from "./settings";
 import { migrateLoadedSettings, refreshSelectedStudylistSnapshots } from "./settings-data";
@@ -93,6 +99,82 @@ interface SuppressedWriteEntry {
 interface PendingOpenWordStatusWrite {
   bodyDirty?: boolean;
   bodyError?: string | null;
+}
+
+interface EditButtonOriginalAttributes {
+  ariaLabel: string | null;
+  role: string | null;
+  tabindex: string | null;
+}
+
+function restoreOptionalAttribute(el: HTMLElement, name: string, value: string | null): void {
+  if (value === null) {
+    el.removeAttribute(name);
+  } else {
+    el.setAttribute(name, value);
+  }
+}
+
+class EudicBlockInteractionRenderChild extends MarkdownRenderChild {
+  private animationFrame: number | null = null;
+  private editButton: HTMLElement | null = null;
+  private editButtonOriginalAttributes: EditButtonOriginalAttributes | null = null;
+
+  constructor(
+    private readonly previewEl: HTMLElement,
+    private readonly enterEditMode: () => boolean,
+  ) {
+    super(previewEl);
+  }
+
+  override onload(): void {
+    this.previewEl.addEventListener("click", this.handlePreviewClick);
+    this.animationFrame = window.requestAnimationFrame(() => {
+      this.animationFrame = null;
+      const editButton = findNativeEudicBlockEditButton(this.previewEl);
+      if (!editButton) {
+        return;
+      }
+
+      this.editButton = editButton;
+      this.editButtonOriginalAttributes = {
+        ariaLabel: editButton.getAttribute("aria-label"),
+        role: editButton.getAttribute("role"),
+        tabindex: editButton.getAttribute("tabindex"),
+      };
+      enhanceNativeEudicBlockEditButton(editButton);
+      editButton.addEventListener("keydown", this.handleEditButtonKeydown);
+    });
+  }
+
+  override onunload(): void {
+    this.previewEl.removeEventListener("click", this.handlePreviewClick);
+    if (this.animationFrame !== null) {
+      window.cancelAnimationFrame(this.animationFrame);
+      this.animationFrame = null;
+    }
+
+    if (this.editButton) {
+      this.editButton.removeEventListener("keydown", this.handleEditButtonKeydown);
+      this.editButton.classList.remove("eudic-sync-block-edit-button");
+      if (this.editButtonOriginalAttributes) {
+        restoreOptionalAttribute(this.editButton, "aria-label", this.editButtonOriginalAttributes.ariaLabel);
+        restoreOptionalAttribute(this.editButton, "role", this.editButtonOriginalAttributes.role);
+        restoreOptionalAttribute(this.editButton, "tabindex", this.editButtonOriginalAttributes.tabindex);
+      }
+    }
+
+    this.editButton = null;
+    this.editButtonOriginalAttributes = null;
+  }
+
+  private readonly handlePreviewClick = (event: MouseEvent): void => {
+    activateEudicBlockEdit(this.previewEl, event, window.getSelection(), this.enterEditMode);
+  };
+
+  private readonly handleEditButtonKeydown = (event: KeyboardEvent): void => {
+    activateEudicBlockEditFromKeyboard(event, this.enterEditMode);
+  };
 }
 
 const AUTO_SYNC_AFTER_LEAVE_DELAY_MS = 2000;
@@ -389,7 +471,8 @@ export default class EudicSyncPlugin extends Plugin {
 
   private registerMarkdownProcessors(): void {
     this.registerMarkdownCodeBlockProcessor(EUDIC_BLOCK_LANGUAGE, async (source, el, ctx) => {
-      const sectionText = ctx.getSectionInfo(el)?.text ?? "";
+      const sectionInfo = ctx.getSectionInfo(el);
+      const sectionText = sectionInfo?.text ?? "";
       const openingFence = findEudicBlockFenceForBody(sectionText, source);
       const embedContainer = el.closest(".markdown-embed, .internal-embed");
 
@@ -401,7 +484,25 @@ export default class EudicSyncPlugin extends Plugin {
       el.empty();
       el.addClass("eudic-sync-block-preview");
       embedContainer?.classList.add("eudic-sync-block-embed");
-      const child = new MarkdownRenderChild(el);
+      const isLiveEudicBlock = !!el.closest(".cm-preview-code-block.cm-lang-eudic-block");
+
+      const enterEditMode = (): boolean => {
+        const view = this.getActiveMarkdownView();
+        if (!sectionInfo || !view?.file || normalizePath(view.file.path) !== normalizePath(ctx.sourcePath)) {
+          return false;
+        }
+
+        view.editor.setCursor({
+          line: Math.min(sectionInfo.lineStart + 1, sectionInfo.lineEnd),
+          ch: 0,
+        });
+        view.editor.focus();
+        return true;
+      };
+
+      const child = isLiveEudicBlock
+        ? new EudicBlockInteractionRenderChild(el, enterEditMode)
+        : new MarkdownRenderChild(el);
       ctx.addChild(child);
       const semanticOptions = await this.getSemanticBlockTransformOptionsForSourcePath(
         ctx.sourcePath,
