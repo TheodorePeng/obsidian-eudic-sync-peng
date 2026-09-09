@@ -3362,6 +3362,88 @@ var SemanticBlockAutomationResolver = class {
   }
 };
 
+// src/semantic-block-edit-interaction.ts
+var LIVE_EUDIC_BLOCK_SELECTOR = ".cm-preview-code-block.cm-lang-eudic-block";
+var NATIVE_EDIT_ACTIONS_CLASS = "embed-actions";
+var NATIVE_EDIT_BUTTON_SELECTOR = ".edit-block-button";
+var INTERACTIVE_TARGET_SELECTOR = [
+  "a",
+  "button",
+  "input",
+  "textarea",
+  "select",
+  "summary",
+  '[role="button"]',
+  '[role="link"]',
+  '[contenteditable="true"]'
+].join(", ");
+function getClosestCapableElement(target) {
+  if (!target || typeof target.closest !== "function") {
+    const parentElement = target?.parentElement;
+    return parentElement && typeof parentElement.closest === "function" ? parentElement : null;
+  }
+  return target;
+}
+function isInteractiveTarget(target, interactionBoundary) {
+  const targetElement = getClosestCapableElement(target);
+  if (!targetElement || !interactionBoundary.contains(targetElement)) {
+    return true;
+  }
+  const interactiveElement = targetElement.closest(INTERACTIVE_TARGET_SELECTOR);
+  return interactiveElement !== null && interactionBoundary.contains(interactiveElement);
+}
+function shouldActivateEudicBlockEdit(event, selection, interactionBoundary) {
+  if (event.button !== 0 || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) {
+    return false;
+  }
+  if (selection?.isCollapsed === false || isInteractiveTarget(event.target, interactionBoundary)) {
+    return false;
+  }
+  return true;
+}
+function findNativeEudicBlockEditButton(previewEl) {
+  const liveBlock = previewEl.closest(LIVE_EUDIC_BLOCK_SELECTOR);
+  if (!liveBlock) {
+    return null;
+  }
+  const actions = Array.from(liveBlock.children).find((child) => child.classList.contains(NATIVE_EDIT_ACTIONS_CLASS));
+  return actions?.querySelector(NATIVE_EDIT_BUTTON_SELECTOR) ?? null;
+}
+function activateEudicBlockEdit(previewEl, event, selection, enterEditMode) {
+  if (!shouldActivateEudicBlockEdit(event, selection, previewEl)) {
+    return false;
+  }
+  const editButton = findNativeEudicBlockEditButton(previewEl);
+  if (!editButton) {
+    return false;
+  }
+  if (!enterEditMode()) {
+    return false;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  return true;
+}
+function enhanceNativeEudicBlockEditButton(editButton) {
+  editButton.classList.add("eudic-sync-block-edit-button");
+  if (!editButton.getAttribute("aria-label")) {
+    editButton.setAttribute("aria-label", "Edit Eudic block");
+  }
+  editButton.setAttribute("role", "button");
+  editButton.setAttribute("tabindex", "0");
+}
+function activateEudicBlockEditFromKeyboard(event, enterEditMode) {
+  if (event.key !== "Enter" && event.key !== " ") {
+    return false;
+  }
+  if (!enterEditMode()) {
+    return false;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  return true;
+}
+
 // src/settings.ts
 var import_obsidian8 = require("obsidian");
 
@@ -8882,6 +8964,65 @@ async function ensureManagedWordProperties(options) {
 }
 
 // src/main.ts
+function restoreOptionalAttribute(el, name, value) {
+  if (value === null) {
+    el.removeAttribute(name);
+  } else {
+    el.setAttribute(name, value);
+  }
+}
+var EudicBlockInteractionRenderChild = class extends import_obsidian17.MarkdownRenderChild {
+  constructor(previewEl, enterEditMode) {
+    super(previewEl);
+    this.previewEl = previewEl;
+    this.enterEditMode = enterEditMode;
+    this.animationFrame = null;
+    this.editButton = null;
+    this.editButtonOriginalAttributes = null;
+    this.handlePreviewClick = (event) => {
+      activateEudicBlockEdit(this.previewEl, event, window.getSelection(), this.enterEditMode);
+    };
+    this.handleEditButtonKeydown = (event) => {
+      activateEudicBlockEditFromKeyboard(event, this.enterEditMode);
+    };
+  }
+  onload() {
+    this.previewEl.addEventListener("click", this.handlePreviewClick);
+    this.animationFrame = window.requestAnimationFrame(() => {
+      this.animationFrame = null;
+      const editButton = findNativeEudicBlockEditButton(this.previewEl);
+      if (!editButton) {
+        return;
+      }
+      this.editButton = editButton;
+      this.editButtonOriginalAttributes = {
+        ariaLabel: editButton.getAttribute("aria-label"),
+        role: editButton.getAttribute("role"),
+        tabindex: editButton.getAttribute("tabindex")
+      };
+      enhanceNativeEudicBlockEditButton(editButton);
+      editButton.addEventListener("keydown", this.handleEditButtonKeydown);
+    });
+  }
+  onunload() {
+    this.previewEl.removeEventListener("click", this.handlePreviewClick);
+    if (this.animationFrame !== null) {
+      window.cancelAnimationFrame(this.animationFrame);
+      this.animationFrame = null;
+    }
+    if (this.editButton) {
+      this.editButton.removeEventListener("keydown", this.handleEditButtonKeydown);
+      this.editButton.classList.remove("eudic-sync-block-edit-button");
+      if (this.editButtonOriginalAttributes) {
+        restoreOptionalAttribute(this.editButton, "aria-label", this.editButtonOriginalAttributes.ariaLabel);
+        restoreOptionalAttribute(this.editButton, "role", this.editButtonOriginalAttributes.role);
+        restoreOptionalAttribute(this.editButton, "tabindex", this.editButtonOriginalAttributes.tabindex);
+      }
+    }
+    this.editButton = null;
+    this.editButtonOriginalAttributes = null;
+  }
+};
 var AUTO_SYNC_AFTER_LEAVE_DELAY_MS = 2e3;
 var EDITOR_CHANGE_DEBOUNCE_MS = 150;
 function isMarkdownFile3(file) {
@@ -9148,7 +9289,8 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
   }
   registerMarkdownProcessors() {
     this.registerMarkdownCodeBlockProcessor(EUDIC_BLOCK_LANGUAGE, async (source, el, ctx) => {
-      const sectionText = ctx.getSectionInfo(el)?.text ?? "";
+      const sectionInfo = ctx.getSectionInfo(el);
+      const sectionText = sectionInfo?.text ?? "";
       const openingFence = findEudicBlockFenceForBody(sectionText, source);
       const embedContainer = el.closest(".markdown-embed, .internal-embed");
       if (!openingFence) {
@@ -9158,7 +9300,20 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
       el.empty();
       el.addClass("eudic-sync-block-preview");
       embedContainer?.classList.add("eudic-sync-block-embed");
-      const child = new import_obsidian17.MarkdownRenderChild(el);
+      const isLiveEudicBlock = !!el.closest(".cm-preview-code-block.cm-lang-eudic-block");
+      const enterEditMode = () => {
+        const view = this.getActiveMarkdownView();
+        if (!sectionInfo || !view?.file || (0, import_obsidian17.normalizePath)(view.file.path) !== (0, import_obsidian17.normalizePath)(ctx.sourcePath)) {
+          return false;
+        }
+        view.editor.setCursor({
+          line: Math.min(sectionInfo.lineStart + 1, sectionInfo.lineEnd),
+          ch: 0
+        });
+        view.editor.focus();
+        return true;
+      };
+      const child = isLiveEudicBlock ? new EudicBlockInteractionRenderChild(el, enterEditMode) : new import_obsidian17.MarkdownRenderChild(el);
       ctx.addChild(child);
       const semanticOptions = await this.getSemanticBlockTransformOptionsForSourcePath(
         ctx.sourcePath,
