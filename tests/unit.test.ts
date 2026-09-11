@@ -75,9 +75,11 @@ import { getSemanticSettingsSignature, SyncRenderCache } from "../src/sync-rende
 import { StartupCoordinator } from "../src/startup-coordinator";
 import { SyncService } from "../src/sync-service";
 import { EudicApiClient } from "../src/eudic-api";
+import { EudicSyncCommandController } from "../src/command-controller";
+import { getReferenceSyncCompletionNotice, selectReferenceSyncTargets } from "../src/reference-sync";
 import type { EudicStudylistCache, EudicSyncSettings } from "../src/types";
 import type { NoteOutputBlock } from "../src/note-output/model";
-import type { App, Editor, EditorPosition, TAbstractFile, TFile } from "obsidian";
+import { TFile, type App, type Editor, type EditorPosition, type TAbstractFile } from "obsidian";
 
 const presets = ["Syn.", "Syn./Cog.", "a.", "Cog."];
 
@@ -4019,3 +4021,142 @@ await startupCoordinator.run([
   },
 ]);
 assert.deepEqual(startupEvents, ["first", "after", "second", "error:second", "after", "third", "after"]);
+
+const referenceSelectionFiles = new Map<string, TFile>([
+  ["Words/a.md", new TFile("Words/a.md")],
+  ["Words/b.md", new TFile("Words/b.md")],
+  ["Words/disabled.md", new TFile("Words/disabled.md")],
+  ["Words/unrelated-dirty.md", new TFile("Words/unrelated-dirty.md")],
+  ["Words/syncing.md", new TFile("Words/syncing.md")],
+]);
+const referenceSelection = selectReferenceSyncTargets(
+  ["Words/syncing.md", "Words/b.md", "Words/missing.md", "Words/a.md", "Words/a.md", "Words/disabled.md"],
+  {
+    resolveFile: (path) => referenceSelectionFiles.get(path) ?? null,
+    canSyncFile: (file) => file.path !== "Words/disabled.md",
+    isSyncInFlight: (file) => file.path === "Words/syncing.md",
+  },
+);
+assert.equal(referenceSelection.referenced, 5);
+assert.deepEqual(referenceSelection.runnableFiles.map((file) => file.path), ["Words/a.md", "Words/b.md"]);
+assert.equal(referenceSelection.unavailable, 2);
+assert.equal(referenceSelection.alreadySyncing, 1);
+assert.equal(referenceSelection.runnableFiles.some((file) => file.path === "Words/unrelated-dirty.md"), false);
+assert.equal(
+  getReferenceSyncCompletionNotice({
+    checked: 2,
+    uploaded: 1,
+    unchanged: 1,
+    failed: 0,
+    unavailable: 2,
+    alreadySyncing: 1,
+  }),
+  "Eudic Sync: checked 2, uploaded 1, unchanged 1, failed 0, unavailable 2, already syncing 1.",
+);
+
+const registeredCommands: Array<Record<string, unknown>> = [];
+let activeCommandFile: TFile | null = new TFile("References/ref-test.md");
+let referenceCommandRuns = 0;
+let referenceMenuFile: TFile | null = null;
+let wordMenuFile: TFile | null = null;
+let fileMenuHandler: ((menu: unknown, file: TFile) => void) | null = null;
+const commandActions = new Proxy({}, {
+  get: (_target, property) => {
+    if (property === "syncCurrentReferenceWords") {
+      return async () => {
+        referenceCommandRuns += 1;
+      };
+    }
+    if (property === "syncWordsReferencingReference") {
+      return async (file: TFile) => {
+        referenceMenuFile = file;
+      };
+    }
+    if (property === "syncFile") {
+      return async (file: TFile) => {
+        wordMenuFile = file;
+      };
+    }
+    return async () => undefined;
+  },
+});
+const commandController = new EudicSyncCommandController({
+  plugin: {
+    addCommand: (command: Record<string, unknown>) => registeredCommands.push(command),
+    registerEvent: () => undefined,
+  },
+  app: {
+    workspace: {
+      getActiveFile: () => activeCommandFile,
+      on: (name: string, handler: (menu: unknown, file: TFile) => void) => {
+        if (name === "file-menu") {
+          fileMenuHandler = handler;
+        }
+        return {};
+      },
+    },
+  },
+  syncService: {
+    canSyncFile: (file: TFile) => file.path.startsWith("Words/"),
+  },
+  getActiveMarkdownFile: () => activeCommandFile,
+  getDisplayWordContext: () => null,
+  isManagedReferenceFile: (file: TFile) => file.path.startsWith("References/"),
+  actions: commandActions,
+} as never);
+commandController.registerCommands();
+const referenceCommand = registeredCommands.find((command) => command.id === "sync-current-reference-words");
+assert.ok(referenceCommand);
+assert.equal(referenceCommand.name, "Sync words referencing current Reference");
+assert.equal("hotkeys" in referenceCommand, false);
+const referenceCheckCallback = referenceCommand.checkCallback as (checking: boolean) => boolean;
+assert.equal(referenceCheckCallback(true), true);
+assert.equal(referenceCommandRuns, 0);
+assert.equal(referenceCheckCallback(false), true);
+await Promise.resolve();
+assert.equal(referenceCommandRuns, 1);
+activeCommandFile = new TFile("Words/not-a-reference.md");
+assert.equal(referenceCheckCallback(true), false);
+assert.equal(referenceCheckCallback(false), false);
+assert.equal(referenceCommandRuns, 1);
+
+commandController.registerFileMenuAction();
+assert.ok(fileMenuHandler);
+const referenceMenuItems: Array<{ title?: string; icon?: string; onClick?: () => void }> = [];
+const referenceMenu = {
+  addItem: (configure: (item: unknown) => void) => {
+    const state: { title?: string; icon?: string; onClick?: () => void } = {};
+    const item = {
+      setTitle: (title: string) => {
+        state.title = title;
+        return item;
+      },
+      setIcon: (icon: string) => {
+        state.icon = icon;
+        return item;
+      },
+      onClick: (onClick: () => void) => {
+        state.onClick = onClick;
+        return item;
+      },
+    };
+    configure(item);
+    referenceMenuItems.push(state);
+  },
+};
+const referenceMenuTarget = new TFile("References/ref-menu.md");
+fileMenuHandler(referenceMenu, referenceMenuTarget);
+assert.deepEqual(
+  referenceMenuItems.map(({ title, icon }) => ({ title, icon })),
+  [{ title: "Sync words referencing this Reference", icon: "refresh-cw" }],
+);
+referenceMenuItems[0]?.onClick?.();
+await Promise.resolve();
+assert.equal(referenceMenuFile, referenceMenuTarget);
+referenceMenuItems.length = 0;
+const wordMenuTarget = new TFile("Words/word-menu.md");
+fileMenuHandler(referenceMenu, wordMenuTarget);
+assert.deepEqual(referenceMenuItems.map(({ title }) => title), ["Sync current word"]);
+referenceMenuItems[0]?.onClick?.();
+await Promise.resolve();
+assert.equal(wordMenuFile, wordMenuTarget);

@@ -43,6 +43,7 @@ import { PathScope } from "./path-scope";
 import { PerformanceMonitor } from "./performance-monitor";
 import { ReferenceGraphService } from "./reference-index-service";
 import { resolveManagedReferencePaths } from "./reference-links";
+import { getReferenceSyncCompletionNotice, selectReferenceSyncTargets } from "./reference-sync";
 import { SemanticBlockAutomationResolver } from "./semantic-block-automation-resolver";
 import {
   activateEudicBlockEdit,
@@ -79,6 +80,7 @@ import type {
   EudicSyncStatus,
   FrontmatterMutator,
   StudylistCatalogRefreshSummary,
+  SyncBatchResult,
   WordNoteContext,
 } from "./types";
 import { EudicSyncUiController } from "./ui-controller";
@@ -94,6 +96,11 @@ import { WordStatusOverrideStore } from "./word-status";
 
 interface SuppressedWriteEntry {
   expiresAt: number;
+}
+
+interface WordBatchExecutionResult {
+  batchResult: SyncBatchResult | null;
+  alreadySyncing: number;
 }
 
 interface PendingOpenWordStatusWrite {
@@ -384,10 +391,14 @@ export default class EudicSyncPlugin extends Plugin {
       plugin: this,
       app: this.app,
       syncService: this.syncService,
+      getActiveMarkdownFile: () => this.getActiveMarkdownFile(),
       getDisplayWordContext: (file) => this.getDisplayWordContext(file),
+      isManagedReferenceFile: (file) => this.pathScope.isReferencePath(file.path),
       actions: {
         syncCurrentWord: () => this.syncCurrentWord(),
         syncAllDirtyWords: () => this.syncAllDirtyWords(),
+        syncCurrentReferenceWords: () => this.syncCurrentReferenceWords(),
+        syncWordsReferencingReference: (file) => this.syncWordsReferencingReference(file),
         resyncAliasesForCurrentWord: () => this.resyncAliasesForCurrentWord(),
         deleteCurrentWordNoteInEudic: () => this.deleteCurrentWordNoteInEudic(),
         deleteTypedWordNoteInEudic: () => this.deleteTypedWordNoteInEudic(),
@@ -1668,6 +1679,123 @@ export default class EudicSyncPlugin extends Plugin {
       .sort((left, right) => left.path.localeCompare(right.path));
   }
 
+  private async syncCurrentReferenceWords(): Promise<void> {
+    const file = this.getActiveMarkdownFile();
+    if (!file || !this.pathScope.isReferencePath(file.path)) {
+      new Notice(`${PLUGIN_NAME}: open a Reference note in the configured Reference folder first.`);
+      return;
+    }
+
+    await this.syncWordsReferencingReference(file);
+  }
+
+  private getReferenceSyncTargetSelection(wordPaths: Iterable<string>) {
+    return selectReferenceSyncTargets(wordPaths, {
+      resolveFile: (path) => this.managedFiles.getFile(path) ?? this.app.vault.getFileByPath(path),
+      canSyncFile: (file) => this.syncService.canSyncFile(file),
+      isSyncInFlight: (file) => this.syncOrchestrator.isSyncInFlight(file),
+    });
+  }
+
+  private async syncWordsReferencingReference(referenceFile: TFile): Promise<void> {
+    if (referenceFile.extension !== "md" || !this.pathScope.isReferencePath(referenceFile.path)) {
+      new Notice(`${PLUGIN_NAME}: select a Reference note in the configured Reference folder first.`);
+      return;
+    }
+
+    try {
+      const lookup = await this.referenceIndex.findWordsReferencingWithFallback(referenceFile.path, { forceScan: true });
+      const selection = this.getReferenceSyncTargetSelection(lookup.wordPaths);
+      if (selection.referenced === 0) {
+        new Notice(`${PLUGIN_NAME}: no word notes reference "${referenceFile.basename}".`);
+        return;
+      }
+      if (selection.runnableFiles.length === 0) {
+        new Notice(
+          `${PLUGIN_NAME}: no available word notes to sync for "${referenceFile.basename}" (unavailable ${selection.unavailable}, already syncing ${selection.alreadySyncing}).`,
+          8000,
+        );
+        return;
+      }
+
+      const confirmed = await confirmEudicAction(
+        this.app,
+        `Sync words referencing "${referenceFile.basename}"?`,
+        [
+          `Referenced word notes: ${selection.referenced}`,
+          `Ready to check: ${selection.runnableFiles.length}`,
+          `Unavailable or disabled: ${selection.unavailable}`,
+          `Already syncing: ${selection.alreadySyncing}`,
+          "Only final Eudic content that has changed will be uploaded.",
+          "Unrelated dirty words and studylist assignments will not be processed.",
+        ],
+        `Sync ${selection.runnableFiles.length} words`,
+      );
+      if (!confirmed) {
+        return;
+      }
+
+      const openView = this.getOpenMarkdownViewForFile(referenceFile);
+      if (openView) {
+        await openView.save();
+      }
+      this.invalidateSemanticReferenceCaches([referenceFile.path]);
+
+      const finalSelection = this.getReferenceSyncTargetSelection(lookup.wordPaths);
+      const execution = await this.runWordSyncBatch(finalSelection.runnableFiles, "sync.currentReferenceWords");
+      const batchResult = execution.batchResult;
+      new Notice(
+        getReferenceSyncCompletionNotice({
+          checked: batchResult?.total ?? 0,
+          uploaded: batchResult?.uploaded ?? 0,
+          unchanged: batchResult?.skipped ?? 0,
+          failed: batchResult?.failed ?? 0,
+          unavailable: finalSelection.unavailable,
+          alreadySyncing: finalSelection.alreadySyncing + execution.alreadySyncing,
+        }),
+        8000,
+      );
+    } catch (error) {
+      const message = toErrorMessage(error);
+      console.error(`${PLUGIN_NAME}: failed to sync words referencing ${referenceFile.path}`, error);
+      new Notice(`${PLUGIN_NAME}: failed to sync words referencing "${referenceFile.basename}": ${message}`, 8000);
+    }
+  }
+
+  private async runWordSyncBatch(files: TFile[], performanceLabel: string): Promise<WordBatchExecutionResult> {
+    const batchFiles: TFile[] = [];
+    let alreadySyncing = 0;
+    for (const file of files) {
+      if (this.syncOrchestrator.beginSync(file)) {
+        batchFiles.push(file);
+      } else {
+        alreadySyncing += 1;
+      }
+    }
+    if (batchFiles.length === 0) {
+      return { batchResult: null, alreadySyncing };
+    }
+    this.refreshUi();
+
+    try {
+      const batchResult = await this.perf.measure(performanceLabel, () => this.syncService.syncWords(batchFiles));
+      for (const result of batchResult.results) {
+        if (result.error) {
+          this.setWordBodyDirtyOverride(result.file, result.error);
+        } else {
+          this.setWordStatusOverride(result.file, "synced", null);
+          await this.captureWordCleanSignatureIfSynced(result.file);
+        }
+      }
+      return { batchResult, alreadySyncing };
+    } finally {
+      for (const file of batchFiles) {
+        this.syncOrchestrator.endSync(file);
+      }
+      this.refreshUi();
+    }
+  }
+
   private async syncAllDirtyWords(): Promise<void> {
     await this.ensureAllWordManagedFrontmatter();
     const collectedDirtyWords = await this.syncService.collectDirtyWords();
@@ -1682,39 +1810,17 @@ export default class EudicSyncPlugin extends Plugin {
       return;
     }
 
-    const batchFiles: TFile[] = [];
-    for (const file of dirtyWords) {
-      if (this.syncOrchestrator.beginSync(file)) {
-        batchFiles.push(file);
-      }
-    }
-    if (batchFiles.length === 0) {
+    const execution = await this.runWordSyncBatch(dirtyWords, "sync.allDirtyWords");
+    const batchResult = execution.batchResult;
+    if (!batchResult) {
       new Notice(`${PLUGIN_NAME}: all dirty words are already syncing.`);
       return;
     }
-    this.refreshUi();
 
-    try {
-      const batchResult = await this.perf.measure("sync.allDirtyWords", () => this.syncService.syncWords(batchFiles));
-      for (const result of batchResult.results) {
-        if (result.error) {
-          this.setWordBodyDirtyOverride(result.file, result.error);
-        } else {
-          this.setWordStatusOverride(result.file, "synced", null);
-          await this.captureWordCleanSignatureIfSynced(result.file);
-        }
-      }
-
-      const aliasSummary =
-        batchResult.aliasUploaded > 0 ? ` aliases updated ${batchResult.aliasUploaded}.` : " aliases unchanged.";
-      const summary = `${PLUGIN_NAME}: processed ${batchResult.total} dirty word(s), uploaded ${batchResult.uploaded}, unchanged ${batchResult.skipped}, failed ${batchResult.failed}.${aliasSummary}`;
-      new Notice(summary, 8000);
-    } finally {
-      for (const file of batchFiles) {
-        this.syncOrchestrator.endSync(file);
-      }
-      this.refreshUi();
-    }
+    const aliasSummary =
+      batchResult.aliasUploaded > 0 ? ` aliases updated ${batchResult.aliasUploaded}.` : " aliases unchanged.";
+    const summary = `${PLUGIN_NAME}: processed ${batchResult.total} dirty word(s), uploaded ${batchResult.uploaded}, unchanged ${batchResult.skipped}, failed ${batchResult.failed}.${aliasSummary}`;
+    new Notice(summary, 8000);
   }
 
   private async createReferenceFromSelection(): Promise<void> {

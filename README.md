@@ -31,6 +31,7 @@ The default folder examples are:
 
 - `Sync current word`
 - `Sync all dirty words`
+- `Sync words referencing current Reference`
 - `Refresh Eudic studylists`
 - `Pull studylist assignments from Eudic`
 - `Push all dirty studylist assignments to Eudic`
@@ -41,6 +42,8 @@ The default folder examples are:
 - `Extract current Eudic block to reference`
 - `Wrap selection as Eudic block`
 - `Insert Eudic block`
+
+`Sync words referencing current Reference` is available while a managed Reference note is active and from the Reference file menu. It checks only word notes that embed that Reference, uploads only changed final Eudic content, and does not process unrelated dirty words or studylist assignments. The plugin does not assign a default hotkey; you can bind one in Obsidian's Hotkeys settings.
 
 ## Blank lines in synced notes
 
@@ -132,6 +135,7 @@ Eudic Sync 是一个 Obsidian 插件，用于管理英语单词笔记，并将�
 
 - `Sync current word`
 - `Sync all dirty words`
+- `Sync words referencing current Reference`
 - `Refresh Eudic studylists`
 - `Pull studylist assignments from Eudic`
 - `Push all dirty studylist assignments to Eudic`
@@ -142,6 +146,8 @@ Eudic Sync 是一个 Obsidian 插件，用于管理英语单词笔记，并将�
 - `Extract current Eudic block to reference`
 - `Wrap selection as Eudic block`
 - `Insert Eudic block`
+
+当受管理的 Reference 笔记处于活动状态时，可以从命令面板执行 `Sync words referencing current Reference`，也可以从该 Reference 文件的右键菜单执行。它只检查嵌入了当前 Reference 的词条，只上传最终欧路内容发生变化的词条，不处理无关的 dirty 词条或生词本归属。插件不预设快捷键；可在 Obsidian 的快捷键设置中自行绑定。
 
 ## 同步后的空行规则
 

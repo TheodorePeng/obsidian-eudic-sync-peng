@@ -508,6 +508,18 @@ var EudicSyncCommandController = class {
       }
     });
     this.options.plugin.addCommand({
+      id: "sync-current-reference-words",
+      name: "Sync words referencing current Reference",
+      checkCallback: (checking) => {
+        const file = this.options.getActiveMarkdownFile();
+        const canRun = !!file && this.options.isManagedReferenceFile(file);
+        if (canRun && !checking) {
+          void this.options.actions.syncCurrentReferenceWords();
+        }
+        return canRun;
+      }
+    });
+    this.options.plugin.addCommand({
       id: "resync-aliases-for-current-word",
       name: "Resync aliases for current word",
       callback: () => {
@@ -668,15 +680,22 @@ var EudicSyncCommandController = class {
         if (!isMarkdownFile(file)) {
           return;
         }
-        if (!this.options.syncService.canSyncFile(file)) {
+        if (this.options.syncService.canSyncFile(file)) {
+          menu.addItem((item) => {
+            const context = this.options.getDisplayWordContext(file);
+            item.setTitle("Sync current word").setIcon(getStatusIcon(context?.effectiveStatus ?? "dirty")).onClick(() => {
+              void this.options.actions.syncFile(file, { force: true, source: "manual" });
+            });
+          });
           return;
         }
-        menu.addItem((item) => {
-          const context = this.options.getDisplayWordContext(file);
-          item.setTitle("Sync current word").setIcon(getStatusIcon(context?.effectiveStatus ?? "dirty")).onClick(() => {
-            void this.options.actions.syncFile(file, { force: true, source: "manual" });
+        if (this.options.isManagedReferenceFile(file)) {
+          menu.addItem((item) => {
+            item.setTitle("Sync words referencing this Reference").setIcon("refresh-cw").onClick(() => {
+              void this.options.actions.syncWordsReferencingReference(file);
+            });
           });
-        });
+        }
       })
     );
   }
@@ -3217,6 +3236,42 @@ var ReferenceGraphService = class {
     return files;
   }
 };
+
+// src/reference-sync.ts
+function selectReferenceSyncTargets(wordPaths, options) {
+  const paths = Array.from(new Set(wordPaths)).sort((left, right) => left.localeCompare(right));
+  const runnableFiles = [];
+  let unavailable = 0;
+  let alreadySyncing = 0;
+  for (const path of paths) {
+    const file = options.resolveFile(path);
+    if (!file || !options.canSyncFile(file)) {
+      unavailable += 1;
+      continue;
+    }
+    if (options.isSyncInFlight(file)) {
+      alreadySyncing += 1;
+      continue;
+    }
+    runnableFiles.push(file);
+  }
+  return {
+    referenced: paths.length,
+    runnableFiles,
+    unavailable,
+    alreadySyncing
+  };
+}
+function getReferenceSyncCompletionNotice(summary) {
+  return [
+    `Eudic Sync: checked ${summary.checked}`,
+    `uploaded ${summary.uploaded}`,
+    `unchanged ${summary.unchanged}`,
+    `failed ${summary.failed}`,
+    `unavailable ${summary.unavailable}`,
+    `already syncing ${summary.alreadySyncing}.`
+  ].join(", ");
+}
 
 // src/semantic-block-automation-resolver.ts
 function normalizeResolverPath(path) {
@@ -9211,10 +9266,14 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
       plugin: this,
       app: this.app,
       syncService: this.syncService,
+      getActiveMarkdownFile: () => this.getActiveMarkdownFile(),
       getDisplayWordContext: (file) => this.getDisplayWordContext(file),
+      isManagedReferenceFile: (file) => this.pathScope.isReferencePath(file.path),
       actions: {
         syncCurrentWord: () => this.syncCurrentWord(),
         syncAllDirtyWords: () => this.syncAllDirtyWords(),
+        syncCurrentReferenceWords: () => this.syncCurrentReferenceWords(),
+        syncWordsReferencingReference: (file) => this.syncWordsReferencingReference(file),
         resyncAliasesForCurrentWord: () => this.resyncAliasesForCurrentWord(),
         deleteCurrentWordNoteInEudic: () => this.deleteCurrentWordNoteInEudic(),
         deleteTypedWordNoteInEudic: () => this.deleteTypedWordNoteInEudic(),
@@ -10323,6 +10382,113 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
     const referencePaths = new Set(resolveManagedReferencePaths(this.app, this.pathScope, file, markdown));
     return Array.from(referencePaths).map((referencePath) => this.managedFiles.getFile(referencePath) ?? this.app.vault.getFileByPath(referencePath)).filter((referenceFile) => !!referenceFile && this.pathScope.isReferencePath(referenceFile.path)).sort((left, right) => left.path.localeCompare(right.path));
   }
+  async syncCurrentReferenceWords() {
+    const file = this.getActiveMarkdownFile();
+    if (!file || !this.pathScope.isReferencePath(file.path)) {
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: open a Reference note in the configured Reference folder first.`);
+      return;
+    }
+    await this.syncWordsReferencingReference(file);
+  }
+  getReferenceSyncTargetSelection(wordPaths) {
+    return selectReferenceSyncTargets(wordPaths, {
+      resolveFile: (path) => this.managedFiles.getFile(path) ?? this.app.vault.getFileByPath(path),
+      canSyncFile: (file) => this.syncService.canSyncFile(file),
+      isSyncInFlight: (file) => this.syncOrchestrator.isSyncInFlight(file)
+    });
+  }
+  async syncWordsReferencingReference(referenceFile) {
+    if (referenceFile.extension !== "md" || !this.pathScope.isReferencePath(referenceFile.path)) {
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: select a Reference note in the configured Reference folder first.`);
+      return;
+    }
+    try {
+      const lookup = await this.referenceIndex.findWordsReferencingWithFallback(referenceFile.path, { forceScan: true });
+      const selection = this.getReferenceSyncTargetSelection(lookup.wordPaths);
+      if (selection.referenced === 0) {
+        new import_obsidian17.Notice(`${PLUGIN_NAME}: no word notes reference "${referenceFile.basename}".`);
+        return;
+      }
+      if (selection.runnableFiles.length === 0) {
+        new import_obsidian17.Notice(
+          `${PLUGIN_NAME}: no available word notes to sync for "${referenceFile.basename}" (unavailable ${selection.unavailable}, already syncing ${selection.alreadySyncing}).`,
+          8e3
+        );
+        return;
+      }
+      const confirmed = await confirmEudicAction(
+        this.app,
+        `Sync words referencing "${referenceFile.basename}"?`,
+        [
+          `Referenced word notes: ${selection.referenced}`,
+          `Ready to check: ${selection.runnableFiles.length}`,
+          `Unavailable or disabled: ${selection.unavailable}`,
+          `Already syncing: ${selection.alreadySyncing}`,
+          "Only final Eudic content that has changed will be uploaded.",
+          "Unrelated dirty words and studylist assignments will not be processed."
+        ],
+        `Sync ${selection.runnableFiles.length} words`
+      );
+      if (!confirmed) {
+        return;
+      }
+      const openView = this.getOpenMarkdownViewForFile(referenceFile);
+      if (openView) {
+        await openView.save();
+      }
+      this.invalidateSemanticReferenceCaches([referenceFile.path]);
+      const finalSelection = this.getReferenceSyncTargetSelection(lookup.wordPaths);
+      const execution = await this.runWordSyncBatch(finalSelection.runnableFiles, "sync.currentReferenceWords");
+      const batchResult = execution.batchResult;
+      new import_obsidian17.Notice(
+        getReferenceSyncCompletionNotice({
+          checked: batchResult?.total ?? 0,
+          uploaded: batchResult?.uploaded ?? 0,
+          unchanged: batchResult?.skipped ?? 0,
+          failed: batchResult?.failed ?? 0,
+          unavailable: finalSelection.unavailable,
+          alreadySyncing: finalSelection.alreadySyncing + execution.alreadySyncing
+        }),
+        8e3
+      );
+    } catch (error) {
+      const message = toErrorMessage7(error);
+      console.error(`${PLUGIN_NAME}: failed to sync words referencing ${referenceFile.path}`, error);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: failed to sync words referencing "${referenceFile.basename}": ${message}`, 8e3);
+    }
+  }
+  async runWordSyncBatch(files, performanceLabel) {
+    const batchFiles = [];
+    let alreadySyncing = 0;
+    for (const file of files) {
+      if (this.syncOrchestrator.beginSync(file)) {
+        batchFiles.push(file);
+      } else {
+        alreadySyncing += 1;
+      }
+    }
+    if (batchFiles.length === 0) {
+      return { batchResult: null, alreadySyncing };
+    }
+    this.refreshUi();
+    try {
+      const batchResult = await this.perf.measure(performanceLabel, () => this.syncService.syncWords(batchFiles));
+      for (const result of batchResult.results) {
+        if (result.error) {
+          this.setWordBodyDirtyOverride(result.file, result.error);
+        } else {
+          this.setWordStatusOverride(result.file, "synced", null);
+          await this.captureWordCleanSignatureIfSynced(result.file);
+        }
+      }
+      return { batchResult, alreadySyncing };
+    } finally {
+      for (const file of batchFiles) {
+        this.syncOrchestrator.endSync(file);
+      }
+      this.refreshUi();
+    }
+  }
   async syncAllDirtyWords() {
     await this.ensureAllWordManagedFrontmatter();
     const collectedDirtyWords = await this.syncService.collectDirtyWords();
@@ -10335,36 +10501,15 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
       new import_obsidian17.Notice(`${PLUGIN_NAME}: all dirty words are already syncing.`);
       return;
     }
-    const batchFiles = [];
-    for (const file of dirtyWords) {
-      if (this.syncOrchestrator.beginSync(file)) {
-        batchFiles.push(file);
-      }
-    }
-    if (batchFiles.length === 0) {
+    const execution = await this.runWordSyncBatch(dirtyWords, "sync.allDirtyWords");
+    const batchResult = execution.batchResult;
+    if (!batchResult) {
       new import_obsidian17.Notice(`${PLUGIN_NAME}: all dirty words are already syncing.`);
       return;
     }
-    this.refreshUi();
-    try {
-      const batchResult = await this.perf.measure("sync.allDirtyWords", () => this.syncService.syncWords(batchFiles));
-      for (const result of batchResult.results) {
-        if (result.error) {
-          this.setWordBodyDirtyOverride(result.file, result.error);
-        } else {
-          this.setWordStatusOverride(result.file, "synced", null);
-          await this.captureWordCleanSignatureIfSynced(result.file);
-        }
-      }
-      const aliasSummary = batchResult.aliasUploaded > 0 ? ` aliases updated ${batchResult.aliasUploaded}.` : " aliases unchanged.";
-      const summary = `${PLUGIN_NAME}: processed ${batchResult.total} dirty word(s), uploaded ${batchResult.uploaded}, unchanged ${batchResult.skipped}, failed ${batchResult.failed}.${aliasSummary}`;
-      new import_obsidian17.Notice(summary, 8e3);
-    } finally {
-      for (const file of batchFiles) {
-        this.syncOrchestrator.endSync(file);
-      }
-      this.refreshUi();
-    }
+    const aliasSummary = batchResult.aliasUploaded > 0 ? ` aliases updated ${batchResult.aliasUploaded}.` : " aliases unchanged.";
+    const summary = `${PLUGIN_NAME}: processed ${batchResult.total} dirty word(s), uploaded ${batchResult.uploaded}, unchanged ${batchResult.skipped}, failed ${batchResult.failed}.${aliasSummary}`;
+    new import_obsidian17.Notice(summary, 8e3);
   }
   async createReferenceFromSelection() {
     await this.withActiveWordView(async (view) => {

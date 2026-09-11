@@ -7,6 +7,8 @@ import type { WordNoteContext } from "./types";
 interface CommandControllerActions {
   syncCurrentWord: () => Promise<void>;
   syncAllDirtyWords: () => Promise<void>;
+  syncCurrentReferenceWords: () => Promise<void>;
+  syncWordsReferencingReference: (file: TFile) => Promise<void>;
   resyncAliasesForCurrentWord: () => Promise<void>;
   deleteCurrentWordNoteInEudic: () => Promise<void>;
   deleteTypedWordNoteInEudic: () => Promise<void>;
@@ -36,7 +38,9 @@ interface CommandControllerOptions {
   plugin: Plugin;
   app: App;
   syncService: Pick<SyncService, "canSyncFile">;
+  getActiveMarkdownFile: () => TFile | null;
   getDisplayWordContext: (file: TFile) => WordNoteContext | null;
+  isManagedReferenceFile: (file: TFile) => boolean;
   actions: CommandControllerActions;
 }
 
@@ -61,6 +65,19 @@ export class EudicSyncCommandController {
       name: "Sync all dirty words",
       callback: () => {
         void this.options.actions.syncAllDirtyWords();
+      },
+    });
+
+    this.options.plugin.addCommand({
+      id: "sync-current-reference-words",
+      name: "Sync words referencing current Reference",
+      checkCallback: (checking) => {
+        const file = this.options.getActiveMarkdownFile();
+        const canRun = !!file && this.options.isManagedReferenceFile(file);
+        if (canRun && !checking) {
+          void this.options.actions.syncCurrentReferenceWords();
+        }
+        return canRun;
       },
     });
 
@@ -248,19 +265,29 @@ export class EudicSyncCommandController {
           return;
         }
 
-        if (!this.options.syncService.canSyncFile(file)) {
+        if (this.options.syncService.canSyncFile(file)) {
+          menu.addItem((item) => {
+            const context = this.options.getDisplayWordContext(file);
+            item
+              .setTitle("Sync current word")
+              .setIcon(getStatusIcon(context?.effectiveStatus ?? "dirty"))
+              .onClick(() => {
+                void this.options.actions.syncFile(file, { force: true, source: "manual" });
+              });
+          });
           return;
         }
 
-        menu.addItem((item) => {
-          const context = this.options.getDisplayWordContext(file);
-          item
-            .setTitle("Sync current word")
-            .setIcon(getStatusIcon(context?.effectiveStatus ?? "dirty"))
-            .onClick(() => {
-              void this.options.actions.syncFile(file, { force: true, source: "manual" });
-            });
-        });
+        if (this.options.isManagedReferenceFile(file)) {
+          menu.addItem((item) => {
+            item
+              .setTitle("Sync words referencing this Reference")
+              .setIcon("refresh-cw")
+              .onClick(() => {
+                void this.options.actions.syncWordsReferencingReference(file);
+              });
+          });
+        }
       }),
     );
   }
