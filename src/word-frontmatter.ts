@@ -35,6 +35,7 @@ interface EnsureWordFrontmatterOptions {
   trigger?: ManagedWordReconcileTrigger;
   defaultStudylists?: EudicStudylistCategory[];
   studylistCatalog?: EudicStudylistCategory[];
+  markdown?: string;
 }
 
 interface ReconcileManagedWordMarkdownOptions {
@@ -314,7 +315,7 @@ export async function ensureManagedWordProperties(
   const { app, file, writeFrontmatter } = options;
   const reconciled = reconcileManagedWordMarkdown({
     file,
-    markdown: await app.vault.cachedRead(file),
+    markdown: options.markdown ?? await app.vault.cachedRead(file),
     ensureEudicUri: options.ensureEudicUri,
     trigger: options.trigger,
     defaultStudylists: options.defaultStudylists,

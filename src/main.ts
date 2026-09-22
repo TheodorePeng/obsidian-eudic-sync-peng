@@ -11,6 +11,7 @@ import {
   normalizePath,
 } from "obsidian";
 import { createAutoBoldMarkersExtension } from "./auto-bold-markers-extension";
+import { forEachIsolated } from "./batch-file-runner";
 import { EudicSyncCommandController } from "./command-controller";
 import { DEFAULT_SETTINGS, FRONTMATTER_KEYS, NOTE_OUTPUT_FORMAT_VERSION, PLUGIN_NAME, SUPPRESSED_WRITE_TTL_MS } from "./constants";
 import {
@@ -38,6 +39,7 @@ import { ReferenceNoteService, hasPendingReferenceBlocks } from "./reference-not
 import { formatBoldMarkersInMarkdown } from "./markdown-bold-markers";
 import { waitForCachedFrontmatterString } from "./frontmatter-cache-settle";
 import { ManagedFileRegistry } from "./managed-file-registry";
+import { ManagedIndexCoordinator, type ManagedIndexDiagnostics } from "./managed-index-coordinator";
 import { getFrontmatter, readNullableString } from "./note-metadata";
 import { PathScope } from "./path-scope";
 import { PerformanceMonitor } from "./performance-monitor";
@@ -54,6 +56,7 @@ import {
 import type { SemanticBlockTransformOptions } from "./semantic-block-transform";
 import { EudicSyncSettingTab } from "./settings";
 import { migrateLoadedSettings, refreshSelectedStudylistSnapshots } from "./settings-data";
+import { classifySettingsImpact } from "./settings-impact";
 import { SerialTaskQueue } from "./serial-task-queue";
 import { EudicSyncSaveHookController } from "./save-hook-controller";
 import { StudylistService } from "./studylist-service";
@@ -252,6 +255,8 @@ export default class EudicSyncPlugin extends Plugin {
 
   private readonly pathScope = new PathScope(DEFAULT_SETTINGS);
   private readonly managedFiles = new ManagedFileRegistry(this.app, this.pathScope);
+  private readonly startupWordMarkdown = new Map<string, string>();
+  private captureStartupWordMarkdown = false;
   private readonly perf = new PerformanceMonitor();
   private readonly referenceIndex = new ReferenceGraphService({
     app: this.app,
@@ -261,6 +266,34 @@ export default class EudicSyncPlugin extends Plugin {
       await this.writeFrontmatter(file, mutate);
     },
     getReferenceMetadataWriteMode: () => this.settings.referenceMetadataWriteMode,
+    onWordRead: (file, markdown) => {
+      if (this.captureStartupWordMarkdown) {
+        this.startupWordMarkdown.set(normalizePath(file.path), markdown);
+      }
+    },
+  });
+  private readonly managedIndexCoordinator = new ManagedIndexCoordinator({
+    rebuildRegistry: () => this.managedFiles.rebuild(),
+    getRegistryCounts: () => ({
+      wordCount: this.managedFiles.getWordFiles().length,
+      referenceCount: this.managedFiles.getReferenceFiles().length,
+    }),
+    getVaultCounts: () => {
+      let wordCount = 0;
+      let referenceCount = 0;
+      for (const file of this.app.vault.getMarkdownFiles()) {
+        if (this.pathScope.isWordPath(file.path)) {
+          wordCount += 1;
+        } else if (this.pathScope.isReferencePath(file.path)) {
+          referenceCount += 1;
+        }
+      }
+      return { wordCount, referenceCount };
+    },
+    rebuildGraph: (shouldCommit) =>
+      this.perf.measure("reference.rebuildAll", () => this.referenceIndex.rebuildAll(shouldCommit)),
+    updateWord: (file, markdown) => this.referenceIndex.updateWord(file, markdown),
+    removeWord: (path) => this.referenceIndex.removeWord(path),
   });
   private readonly startupCoordinator = new StartupCoordinator({
     isUnloaded: () => this.isUnloaded,
@@ -283,7 +316,7 @@ export default class EudicSyncPlugin extends Plugin {
   private readonly wordSyncSignatures = new Map<string, string>();
   private readonly wordCleanSyncSignatures = new Map<string, string>();
   private readonly pendingOpenWordStatusWrites = new Map<string, PendingOpenWordStatusWrite>();
-  private readonly wordLifecycleQueue = new SerialTaskQueue<TFile>();
+  private readonly wordLifecycleQueue = new SerialTaskQueue<string>();
   private readonly flushingOpenWordStatusWritePaths = new Set<string>();
   private readonly editorChangeTimers = new Map<string, number>();
   private readonly autoBodyDirtyPaths = new Set<string>();
@@ -295,6 +328,8 @@ export default class EudicSyncPlugin extends Plugin {
   private lastActiveWordPath: string | null = null;
   private startupKnownPathClearTimer: number | null = null;
   private isUnloaded = false;
+  private settingsSaveQueue: Promise<void> = Promise.resolve();
+  private activeBatchAbortController: AbortController | null = null;
   private referenceNoteService!: ReferenceNoteService;
   private syncService!: SyncService;
   private studylistService!: StudylistService;
@@ -307,8 +342,6 @@ export default class EudicSyncPlugin extends Plugin {
   async onload(): Promise<void> {
     this.isUnloaded = false;
     await this.loadSettings();
-    this.managedFiles.rebuild();
-    this.captureStartupKnownPaths();
 
     this.referenceNoteService = new ReferenceNoteService(this.app, this.pathScope);
     this.syncService = new SyncService({
@@ -367,15 +400,7 @@ export default class EudicSyncPlugin extends Plugin {
       plugin: this,
       isUnloaded: () => this.isUnloaded,
       onLayoutReady: () => {
-        this.lastActiveWordPath = this.getActiveWordPath();
-        const activeFile = this.getActiveMarkdownFile();
-        if (activeFile && this.pathScope.isWordPath(activeFile.path)) {
-          void this.enqueueWordLifecycle(activeFile, () =>
-            this.ensureManagedWordProperties(activeFile, { ensureEudicUri: false, trigger: "touch" }),
-          ).catch((error) => this.reportWordReconcileError("layout-ready", activeFile, error));
-        }
-        this.scheduleStartupKnownPathClear();
-        this.runStartupTasks();
+        void this.initializeAfterLayoutReady();
       },
       onEditorChange: (file, markdown, editor) => this.handleEditorChange(file, markdown, editor),
       onModify: (file) => this.handleModify(file),
@@ -448,6 +473,10 @@ export default class EudicSyncPlugin extends Plugin {
 
   onunload(): void {
     this.isUnloaded = true;
+    this.activeBatchAbortController?.abort();
+    this.activeBatchAbortController = null;
+    this.managedIndexCoordinator.cancel();
+    this.startupWordMarkdown.clear();
     this.clearStartupKnownPathTimer();
     this.clearAutoSyncTimers();
     this.clearEditorChangeTimers();
@@ -458,26 +487,41 @@ export default class EudicSyncPlugin extends Plugin {
 
   async updateSettings(partial: Partial<EudicSyncSettings>): Promise<void> {
     const previousSettings = this.settings;
-    this.settings = Object.assign({}, this.settings, partial);
-    this.pathScope.updateSettings(this.settings);
-    this.managedFiles.rebuild();
-    this.invalidateSemanticReferenceCaches();
-    await this.saveData(this.settings);
-    await this.rebuildReferenceIndex();
-    this.studylistService.captureAllLocalSnapshots();
+    const nextSettings = Object.assign({}, this.settings, partial);
+    const impact = classifySettingsImpact(previousSettings, nextSettings);
+    if (impact.changedKeys.length === 0) {
+      return;
+    }
 
-    if (previousSettings.enableAutoSyncWordOnLeave && !this.settings.enableAutoSyncWordOnLeave) {
+    this.settings = nextSettings;
+    if (impact.rebuildManagedIndex) {
+      this.pathScope.updateSettings(this.settings);
+    }
+    await this.enqueueSettingsSave(nextSettings);
+
+    if (impact.invalidateRenderCache) {
+      this.invalidateSemanticReferenceCaches();
+    }
+    if (impact.rebuildManagedIndex) {
+      await this.managedIndexCoordinator.rebuild("settings-scope-change");
+    }
+    if (impact.refreshStudylistSnapshots) {
+      this.studylistService.captureAllLocalSnapshots();
+    }
+    if (impact.clearAutoSyncTimers) {
       this.clearAutoSyncTimers();
     }
 
-    if (previousSettings.noteOutputMode !== this.settings.noteOutputMode) {
+    if (impact.markAllWordsDirty) {
       const markedCount = await this.markAllSyncWordsDirty();
       new Notice(
         `${PLUGIN_NAME}: note output mode changed to ${this.settings.noteOutputMode}. Marked ${markedCount} word(s) dirty.`,
       );
     }
 
-    this.refreshUi();
+    if (impact.refreshUi) {
+      this.refreshUi();
+    }
   }
 
   private registerMarkdownProcessors(): void {
@@ -570,6 +614,54 @@ export default class EudicSyncPlugin extends Plugin {
     this.vaultEventController.registerOnLayoutReady();
   }
 
+  getManagedIndexDiagnostics(): ManagedIndexDiagnostics {
+    return this.managedIndexCoordinator.getDiagnostics();
+  }
+
+  getOptimizationDiagnostics(): {
+    managedIndex: ManagedIndexDiagnostics;
+    referenceGraph: ReturnType<ReferenceGraphService["getDiagnostics"]>;
+    renderCache: ReturnType<SyncService["getRenderCacheDiagnostics"]> | null;
+  } {
+    return {
+      managedIndex: this.managedIndexCoordinator.getDiagnostics(),
+      referenceGraph: this.referenceIndex.getDiagnostics(),
+      renderCache: this.syncService ? this.syncService.getRenderCacheDiagnostics() : null,
+    };
+  }
+
+  private async initializeAfterLayoutReady(): Promise<void> {
+    this.startupWordMarkdown.clear();
+    this.captureStartupWordMarkdown = true;
+    try {
+      await this.managedIndexCoordinator.rebuild("layout-ready");
+    } catch (error) {
+      if (this.isUnloaded) {
+        return;
+      }
+      this.startupWordMarkdown.clear();
+      console.error(`${PLUGIN_NAME}: failed to initialize managed index`, error);
+      new Notice(`${PLUGIN_NAME}: managed index initialization failed: ${toErrorMessage(error)}`, 8000);
+      return;
+    } finally {
+      this.captureStartupWordMarkdown = false;
+    }
+
+    if (this.isUnloaded) {
+      return;
+    }
+    this.captureStartupKnownPaths();
+    this.lastActiveWordPath = this.getActiveWordPath();
+    const activeFile = this.getActiveMarkdownFile();
+    if (activeFile && this.pathScope.isWordPath(activeFile.path)) {
+      void this.enqueueWordLifecycle(activeFile, () =>
+        this.ensureManagedWordProperties(activeFile, { ensureEudicUri: false, trigger: "touch" }),
+      ).catch((error) => this.reportWordReconcileError("layout-ready", activeFile, error));
+    }
+    this.scheduleStartupKnownPathClear();
+    this.runStartupTasks();
+  }
+
   private runStartupTasks(): void {
     void this.startupCoordinator.run(this.getStartupTasks()).then(() => {
       if (this.isUnloaded) {
@@ -603,10 +695,6 @@ export default class EudicSyncPlugin extends Plugin {
         label: "startup.captureWordSyncSignatures",
         run: () => this.captureWordSyncSignatures(),
       },
-      {
-        label: "startup.rebuildReferenceIndex",
-        run: () => this.rebuildReferenceIndex(),
-      },
     ];
   }
 
@@ -639,20 +727,10 @@ export default class EudicSyncPlugin extends Plugin {
     this.startupKnownPathClearTimer = null;
   }
 
-  private async rebuildReferenceIndex(): Promise<void> {
-    try {
-      this.invalidateSemanticReferenceCaches();
-      await this.perf.measure("reference.rebuildAll", () => this.referenceIndex.rebuildAll());
-    } catch (error) {
-      console.error(`${PLUGIN_NAME}: failed to rebuild reference index`, error);
-      new Notice(`${PLUGIN_NAME}: failed to rebuild Reference index: ${toErrorMessage(error)}`, 8000);
-    }
-  }
-
   private async rebuildReferenceIndexManually(): Promise<void> {
     try {
       this.invalidateSemanticReferenceCaches();
-      await this.perf.measure("reference.rebuildAll.manual", () => this.referenceIndex.rebuildAll());
+      await this.perf.measure("reference.rebuildAll.manual", () => this.managedIndexCoordinator.rebuild("manual"));
       new Notice(`${PLUGIN_NAME}: rebuilt Reference graph.`);
       this.refreshUi();
     } catch (error) {
@@ -746,13 +824,23 @@ export default class EudicSyncPlugin extends Plugin {
     }
   }
 
+  private enqueueSettingsSave(settings: EudicSyncSettings): Promise<void> {
+    const snapshot = JSON.parse(JSON.stringify(settings)) as EudicSyncSettings;
+    const save = this.settingsSaveQueue.then(() => this.saveData(snapshot));
+    this.settingsSaveQueue = save.catch((error) => {
+      console.error(`${PLUGIN_NAME}: failed to save settings`, error);
+      new Notice(`${PLUGIN_NAME}: failed to save settings: ${toErrorMessage(error)}`, 8000);
+    });
+    return save;
+  }
+
   private async setStudylistCache(cache: EudicStudylistCache): Promise<void> {
     const newWordDefaultStudylists = refreshSelectedStudylistSnapshots(
       this.settings.newWordDefaultStudylists,
       cache,
     );
     this.settings = Object.assign({}, this.settings, { studylistCache: cache, newWordDefaultStudylists });
-    await this.saveData(this.settings);
+    await this.enqueueSettingsSave(this.settings);
   }
 
   private async ensureCurrentNoteOutputFormatVersion(): Promise<void> {
@@ -764,7 +852,7 @@ export default class EudicSyncPlugin extends Plugin {
     this.settings = Object.assign({}, this.settings, {
       noteOutputFormatVersion: NOTE_OUTPUT_FORMAT_VERSION,
     });
-    await this.saveData(this.settings);
+    await this.enqueueSettingsSave(this.settings);
     this.startupNotices.push(
       `${PLUGIN_NAME}: final note output format upgraded to v${NOTE_OUTPUT_FORMAT_VERSION}. Marked ${markedCount} word(s) dirty.`,
     );
@@ -774,14 +862,15 @@ export default class EudicSyncPlugin extends Plugin {
     this.wordSyncSignatures.clear();
     this.wordCleanSyncSignatures.clear();
     for (const file of this.managedFiles.getWordFiles()) {
-      const markdown = await this.app.vault.cachedRead(file);
-      const signature = getWordSyncSignature(markdown);
       const normalizedPath = normalizePath(file.path);
+      const markdown = this.startupWordMarkdown.get(normalizedPath) ?? await this.app.vault.cachedRead(file);
+      const signature = getWordSyncSignature(markdown);
       this.wordSyncSignatures.set(normalizedPath, signature);
       if (this.syncService.getWordContext(file)?.bodyStatus === "synced") {
         this.wordCleanSyncSignatures.set(normalizedPath, signature);
       }
     }
+    this.startupWordMarkdown.clear();
   }
 
   private async captureWordCleanSignatureIfSynced(file: TFile): Promise<void> {
@@ -939,12 +1028,13 @@ export default class EudicSyncPlugin extends Plugin {
     }
 
     if (this.pathScope.isWordPath(file.path)) {
+      this.syncService.invalidateWordRenderCache(file.path);
       const markdown = await this.app.vault.cachedRead(file);
       const normalizedPath = normalizePath(file.path);
       const isOpenWord = this.isMarkdownFileOpen(file);
       const nextWordSyncSignature = getWordSyncSignature(markdown);
       await this.studylistService.handleWordModify(file, markdown);
-      const result = await this.referenceIndex.updateWord(file, markdown);
+      const result = await this.managedIndexCoordinator.updateWord(file, markdown);
       this.scheduleReferenceUsageRefresh(result.affectedReferencePaths);
 
       if (result.disabled) {
@@ -976,11 +1066,12 @@ export default class EudicSyncPlugin extends Plugin {
     }
 
     if (this.pathScope.isReferencePath(file.path)) {
+      await this.managedIndexCoordinator.ensureReady();
       const isOpenReference = this.isMarkdownFileOpen(file);
       if (!isOpenReference) {
         await this.ensureReferenceManagedFrontmatter(file);
       }
-      const lookup = await this.referenceIndex.findWordsReferencingWithFallback(file.path, { forceScan: true });
+      const lookup = await this.referenceIndex.findWordsReferencingWithFallback(file.path);
       await this.markWordsDirtyByPaths(lookup.wordPaths);
       this.invalidateSemanticReferenceCaches(lookup.affectedReferencePaths);
       this.refreshUi();
@@ -1037,16 +1128,17 @@ export default class EudicSyncPlugin extends Plugin {
     }
 
     if (this.pathScope.isWordPath(file.path)) {
+      this.syncService.invalidateWordRenderCache(file.path);
       const ensured = await this.ensureManagedWordProperties(file, { trigger: "create" });
 
       if (ensured.skipped) {
-        const affectedReferencePaths = this.referenceIndex.removeWord(file.path);
+        const affectedReferencePaths = await this.managedIndexCoordinator.removeWord(file.path);
         this.scheduleReferenceUsageRefresh(affectedReferencePaths);
         this.refreshUi();
         return;
       }
 
-      const result = await this.referenceIndex.updateWord(file, ensured.markdown);
+      const result = await this.managedIndexCoordinator.updateWord(file, ensured.markdown);
       await this.studylistService.handleWordModify(file, ensured.markdown);
       this.scheduleReferenceUsageRefresh(result.affectedReferencePaths);
       await this.syncService.markWordDirty(file);
@@ -1057,8 +1149,9 @@ export default class EudicSyncPlugin extends Plugin {
     }
 
     if (this.pathScope.isReferencePath(file.path)) {
+      await this.managedIndexCoordinator.ensureReady();
       await this.ensureReferenceManagedFrontmatter(file);
-      const lookup = await this.referenceIndex.findWordsReferencingWithFallback(file.path, { forceScan: true });
+      const lookup = await this.referenceIndex.findWordsReferencingWithFallback(file.path);
       await this.markWordsDirtyByPaths(lookup.wordPaths);
       this.invalidateSemanticReferenceCaches(lookup.affectedReferencePaths);
       this.refreshUi();
@@ -1090,7 +1183,8 @@ export default class EudicSyncPlugin extends Plugin {
     }
 
     if (this.pathScope.isWordPath(normalizedPath)) {
-      const affectedReferencePaths = this.referenceIndex.removeWord(normalizedPath);
+      this.syncService.invalidateWordRenderCache(normalizedPath);
+      const affectedReferencePaths = await this.managedIndexCoordinator.removeWord(normalizedPath);
       await this.refreshReferenceUsage(affectedReferencePaths);
       this.clearWordStatusOverride(normalizedPath);
       if (this.lastActiveWordPath === normalizedPath) {
@@ -1116,6 +1210,7 @@ export default class EudicSyncPlugin extends Plugin {
     let shouldRepairAffectedReferenceMetadata = false;
 
     if (this.pathScope.isReferencePath(normalizedOldPath)) {
+      await this.managedIndexCoordinator.ensureReady();
       const lookup = await this.referenceIndex.findWordsReferencingWithFallback(normalizedOldPath);
       for (const wordPath of lookup.wordPaths) {
         impactedWordPaths.add(wordPath);
@@ -1126,7 +1221,8 @@ export default class EudicSyncPlugin extends Plugin {
     }
 
     if (this.pathScope.isWordPath(normalizedOldPath)) {
-      for (const referencePath of this.referenceIndex.removeWord(normalizedOldPath)) {
+      this.syncService.invalidateWordRenderCache(normalizedOldPath);
+      for (const referencePath of await this.managedIndexCoordinator.removeWord(normalizedOldPath)) {
         affectedReferencePaths.add(referencePath);
       }
       shouldRepairAffectedReferenceMetadata = true;
@@ -1140,9 +1236,10 @@ export default class EudicSyncPlugin extends Plugin {
     this.clearPendingOpenWordStatusWrite(normalizedOldPath);
 
     if (isMarkdownFile(file) && this.pathScope.isWordPath(normalizedNewPath)) {
+      this.syncService.invalidateWordRenderCache(normalizedNewPath);
       const openView = this.getOpenMarkdownViewForFile(file);
       const markdown = openView?.editor.getValue() ?? await this.app.vault.cachedRead(file);
-      const result = await this.referenceIndex.updateWord(file, markdown);
+      const result = await this.managedIndexCoordinator.updateWord(file, markdown);
 
       if (!result.disabled) {
         for (const referencePath of result.affectedReferencePaths) {
@@ -1151,7 +1248,7 @@ export default class EudicSyncPlugin extends Plugin {
         shouldRepairAffectedReferenceMetadata = true;
         this.wordSyncSignatures.set(normalizePath(file.path), getWordSyncSignature(markdown));
       } else {
-        for (const referencePath of this.referenceIndex.removeWord(normalizedNewPath)) {
+        for (const referencePath of await this.managedIndexCoordinator.removeWord(normalizedNewPath)) {
           affectedReferencePaths.add(referencePath);
         }
         shouldRepairAffectedReferenceMetadata = true;
@@ -1164,8 +1261,9 @@ export default class EudicSyncPlugin extends Plugin {
     }
 
     if (this.pathScope.isReferencePath(normalizedNewPath)) {
+      await this.managedIndexCoordinator.ensureReady();
       await this.ensureReferenceManagedFrontmatter(file);
-      const lookup = await this.referenceIndex.findWordsReferencingWithFallback(normalizedNewPath, { forceScan: true });
+      const lookup = await this.referenceIndex.findWordsReferencingWithFallback(normalizedNewPath);
       for (const wordPath of lookup.wordPaths) {
         impactedWordPaths.add(wordPath);
       }
@@ -1195,6 +1293,7 @@ export default class EudicSyncPlugin extends Plugin {
   }
 
   private async markAllSyncWordsDirty(): Promise<number> {
+    await this.managedIndexCoordinator.ensureReady();
     let markedCount = 0;
 
     for (const file of this.managedFiles.getWordFiles()) {
@@ -1745,14 +1844,14 @@ export default class EudicSyncPlugin extends Plugin {
       const execution = await this.runWordSyncBatch(finalSelection.runnableFiles, "sync.currentReferenceWords");
       const batchResult = execution.batchResult;
       new Notice(
-        getReferenceSyncCompletionNotice({
+        `${getReferenceSyncCompletionNotice({
           checked: batchResult?.total ?? 0,
           uploaded: batchResult?.uploaded ?? 0,
           unchanged: batchResult?.skipped ?? 0,
           failed: batchResult?.failed ?? 0,
           unavailable: finalSelection.unavailable,
           alreadySyncing: finalSelection.alreadySyncing + execution.alreadySyncing,
-        }),
+        })}${batchResult?.canceled ? ` Canceled before start: ${batchResult.canceled}.` : ""}`,
         8000,
       );
     } catch (error) {
@@ -1777,8 +1876,28 @@ export default class EudicSyncPlugin extends Plugin {
     }
     this.refreshUi();
 
+    const abortController = new AbortController();
+    this.activeBatchAbortController = abortController;
+    const progressFragment = document.createDocumentFragment();
+    const progressText = document.createElement("span");
+    progressText.textContent = `${PLUGIN_NAME}: preparing ${batchFiles.length} word(s)… `;
+    const cancelButton = document.createElement("button");
+    cancelButton.textContent = "Cancel remaining";
+    cancelButton.addEventListener("click", () => {
+      abortController.abort();
+      cancelButton.disabled = true;
+      progressText.textContent = `${PLUGIN_NAME}: stopping after the current item… `;
+    });
+    progressFragment.append(progressText, cancelButton);
+    const progressNotice = new Notice(progressFragment, 0);
+
     try {
-      const batchResult = await this.perf.measure(performanceLabel, () => this.syncService.syncWords(batchFiles));
+      const batchResult = await this.perf.measure(performanceLabel, () => this.syncService.syncWords(batchFiles, {
+        signal: abortController.signal,
+        onProgress: (completed, total) => {
+          progressText.textContent = `${PLUGIN_NAME}: synced ${completed}/${total} word(s)… `;
+        },
+      }));
       for (const result of batchResult.results) {
         if (result.error) {
           this.setWordBodyDirtyOverride(result.file, result.error);
@@ -1789,6 +1908,10 @@ export default class EudicSyncPlugin extends Plugin {
       }
       return { batchResult, alreadySyncing };
     } finally {
+      progressNotice.hide();
+      if (this.activeBatchAbortController === abortController) {
+        this.activeBatchAbortController = null;
+      }
       for (const file of batchFiles) {
         this.syncOrchestrator.endSync(file);
       }
@@ -1819,7 +1942,8 @@ export default class EudicSyncPlugin extends Plugin {
 
     const aliasSummary =
       batchResult.aliasUploaded > 0 ? ` aliases updated ${batchResult.aliasUploaded}.` : " aliases unchanged.";
-    const summary = `${PLUGIN_NAME}: processed ${batchResult.total} dirty word(s), uploaded ${batchResult.uploaded}, unchanged ${batchResult.skipped}, failed ${batchResult.failed}.${aliasSummary}`;
+    const canceledSummary = batchResult.canceled ? ` canceled before start ${batchResult.canceled}.` : "";
+    const summary = `${PLUGIN_NAME}: processed ${batchResult.total} dirty word(s), uploaded ${batchResult.uploaded}, unchanged ${batchResult.skipped}, failed ${batchResult.failed}.${aliasSummary}${canceledSummary}`;
     new Notice(summary, 8000);
   }
 
@@ -2290,7 +2414,7 @@ export default class EudicSyncPlugin extends Plugin {
     this.flushingOpenWordStatusWritePaths.add(normalizedPath);
     try {
       const markdown = await this.app.vault.cachedRead(file);
-      const result = await this.referenceIndex.updateWord(file, markdown);
+      const result = await this.managedIndexCoordinator.updateWord(file, markdown);
       this.scheduleReferenceUsageRefresh(result.affectedReferencePaths);
 
       if (result.disabled) {
@@ -2381,7 +2505,7 @@ export default class EudicSyncPlugin extends Plugin {
         return;
       }
 
-      const result = await this.referenceIndex.updateWord(file, markdown);
+      const result = await this.managedIndexCoordinator.updateWord(file, markdown);
       await this.refreshReferenceUsage(result.affectedReferencePaths);
       // Auto-sync is only an automatic confirmation opportunity; syncWord() still decides whether to upload.
       await this.syncService.markWordDirty(file);
@@ -2445,7 +2569,7 @@ export default class EudicSyncPlugin extends Plugin {
   }
 
   private enqueueWordLifecycle<Result>(file: TFile, task: () => Promise<Result>): Promise<Result> {
-    return this.wordLifecycleQueue.enqueue(file, task);
+    return this.wordLifecycleQueue.enqueue(normalizePath(file.path), task);
   }
 
   private isStaleMissingWordFileError(file: TFile, error: unknown): boolean {
@@ -2572,7 +2696,7 @@ export default class EudicSyncPlugin extends Plugin {
 
   private async ensureManagedWordProperties(
     file: TFile,
-    options: { ensureEudicUri?: boolean; trigger?: ManagedWordReconcileTrigger } = {},
+    options: { ensureEudicUri?: boolean; trigger?: ManagedWordReconcileTrigger; markdown?: string } = {},
   ) {
     const openView = this.getOpenMarkdownViewForFile(file);
     if (openView) {
@@ -2611,6 +2735,7 @@ export default class EudicSyncPlugin extends Plugin {
       trigger: options.trigger,
       defaultStudylists: this.settings.newWordDefaultStudylists,
       studylistCatalog: this.settings.studylistCache.categories,
+      markdown: options.markdown,
       writeFrontmatter: async (targetFile, mutate) => {
         await this.writeFrontmatter(targetFile, mutate);
       },
@@ -2641,12 +2766,28 @@ export default class EudicSyncPlugin extends Plugin {
   }
 
   private async ensureAllWordManagedFrontmatter(): Promise<void> {
+    await this.managedIndexCoordinator.ensureReady();
     const openPaths = this.getOpenMarkdownFilePaths();
-    for (const file of this.managedFiles.getWordFiles()) {
-      if (openPaths.has(normalizePath(file.path))) {
-        continue;
+    const failures: string[] = [];
+    await forEachIsolated(this.managedFiles.getWordFiles(), async (file) => {
+      if (!openPaths.has(normalizePath(file.path))) {
+        const normalizedPath = normalizePath(file.path);
+        const reconciled = await this.ensureManagedWordProperties(file, {
+          ensureEudicUri: false,
+          trigger: "startup",
+          markdown: this.startupWordMarkdown.get(normalizedPath),
+        });
+        this.startupWordMarkdown.set(normalizedPath, reconciled.markdown);
       }
-      await this.ensureManagedWordProperties(file, { ensureEudicUri: false, trigger: "startup" });
+    }, (file) => {
+      failures.push(file.path);
+      console.warn(`${PLUGIN_NAME}: skipped startup Word reconciliation for ${file.path}.`);
+    }, () => this.isUnloaded);
+    if (failures.length > 0 && !this.isUnloaded) {
+      new Notice(
+        `${PLUGIN_NAME}: skipped ${failures.length} Word note(s) with unreadable or malformed properties during startup. First: ${failures[0]}`,
+        8000,
+      );
     }
   }
 
@@ -2692,12 +2833,22 @@ export default class EudicSyncPlugin extends Plugin {
   }
 
   private async ensureAllReferenceManagedFrontmatter(): Promise<void> {
+    await this.managedIndexCoordinator.ensureReady();
     const openPaths = this.getOpenMarkdownFilePaths();
-    for (const file of this.managedFiles.getReferenceFiles()) {
-      if (openPaths.has(normalizePath(file.path))) {
-        continue;
+    const failures: string[] = [];
+    await forEachIsolated(this.managedFiles.getReferenceFiles(), async (file) => {
+      if (!openPaths.has(normalizePath(file.path))) {
+        await this.ensureReferenceManagedFrontmatter(file);
       }
-      await this.ensureReferenceManagedFrontmatter(file);
+    }, (file) => {
+      failures.push(file.path);
+      console.warn(`${PLUGIN_NAME}: skipped startup Reference reconciliation for ${file.path}.`);
+    }, () => this.isUnloaded);
+    if (failures.length > 0 && !this.isUnloaded) {
+      new Notice(
+        `${PLUGIN_NAME}: skipped ${failures.length} Reference note(s) with unreadable or malformed properties during startup. First: ${failures[0]}`,
+        8000,
+      );
     }
   }
 

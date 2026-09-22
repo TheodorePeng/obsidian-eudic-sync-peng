@@ -47,6 +47,24 @@ interface SyncWordOptions {
   force?: boolean;
 }
 
+export interface PreparedWordSync {
+  file: TFile;
+  word: string;
+  language: string;
+  wordLinkId: string;
+  localContentSignature: string;
+  finalNoteHtml: string;
+  currentHash: string;
+  storedAliasHash: string | null;
+  shouldUpload: boolean;
+  force: boolean;
+}
+
+export interface SyncWordsOptions {
+  signal?: AbortSignal;
+  onProgress?: (completed: number, total: number) => void;
+}
+
 function pad2(value: number): string {
   return String(value).padStart(2, "0");
 }
@@ -140,7 +158,25 @@ export class SyncService {
 
   invalidateSemanticBlockReferenceCache(referencePaths?: Iterable<string>): void {
     this.semanticBlockAutomation.invalidateReferenceLinkTargets(referencePaths);
-    this.renderCache.invalidateAll();
+    const referenceIndex = this.options.referenceIndex;
+    if (!referencePaths || !referenceIndex) {
+      this.renderCache.invalidateAll();
+      return;
+    }
+
+    for (const referencePath of referencePaths) {
+      for (const wordPath of referenceIndex.findWordsReferencing(referencePath)) {
+        this.renderCache.invalidateWord(wordPath);
+      }
+    }
+  }
+
+  invalidateWordRenderCache(path: string): void {
+    this.renderCache.invalidateWord(path);
+  }
+
+  getRenderCacheDiagnostics(): ReturnType<SyncRenderCache["getDiagnostics"]> {
+    return this.renderCache.getDiagnostics();
   }
 
   async collectDirtyWords(): Promise<TFile[]> {
@@ -183,90 +219,106 @@ export class SyncService {
    * and only upload when it differs from last_synced_hash.
    */
   async syncWord(file: TFile, options: SyncWordOptions = {}): Promise<SyncWordResult> {
-    const wordLinkId = await this.options.ensureWordLinkId(file);
     const context = this.getWordContext(file);
     if (!context) {
       throw new Error(`File is not an eligible Eudic word note: ${file.path}`);
     }
 
     try {
-      if (!context.lang) {
-        throw new Error(`Missing '${FRONTMATTER_KEYS.lang}' in ${file.path}.`);
-      }
-
-      await this.ensureEudicUrlBeforeFirstSync(file, context);
-
-      const frontmatter = getFrontmatter(this.options.app, file);
-      const storedAliasHash = readNullableString(frontmatter[FRONTMATTER_KEYS.lastSyncedAliasesHash]);
-      const settings = this.options.getSettings();
-      const rawMarkdown = await this.options.app.vault.cachedRead(file);
-      const { finalNoteHtml } = await this.renderFinalWordNoteHtml(file, context, wordLinkId, settings, rawMarkdown);
-      const currentHash = await sha256Hex(finalNoteHtml);
-      let uploaded = false;
-
-      if (options.force || context.lastSyncedHash !== currentHash) {
-        await this.apiClient.overwriteNotePreservingAttachments({
-          word: context.word,
-          language: context.lang,
-          note: finalNoteHtml,
-        });
-        uploaded = true;
-      }
-
-      const aliasResult = await this.aliasSyncService.syncAliasesForWord(file, context.lang, storedAliasHash, {
-        force: options.force,
-        wordLinkId,
-      });
-      if (aliasResult.error) {
-        await this.writeDirtyStateAfterMainConfirmation(file, currentHash, aliasResult.error);
-        return {
-          file,
-          word: context.word,
-          status: "dirty",
-          uploaded,
-          skipped: false,
-          aliasCount: aliasResult.aliasCount,
-          aliasUploaded: 0,
-          aliasSkipped: false,
-          aliasError: aliasResult.error,
-          error: aliasResult.error,
-        };
-      }
-
-      const status = await this.writeSyncedState(file, currentHash, aliasResult.hash);
-      return {
-        file,
-        word: context.word,
-        status,
-        uploaded: uploaded || aliasResult.uploaded,
-        skipped: !uploaded && !aliasResult.uploaded && aliasResult.skipped,
-        aliasCount: aliasResult.aliasCount,
-        aliasUploaded: aliasResult.uploaded ? aliasResult.aliasCount : 0,
-        aliasSkipped: aliasResult.skipped || aliasResult.aliasCount === 0,
-      };
+      const prepared = await this.prepareWordSync(file, options);
+      return await this.commitPreparedWordSync(prepared);
     } catch (error) {
-      const message = toErrorMessage(error);
-      try {
-        await this.options.writeSyncFrontmatter(file, {
-          syncStatus: "dirty",
-          lastError: message,
-        });
-      } catch {
-        // Best effort: keep the original failure reason even if the error state writeback fails.
-      }
+      return this.writeFailedSyncResult(file, context.word, error);
+    }
+  }
 
+  async prepareWordSync(file: TFile, options: SyncWordOptions = {}): Promise<PreparedWordSync> {
+    const wordLinkId = await this.options.ensureWordLinkId(file);
+    const context = this.getWordContext(file);
+    if (!context) {
+      throw new Error(`File is not an eligible Eudic word note: ${file.path}`);
+    }
+
+    if (!context.lang) {
+      throw new Error(`Missing '${FRONTMATTER_KEYS.lang}' in ${file.path}.`);
+    }
+
+    await this.ensureEudicUrlBeforeFirstSync(file, context);
+
+    const frontmatter = getFrontmatter(this.options.app, file);
+    const storedAliasHash = readNullableString(frontmatter[FRONTMATTER_KEYS.lastSyncedAliasesHash]);
+    const settings = this.options.getSettings();
+    const rawMarkdown = await this.options.app.vault.cachedRead(file);
+    const localContentSignature = getWordSyncSignature(rawMarkdown);
+    const { finalNoteHtml } = await this.renderFinalWordNoteHtml(file, context, wordLinkId, settings, rawMarkdown);
+    const currentHash = await sha256Hex(finalNoteHtml);
+
+    return {
+      file,
+      word: context.word,
+      language: context.lang,
+      wordLinkId,
+      localContentSignature,
+      finalNoteHtml,
+      currentHash,
+      storedAliasHash,
+      shouldUpload: options.force === true || context.lastSyncedHash !== currentHash,
+      force: options.force === true,
+    };
+  }
+
+  async commitPreparedWordSync(prepared: PreparedWordSync): Promise<SyncWordResult> {
+    const latestMarkdown = await this.options.app.vault.cachedRead(prepared.file);
+    if (getWordSyncSignature(latestMarkdown) !== prepared.localContentSignature) {
+      throw new Error(`Word note changed during sync preparation; upload skipped for ${prepared.file.path}.`);
+    }
+
+    let uploaded = false;
+    if (prepared.shouldUpload) {
+      await this.apiClient.overwriteNotePreservingAttachments({
+        word: prepared.word,
+        language: prepared.language,
+        note: prepared.finalNoteHtml,
+      });
+      uploaded = true;
+    }
+
+    const aliasResult = await this.aliasSyncService.syncAliasesForWord(
+      prepared.file,
+      prepared.language,
+      prepared.storedAliasHash,
+      {
+        force: prepared.force,
+        wordLinkId: prepared.wordLinkId,
+      },
+    );
+    if (aliasResult.error) {
+      await this.writeDirtyStateAfterMainConfirmation(prepared.file, prepared.currentHash, aliasResult.error);
       return {
-        file,
-        word: context.word,
+        file: prepared.file,
+        word: prepared.word,
         status: "dirty",
-        uploaded: false,
+        uploaded,
         skipped: false,
-        aliasCount: 0,
+        aliasCount: aliasResult.aliasCount,
         aliasUploaded: 0,
         aliasSkipped: false,
-        error: message,
+        aliasError: aliasResult.error,
+        error: aliasResult.error,
       };
     }
+
+    const status = await this.writeSyncedState(prepared.file, prepared.currentHash, aliasResult.hash);
+    return {
+      file: prepared.file,
+      word: prepared.word,
+      status,
+      uploaded: uploaded || aliasResult.uploaded,
+      skipped: !uploaded && !aliasResult.uploaded && aliasResult.skipped,
+      aliasCount: aliasResult.aliasCount,
+      aliasUploaded: aliasResult.uploaded ? aliasResult.aliasCount : 0,
+      aliasSkipped: aliasResult.skipped || aliasResult.aliasCount === 0,
+    };
   }
 
   private async ensureEudicUrlBeforeFirstSync(file: TFile, context: WordNoteContext): Promise<void> {
@@ -421,11 +473,48 @@ export class SyncService {
     };
   }
 
-  async syncWords(files: TFile[]): Promise<SyncBatchResult> {
+  async syncWords(files: TFile[], options: SyncWordsOptions = {}): Promise<SyncBatchResult> {
     const results: SyncWordResult[] = [];
 
-    for (const file of files) {
-      results.push(await this.syncWord(file));
+    for (let index = 0; index < files.length; index += 2) {
+      if (options.signal?.aborted) {
+        break;
+      }
+      const chunk = files.slice(index, index + 2);
+      const preparedChunk = await Promise.all(chunk.map(async (file) => {
+        const context = this.getWordContext(file);
+        if (!context) {
+          return {
+            result: await this.writeFailedSyncResult(
+              file,
+              file.basename,
+              new Error(`File is not an eligible Eudic word note: ${file.path}`),
+            ),
+          };
+        }
+        try {
+          return { prepared: await this.prepareWordSync(file) };
+        } catch (error) {
+          return { result: await this.writeFailedSyncResult(file, context.word, error) };
+        }
+      }));
+
+      for (const item of preparedChunk) {
+        if (options.signal?.aborted) {
+          break;
+        }
+        if (item.result) {
+          results.push(item.result);
+          options.onProgress?.(results.length, files.length);
+          continue;
+        }
+        try {
+          results.push(await this.commitPreparedWordSync(item.prepared));
+        } catch (error) {
+          results.push(await this.writeFailedSyncResult(item.prepared.file, item.prepared.word, error));
+        }
+        options.onProgress?.(results.length, files.length);
+      }
     }
 
     return {
@@ -435,6 +524,7 @@ export class SyncService {
       failed: results.filter((result) => result.error).length,
       aliasUploaded: results.reduce((sum, result) => sum + result.aliasUploaded, 0),
       results,
+      canceled: files.length - results.length,
     };
   }
 
@@ -550,6 +640,30 @@ export class SyncService {
       lastSyncedHash: hash,
       lastError: error,
     });
+  }
+
+  private async writeFailedSyncResult(file: TFile, word: string, error: unknown): Promise<SyncWordResult> {
+    const message = toErrorMessage(error);
+    try {
+      await this.options.writeSyncFrontmatter(file, {
+        syncStatus: "dirty",
+        lastError: message,
+      });
+    } catch {
+      // Best effort: keep the original failure reason even if the error state writeback fails.
+    }
+
+    return {
+      file,
+      word,
+      status: "dirty",
+      uploaded: false,
+      skipped: false,
+      aliasCount: 0,
+      aliasUploaded: 0,
+      aliasSkipped: false,
+      error: message,
+    };
   }
 
   private async writeSyncedState(file: TFile, hash: string, aliasesHash: string | null): Promise<EudicSyncStatus> {

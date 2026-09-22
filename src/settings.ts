@@ -13,7 +13,8 @@ import {
   getStudylistSelectionSummary,
 } from "./studylist-settings-model";
 import type EudicSyncPlugin from "./main";
-import type { EudicStudylistCategory } from "./types";
+import { DebouncedSettingsCommitter } from "./settings-update-queue";
+import type { EudicStudylistCategory, EudicSyncSettings } from "./types";
 
 function normalizePathInput(value: string): string {
   const normalized = normalizeFolderPath(value);
@@ -249,8 +250,24 @@ class DefaultStudylistsModal extends Modal {
 }
 
 export class EudicSyncSettingTab extends PluginSettingTab {
+  private readonly settingsCommitter: DebouncedSettingsCommitter<EudicSyncSettings>;
+
   constructor(app: App, private readonly plugin: EudicSyncPlugin) {
     super(app, plugin);
+    this.settingsCommitter = new DebouncedSettingsCommitter({
+      delayMs: 400,
+      commit: (partial) => this.plugin.updateSettings(partial),
+    });
+  }
+
+  override hide(): void {
+    void this.settingsCommitter.flush();
+  }
+
+  private flushDraftOnBlur(input: HTMLInputElement | HTMLTextAreaElement): void {
+    input.addEventListener("blur", () => {
+      void this.settingsCommitter.flush();
+    });
   }
 
   private exportSettingsBackup(): void {
@@ -337,36 +354,50 @@ export class EudicSyncSettingTab extends PluginSettingTab {
       .setName("Word notes folder")
       .setDesc("Vault-relative path for word notes. Any vault-relative path can be used.")
       .addText((text) => {
-        new FolderInputSuggest(this.app, text.inputEl, async (value) => {
+        const commit = async (value: string): Promise<void> => {
           const normalizedValue = normalizePathInput(value) || "Eudic/Words";
           text.setValue(normalizedValue);
           await this.plugin.updateSettings({ wordFolder: normalizedValue });
+        };
+        new FolderInputSuggest(this.app, text.inputEl, async (value) => {
+          await commit(value);
         });
 
         text
           .setPlaceholder("Eudic/Words")
-          .setValue(settings.wordFolder)
-          .onChange(async (value) => {
-            await this.plugin.updateSettings({ wordFolder: normalizePathInput(value) || "Eudic/Words" });
-          });
+          .setValue(settings.wordFolder);
+        text.inputEl.addEventListener("blur", () => void commit(text.getValue()));
+        text.inputEl.addEventListener("keydown", (event) => {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            void commit(text.getValue());
+          }
+        });
       });
 
     new Setting(basicSection)
       .setName("Reference notes folder")
       .setDesc("Vault-relative path for reference notes. Any vault-relative path can be used.")
       .addText((text) => {
-        new FolderInputSuggest(this.app, text.inputEl, async (value) => {
+        const commit = async (value: string): Promise<void> => {
           const normalizedValue = normalizePathInput(value) || "Eudic/References";
           text.setValue(normalizedValue);
           await this.plugin.updateSettings({ referenceFolder: normalizedValue });
+        };
+        new FolderInputSuggest(this.app, text.inputEl, async (value) => {
+          await commit(value);
         });
 
         text
           .setPlaceholder("Eudic/References")
-          .setValue(settings.referenceFolder)
-          .onChange(async (value) => {
-            await this.plugin.updateSettings({ referenceFolder: normalizePathInput(value) || "Eudic/References" });
-          });
+          .setValue(settings.referenceFolder);
+        text.inputEl.addEventListener("blur", () => void commit(text.getValue()));
+        text.inputEl.addEventListener("keydown", (event) => {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            void commit(text.getValue());
+          }
+        });
       });
 
     new Setting(basicSection)
@@ -376,10 +407,11 @@ export class EudicSyncSettingTab extends PluginSettingTab {
         text
           .setPlaceholder("NIS xxxx")
           .setValue(settings.authorizationToken)
-          .onChange(async (value) => {
-            await this.plugin.updateSettings({ authorizationToken: value.trim() });
+          .onChange((value) => {
+            this.settingsCommitter.schedule({ authorizationToken: value.trim() });
           });
         text.inputEl.type = "password";
+        this.flushDraftOnBlur(text.inputEl);
       });
 
     const syncOutputSection = createSection(
@@ -471,10 +503,11 @@ export class EudicSyncSettingTab extends PluginSettingTab {
         text
           .setPlaceholder("n.\ne.g.\nSyn.\nCog.\nP.S.")
           .setValue(settings.boldMarkers.join("\n"))
-          .onChange(async (value) => {
-            await this.plugin.updateSettings({ boldMarkers: parseLines(value) });
+          .onChange((value) => {
+            this.settingsCommitter.schedule({ boldMarkers: parseLines(value) });
           });
         configureTextarea(text, 6);
+        this.flushDraftOnBlur(text.inputEl);
       });
 
     new Setting(writingHelpersSection)
@@ -505,10 +538,11 @@ export class EudicSyncSettingTab extends PluginSettingTab {
         text
           .setPlaceholder("n.\nv.\na.\nCog.\nSyn.\nSyn./Cog.\nAnt.\nP.S.")
           .setValue(settings.semanticBlockKindPresets.join("\n"))
-          .onChange(async (value) => {
-            await this.plugin.updateSettings({ semanticBlockKindPresets: parseLines(value) });
+          .onChange((value) => {
+            this.settingsCommitter.schedule({ semanticBlockKindPresets: parseLines(value) });
           });
         configureTextarea(text, 8);
+        this.flushDraftOnBlur(text.inputEl);
       });
 
     new Setting(semanticBlockSection)
@@ -544,10 +578,11 @@ export class EudicSyncSettingTab extends PluginSettingTab {
         text
           .setPlaceholder("n.\nv.\na.\nadj.\nadv.")
           .setValue(settings.semanticBlockWordBoldKinds.join("\n"))
-          .onChange(async (value) => {
-            await this.plugin.updateSettings({ semanticBlockWordBoldKinds: parseLines(value) });
+          .onChange((value) => {
+            this.settingsCommitter.schedule({ semanticBlockWordBoldKinds: parseLines(value) });
           });
         configureTextarea(text, 6);
+        this.flushDraftOnBlur(text.inputEl);
       });
 
     new Setting(semanticBlockSection)
@@ -570,10 +605,11 @@ export class EudicSyncSettingTab extends PluginSettingTab {
         text
           .setPlaceholder("Cog.\nSyn.\nSyn./Cog.\nAnt.")
           .setValue(settings.semanticBlockWordLinkKinds.join("\n"))
-          .onChange(async (value) => {
-            await this.plugin.updateSettings({ semanticBlockWordLinkKinds: parseLines(value) });
+          .onChange((value) => {
+            this.settingsCommitter.schedule({ semanticBlockWordLinkKinds: parseLines(value) });
           });
         configureTextarea(text, 6);
+        this.flushDraftOnBlur(text.inputEl);
       });
 
     const obsidianUiSection = createSection(

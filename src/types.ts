@@ -80,6 +80,7 @@ export interface SyncBatchResult {
   failed: number;
   aliasUploaded: number;
   results: SyncWordResult[];
+  canceled?: number;
 }
 
 export interface ResyncAliasesResult {

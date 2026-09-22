@@ -14,6 +14,7 @@ import {
   refreshSelectedStudylistSnapshots,
 } from "../src/settings-data";
 import { ManagedFileRegistry } from "../src/managed-file-registry";
+import { ManagedIndexCoordinator } from "../src/managed-index-coordinator";
 import { protectLeadingThematicBreakFromFrontmatter } from "../src/render-markdown-frontmatter";
 import { SemanticBlockAutomationResolver } from "../src/semantic-block-automation-resolver";
 import { ReferenceGraphService } from "../src/reference-index-service";
@@ -73,8 +74,12 @@ import { resolveWordDirtySignatureDecision } from "../src/word-dirty-signature-s
 import { getWordSyncSignature } from "../src/word-sync-signature";
 import { getSemanticSettingsSignature, SyncRenderCache } from "../src/sync-render-cache";
 import { StartupCoordinator } from "../src/startup-coordinator";
+import { classifySettingsImpact } from "../src/settings-impact";
+import { DebouncedSettingsCommitter } from "../src/settings-update-queue";
+import { forEachIsolated } from "../src/batch-file-runner";
 import { SyncService } from "../src/sync-service";
 import { EudicApiClient } from "../src/eudic-api";
+import { EudicMcpClient, isEudicMcpReadTool } from "../src/eudic-mcp-client";
 import { EudicSyncCommandController } from "../src/command-controller";
 import { getReferenceSyncCompletionNotice, selectReferenceSyncTargets } from "../src/reference-sync";
 import type { EudicStudylistCache, EudicSyncSettings } from "../src/types";
@@ -87,6 +92,80 @@ assert.equal(DEFAULT_SETTINGS.enableAutoBoldMarkersOnEdit, false);
 assert.equal(DEFAULT_SETTINGS.enableSemanticBlockMarkerBold, false);
 assert.equal(NOTE_OUTPUT_FORMAT_VERSION, 8);
 assert.equal(DEFAULT_SETTINGS.referenceMetadataWriteMode, "auto");
+assert.equal(isEudicMcpReadTool("get_note"), true);
+assert.equal(isEudicMcpReadTool("get_words"), true);
+assert.equal(isEudicMcpReadTool("add_note"), false);
+assert.equal(isEudicMcpReadTool("delete_note"), false);
+assert.equal(isEudicMcpReadTool("add_words"), false);
+let mutationRequestAttempts = 0;
+const mutationRetryClient = new EudicMcpClient(() => "test token", {
+  request: (async () => {
+    mutationRequestAttempts += 1;
+    throw new Error("simulated timeout");
+  }) as never,
+  timeoutMs: 5,
+  retryAttempts: 3,
+  retryInitialDelayMs: 0,
+  retryMaxDelayMs: 0,
+  retryJitterRatio: 0,
+});
+await assert.rejects(
+  mutationRetryClient.callTool("add_note", { word: "test", note: "test" }, "en"),
+  /request failed/,
+);
+assert.equal(mutationRequestAttempts, 1);
+
+let readRequestAttempts = 0;
+const readRetryClient = new EudicMcpClient(() => "test token", {
+  request: (async () => {
+    readRequestAttempts += 1;
+    throw new Error("simulated read timeout");
+  }) as never,
+  timeoutMs: 5,
+  retryAttempts: 3,
+  retryInitialDelayMs: 0,
+  retryMaxDelayMs: 0,
+  retryJitterRatio: 0,
+});
+await assert.rejects(
+  readRetryClient.callTool("get_note", { word: "test" }, "en"),
+  /request failed/,
+);
+assert.equal(readRequestAttempts, 3);
+
+let resolveTimedOutMutation!: (value: never) => void;
+const timedOutMutationRequest = new Promise<never>((resolve) => {
+  resolveTimedOutMutation = resolve;
+});
+let serializedMutationAttempts = 0;
+const serializedMutationClient = new EudicMcpClient(() => "test token", {
+  request: (() => {
+    serializedMutationAttempts += 1;
+    if (serializedMutationAttempts === 1) {
+      return timedOutMutationRequest;
+    }
+    return Promise.resolve({
+      status: 200,
+      headers: {},
+      text: '{"result":{"content":[{"type":"text","text":"{\\"data\\":{}}"}]}}',
+    }) as never;
+  }) as never,
+  timeoutMs: 1,
+});
+await assert.rejects(
+  serializedMutationClient.callTool("add_note", { word: "first", note: "first" }, "en"),
+  /timed out/,
+);
+const queuedMutation = serializedMutationClient.callTool("delete_note", { word: "second" }, "en");
+await Promise.resolve();
+assert.equal(serializedMutationAttempts, 1);
+resolveTimedOutMutation({
+  status: 200,
+  headers: {},
+  text: '{"result":{"content":[{"type":"text","text":"{\\"data\\":{}}"}]}}',
+} as never);
+await queuedMutation;
+assert.equal(serializedMutationAttempts, 2);
 assert.deepEqual(DEFAULT_SETTINGS.newWordDefaultStudylists, DEFAULT_NEW_WORD_STUDYLISTS);
 
 const migratedDefaults = migrateLoadedSettings({
@@ -108,6 +187,155 @@ assert.deepEqual(normalizedStudylistSettings.settings.newWordDefaultStudylists, 
   { id: "0", language: "en", name: "略｜我的生词本" },
 ]);
 assert.equal(migrateLoadedSettings(normalizedStudylistSettings.settings).changed, false);
+
+const authorizationImpact = classifySettingsImpact(DEFAULT_SETTINGS, {
+  ...DEFAULT_SETTINGS,
+  authorizationToken: "NIS changed",
+});
+assert.deepEqual(authorizationImpact.changedKeys, ["authorizationToken"]);
+assert.equal(authorizationImpact.rebuildManagedIndex, false);
+assert.equal(authorizationImpact.invalidateRenderCache, false);
+
+const scopeImpact = classifySettingsImpact(DEFAULT_SETTINGS, {
+  ...DEFAULT_SETTINGS,
+  wordFolder: "Words",
+});
+assert.equal(scopeImpact.rebuildManagedIndex, true);
+assert.equal(scopeImpact.refreshStudylistSnapshots, true);
+
+const semanticImpact = classifySettingsImpact(DEFAULT_SETTINGS, {
+  ...DEFAULT_SETTINGS,
+  enableSemanticBlockWordLinks: !DEFAULT_SETTINGS.enableSemanticBlockWordLinks,
+});
+assert.equal(semanticImpact.rebuildManagedIndex, false);
+assert.equal(semanticImpact.invalidateRenderCache, true);
+
+const noteOutputImpact = classifySettingsImpact(DEFAULT_SETTINGS, {
+  ...DEFAULT_SETTINGS,
+  noteOutputMode: DEFAULT_SETTINGS.noteOutputMode === "minimal" ? "compatible" : "minimal",
+});
+assert.equal(noteOutputImpact.invalidateRenderCache, true);
+assert.equal(noteOutputImpact.markAllWordsDirty, true);
+
+const uiImpact = classifySettingsImpact(DEFAULT_SETTINGS, {
+  ...DEFAULT_SETTINGS,
+  enableHeaderSyncButton: !DEFAULT_SETTINGS.enableHeaderSyncButton,
+});
+assert.equal(uiImpact.refreshUi, true);
+assert.equal(uiImpact.rebuildManagedIndex, false);
+
+const noSettingsImpact = classifySettingsImpact(DEFAULT_SETTINGS, { ...DEFAULT_SETTINGS });
+assert.equal(noSettingsImpact.changedKeys.length, 0);
+
+const isolatedBatchCompleted: number[] = [];
+const isolatedBatchFailures: number[] = [];
+await forEachIsolated([1, 2, 3], async (value) => {
+  if (value === 2) {
+    throw new Error("isolated failure");
+  }
+  isolatedBatchCompleted.push(value);
+}, (value) => {
+  isolatedBatchFailures.push(value);
+});
+assert.deepEqual(isolatedBatchCompleted, [1, 3]);
+assert.deepEqual(isolatedBatchFailures, [2]);
+
+const committedSettingsBatches: Array<Partial<EudicSyncSettings>> = [];
+const settingsCommitter = new DebouncedSettingsCommitter<EudicSyncSettings>({
+  delayMs: 400,
+  commit: async (partial) => {
+    committedSettingsBatches.push(partial);
+  },
+});
+for (let index = 0; index < 20; index += 1) {
+  settingsCommitter.schedule({ authorizationToken: `token-${index}` });
+}
+await settingsCommitter.flush();
+assert.deepEqual(committedSettingsBatches, [{ authorizationToken: "token-19" }]);
+
+const coordinatorEvents: string[] = [];
+let releaseFirstCoordinatorBuild!: () => void;
+const firstCoordinatorBuildGate = new Promise<void>((resolve) => {
+  releaseFirstCoordinatorBuild = resolve;
+});
+let coordinatorBuildCount = 0;
+const managedIndexCoordinator = new ManagedIndexCoordinator({
+  rebuildRegistry: () => {
+    coordinatorEvents.push("registry");
+  },
+  getRegistryCounts: () => ({ wordCount: 2, referenceCount: 1 }),
+  getVaultCounts: () => ({ wordCount: 2, referenceCount: 1 }),
+  rebuildGraph: async (shouldCommit) => {
+    coordinatorBuildCount += 1;
+    if (coordinatorBuildCount === 1) {
+      await firstCoordinatorBuildGate;
+    }
+    coordinatorEvents.push(`graph:${coordinatorBuildCount}:${shouldCommit()}`);
+    return shouldCommit();
+  },
+  updateWord: async (file, markdown) => {
+    coordinatorEvents.push(`update:${file.path}:${markdown}`);
+    return {
+      wordPath: file.path,
+      referencePaths: [],
+      storedReferencePaths: [],
+      affectedReferencePaths: [],
+      disabled: false,
+    };
+  },
+  removeWord: (path) => {
+    coordinatorEvents.push(`remove:${path}`);
+    return [];
+  },
+});
+const firstCoordinatorBuild = managedIndexCoordinator.rebuild("layout-ready");
+const queuedCoordinatorUpdate = managedIndexCoordinator.updateWord(
+  mockFile("Eudic/Words/queued.md"),
+  "queued markdown",
+);
+assert.equal(managedIndexCoordinator.getDiagnostics().state, "building");
+releaseFirstCoordinatorBuild();
+await firstCoordinatorBuild;
+await queuedCoordinatorUpdate;
+assert.equal(managedIndexCoordinator.getDiagnostics().state, "ready");
+assert.deepEqual(coordinatorEvents, [
+  "registry",
+  "graph:1:true",
+  "update:Eudic/Words/queued.md:queued markdown",
+]);
+
+let releaseStaleCoordinatorBuild!: () => void;
+const staleCoordinatorBuildGate = new Promise<void>((resolve) => {
+  releaseStaleCoordinatorBuild = resolve;
+});
+let generationBuildCount = 0;
+const generationCoordinator = new ManagedIndexCoordinator({
+  rebuildRegistry: () => undefined,
+  getRegistryCounts: () => ({ wordCount: 1, referenceCount: 0 }),
+  getVaultCounts: () => ({ wordCount: 1, referenceCount: 0 }),
+  rebuildGraph: async (shouldCommit) => {
+    generationBuildCount += 1;
+    if (generationBuildCount === 1) {
+      await staleCoordinatorBuildGate;
+    }
+    return shouldCommit();
+  },
+  updateWord: async (file) => ({
+    wordPath: file.path,
+    referencePaths: [],
+    storedReferencePaths: [],
+    affectedReferencePaths: [],
+    disabled: false,
+  }),
+  removeWord: () => [],
+});
+const staleCoordinatorBuild = generationCoordinator.rebuild("layout-ready");
+const latestCoordinatorBuild = generationCoordinator.rebuild("settings-scope-change");
+await latestCoordinatorBuild;
+releaseStaleCoordinatorBuild();
+await staleCoordinatorBuild;
+assert.equal(generationCoordinator.getDiagnostics().generation, 2);
+assert.equal(generationCoordinator.getDiagnostics().state, "ready");
 const refreshedDefaultSnapshots = refreshSelectedStudylistSnapshots(
   [
     { id: "0", language: "en", name: "Old name" },
@@ -1438,6 +1666,27 @@ const ensureDeferredUriResult = await ensureManagedWordProperties({
 });
 assert.equal(ensureDeferredUriResult.changed, false);
 assert.equal(ensureFrontmatterByPath.get(ensureDeferredUriFile.path)?.eudic_uri, undefined);
+let startupSnapshotFallbackReads = 0;
+const startupSnapshotMarkdown = ensureMarkdownByPath.get(ensureDeferredUriFile.path) ?? "";
+const startupSnapshotResult = await ensureManagedWordProperties({
+  app: {
+    vault: {
+      cachedRead: async () => {
+        startupSnapshotFallbackReads += 1;
+        return startupSnapshotMarkdown;
+      },
+    },
+  } as unknown as App,
+  file: ensureDeferredUriFile,
+  ensureEudicUri: false,
+  trigger: "startup",
+  markdown: startupSnapshotMarkdown,
+  writeFrontmatter: async () => {
+    throw new Error("An unchanged startup snapshot must not write frontmatter.");
+  },
+});
+assert.equal(startupSnapshotResult.changed, false);
+assert.equal(startupSnapshotFallbackReads, 0);
 
 const renamedBeforeSyncMarkdown = [
   "---",
@@ -1758,6 +2007,23 @@ await failureQueue.enqueue(failureKey, async () => {
 });
 assert.equal(ranAfterFailure, true);
 
+const pathLifecycleQueue = new SerialTaskQueue<string>();
+const pathQueueEvents: string[] = [];
+let releasePathTask: (() => void) | undefined;
+const pathTaskGate = new Promise<void>((resolve) => {
+  releasePathTask = resolve;
+});
+const firstPathTask = pathLifecycleQueue.enqueue("Words/path-key.md", async () => {
+  await pathTaskGate;
+  pathQueueEvents.push("first");
+});
+const secondPathTask = pathLifecycleQueue.enqueue("Words/path-key.md", async () => {
+  pathQueueEvents.push("second");
+});
+releasePathTask?.();
+await Promise.all([firstPathTask, secondPathTask]);
+assert.deepEqual(pathQueueEvents, ["first", "second"]);
+
 const originalOverwriteNotePreservingAttachments = EudicApiClient.prototype.overwriteNotePreservingAttachments;
 try {
   const syncUrlFile = mockFile("Eudic/Words/apple.md");
@@ -1852,6 +2118,19 @@ try {
   });
   await syncUrlService.syncWord(syncUrlFile, { force: true });
   assert.equal(syncUrlFrontmatterByPath.get(syncUrlFile.path)?.eudic_url, "https://dict.eudic.net/dicts/en/custom");
+
+  uploadedWord = null;
+  syncUrlMarkdownByPath.set(syncUrlFile.path, "original local body");
+  (syncUrlService as unknown as {
+    renderFinalWordNoteHtml: () => Promise<{ finalNoteHtml: string }>;
+  }).renderFinalWordNoteHtml = async () => {
+    syncUrlMarkdownByPath.set(syncUrlFile.path, "edited after prepare");
+    return { finalNoteHtml: "<p>original local body</p>" };
+  };
+  const changedDuringPrepareResult = await syncUrlService.syncWord(syncUrlFile, { force: true });
+  assert.equal(uploadedWord, null);
+  assert.equal(changedDuringPrepareResult.status, "dirty");
+  assert.match(changedDuringPrepareResult.error ?? "", /changed during sync preparation/i);
 } finally {
   EudicApiClient.prototype.overwriteNotePreservingAttachments = originalOverwriteNotePreservingAttachments;
 }
@@ -3684,17 +3963,13 @@ const absurdAdapterRepairGraph = new ReferenceGraphService({
 const absurdAdapterRepairResult = await absurdAdapterRepairGraph.repairReferenceMetadataForReference(
   absurdReferenceFile.path,
 );
-assert.equal(absurdAdapterRepairResult.scannedWordCount, 3);
+assert.equal(absurdAdapterRepairResult.scannedWordCount, 1);
 assert.deepEqual(absurdAdapterRepairResult.wordPaths, [
   absurdWordFile.path,
-  ludicrousWordFile.path,
-  ridiculousWordFile.path,
 ]);
 assert.equal(absurdAdapterRepairResult.referenceMetadataUpdated, 1);
 assert.deepEqual(absurdAdapterFrontmatterByPath.get(absurdReferenceFile.path)?.referenced_by, [
   absurdWordFile.path,
-  ludicrousWordFile.path,
-  ridiculousWordFile.path,
 ]);
 const absurdReferenceGraph = new ReferenceGraphService({
   app: absurdApp,
@@ -3709,6 +3984,73 @@ assert.deepEqual(
   absurdReferenceGraph.findWordsReferencing(absurdReferenceFile.path),
   [absurdWordFile.path, ludicrousWordFile.path, ridiculousWordFile.path],
 );
+
+let optimizedReferenceReadCount = 0;
+let optimizedReferenceReadShouldFail = false;
+const optimizedReferenceFiles = [
+  mockFile("Eudic/References/ref-a.md"),
+  mockFile("Eudic/References/ref-b.md"),
+  mockFile("Eudic/Words/one.md"),
+  mockFile("Eudic/Words/two.md"),
+  mockFile("Eudic/Words/three.md"),
+];
+const optimizedReferenceMarkdownByPath = new Map<string, string>([
+  [optimizedReferenceFiles[2].path, "![[References/ref-a]] ![[References/ref-b]]"],
+  [optimizedReferenceFiles[3].path, "![[References/ref-a]]"],
+  [optimizedReferenceFiles[4].path, "![[References/ref-b]]"],
+]);
+const optimizedReferenceApp = {
+  vault: {
+    getMarkdownFiles: () => optimizedReferenceFiles,
+    getFileByPath: (path: string) => optimizedReferenceFiles.find((file) => file.path === path) ?? null,
+    cachedRead: async (file: TFile) => {
+      optimizedReferenceReadCount += 1;
+      if (optimizedReferenceReadShouldFail && file.path.endsWith("two.md")) {
+        throw new Error("simulated graph rebuild failure");
+      }
+      return optimizedReferenceMarkdownByPath.get(file.path) ?? "";
+    },
+  },
+  metadataCache: {
+    getFileCache: () => ({ frontmatter: { sync_eudic_enabled: true } }),
+    getFirstLinkpathDest: (linkpath: string) =>
+      optimizedReferenceFiles.find((file) => file.path.endsWith(`${linkpath.replace(/^References\//, "")}.md`)) ?? null,
+  },
+} as unknown as App;
+const optimizedReferenceRegistry = new ManagedFileRegistry(optimizedReferenceApp, absurdPathScope);
+optimizedReferenceRegistry.rebuild();
+const optimizedReferenceGraph = new ReferenceGraphService({
+  app: optimizedReferenceApp,
+  pathScope: absurdPathScope,
+  managedFiles: optimizedReferenceRegistry,
+  writeFrontmatter: async () => undefined,
+  getReferenceMetadataWriteMode: () => "auto",
+});
+const optimizedBatchRepair = await optimizedReferenceGraph.repairReferenceMetadata(
+  [optimizedReferenceFiles[0].path, optimizedReferenceFiles[1].path],
+  { forceFreshScan: true, write: false },
+);
+assert.equal(optimizedBatchRepair.scannedWordCount, 3);
+assert.equal(optimizedReferenceReadCount, 3);
+
+optimizedReferenceReadCount = 0;
+await optimizedReferenceGraph.updateWord(
+  optimizedReferenceFiles[2],
+  optimizedReferenceMarkdownByPath.get(optimizedReferenceFiles[2].path),
+);
+await optimizedReferenceGraph.refreshReferenceUsage([
+  optimizedReferenceFiles[0].path,
+  optimizedReferenceFiles[1].path,
+]);
+assert.equal(optimizedReferenceReadCount, 0);
+
+optimizedReferenceReadShouldFail = true;
+await assert.rejects(() => optimizedReferenceGraph.rebuildAll(), /simulated graph rebuild failure/);
+assert.deepEqual(optimizedReferenceGraph.findWordsReferencing(optimizedReferenceFiles[0].path), [
+  optimizedReferenceFiles[2].path,
+  optimizedReferenceFiles[3].path,
+]);
+optimizedReferenceReadShouldFail = false;
 const absurdResolver = new SemanticBlockAutomationResolver({
   app: absurdApp,
   pathScope: absurdPathScope,
@@ -3954,6 +4296,25 @@ assert.equal(syncRenderCache.get({ ...syncRenderCacheKey, noteOutputFormatVersio
 assert.equal(syncRenderCache.get({ ...syncRenderCacheKey, referenceDependencySignature: "References/ref-b.md" }), null);
 syncRenderCache.invalidateWord("Words/cache.md");
 assert.equal(syncRenderCache.get(syncRenderCacheKey), null);
+
+const makeCacheKey = (wordPath: string) => ({ ...syncRenderCacheKey, wordPath });
+const boundedRenderCache = new SyncRenderCache({ maxEntries: 2, maxCharacters: 10 });
+boundedRenderCache.set(makeCacheKey("Words/a.md"), "aaaa");
+boundedRenderCache.set(makeCacheKey("Words/b.md"), "bbbb");
+assert.equal(boundedRenderCache.get(makeCacheKey("Words/a.md")), "aaaa");
+boundedRenderCache.set(makeCacheKey("Words/c.md"), "cc");
+assert.equal(boundedRenderCache.get(makeCacheKey("Words/b.md")), null);
+assert.equal(boundedRenderCache.get(makeCacheKey("Words/a.md")), "aaaa");
+boundedRenderCache.set(makeCacheKey("Words/d.md"), "ddddddd");
+assert.equal(boundedRenderCache.get(makeCacheKey("Words/a.md")), null);
+assert.equal(boundedRenderCache.get(makeCacheKey("Words/c.md")), null);
+assert.equal(boundedRenderCache.get(makeCacheKey("Words/d.md")), "ddddddd");
+boundedRenderCache.set(makeCacheKey("Words/d.md"), "dd");
+boundedRenderCache.set(makeCacheKey("Words/e.md"), "eeeeeeee");
+assert.equal(boundedRenderCache.get(makeCacheKey("Words/d.md")), "dd");
+assert.equal(boundedRenderCache.get(makeCacheKey("Words/e.md")), "eeeeeeee");
+boundedRenderCache.set(makeCacheKey("Words/oversized.md"), "x".repeat(11));
+assert.equal(boundedRenderCache.get(makeCacheKey("Words/oversized.md")), null);
 
 let retryAttempts = 0;
 const retryResult = await withRetry(

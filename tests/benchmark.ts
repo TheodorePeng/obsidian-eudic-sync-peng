@@ -16,6 +16,7 @@ function mockFile(path: string): TFile {
 const files: TFile[] = [];
 const markdownByPath = new Map<string, string>();
 const frontmatterByPath = new Map<string, Record<string, unknown>>();
+let cachedReadCount = 0;
 for (let index = 0; index < 4000; index += 1) {
   const file = mockFile(`Eudic/Words/word-${String(index).padStart(4, "0")}.md`);
   const referenceIndex = index % 400;
@@ -42,7 +43,10 @@ const benchmarkApp = {
     vault: {
       getMarkdownFiles: () => files,
       getFileByPath: (path: string) => files.find((file) => file.path === path) ?? null,
-      cachedRead: async (file: TFile) => markdownByPath.get(file.path) ?? "",
+      cachedRead: async (file: TFile) => {
+        cachedReadCount += 1;
+        return markdownByPath.get(file.path) ?? "";
+      },
     },
     metadataCache: {
       getFileCache: (file: TFile) => ({ frontmatter: frontmatterByPath.get(file.path) ?? {} }),
@@ -81,6 +85,23 @@ const referenceGraph = new ReferenceGraphService({
 const referenceStartedAt = performance.now();
 await referenceGraph.rebuildAll();
 const referenceRebuildMs = Math.round((performance.now() - referenceStartedAt) * 10) / 10;
+const referenceBuildReadCount = cachedReadCount;
+
+const benchmarkReferencePaths = files
+  .filter((file) => benchmarkPathScope.isReferencePath(file.path))
+  .slice(0, 3)
+  .map((file) => file.path);
+cachedReadCount = 0;
+await referenceGraph.refreshReferenceUsage(benchmarkReferencePaths);
+const automaticRefreshReadCount = cachedReadCount;
+cachedReadCount = 0;
+await referenceGraph.repairReferenceMetadata(benchmarkReferencePaths, { forceFreshScan: true, write: false });
+const forcedRepairReadCount = cachedReadCount;
+if (automaticRefreshReadCount !== 0 || forcedRepairReadCount !== wordCount) {
+  throw new Error(
+    `Reference scan budget failed (automatic ${automaticRefreshReadCount}, forced ${forcedRepairReadCount}, words ${wordCount}).`,
+  );
+}
 
 const startupStartedAt = performance.now();
 const startupCoordinator = new StartupCoordinator({
@@ -96,3 +117,6 @@ await startupCoordinator.run([
 const startupMs = Math.round((performance.now() - startupStartedAt) * 10) / 10;
 
 console.log(`Synthetic benchmark: reference rebuild ${referenceRebuildMs}ms, startup coordinator ${startupMs}ms.`);
+console.log(
+  `Synthetic benchmark: graph reads ${referenceBuildReadCount}, 3-reference automatic reads ${automaticRefreshReadCount}, forced reads ${forcedRepairReadCount}.`,
+);

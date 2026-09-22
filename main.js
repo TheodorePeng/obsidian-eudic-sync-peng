@@ -391,6 +391,30 @@ function createAutoBoldMarkersExtension(options) {
   });
 }
 
+// src/batch-file-runner.ts
+async function forEachIsolated(items, run, onError, isCancelled = () => false) {
+  let sliceStartedAt = globalThis.performance?.now?.() ?? Date.now();
+  for (let index = 0; index < items.length; index += 1) {
+    if (isCancelled()) {
+      return;
+    }
+    const now2 = globalThis.performance?.now?.() ?? Date.now();
+    if (index > 0 && (index % 50 === 0 || now2 - sliceStartedAt >= 8)) {
+      await new Promise((resolve) => globalThis.setTimeout(resolve, 0));
+      sliceStartedAt = globalThis.performance?.now?.() ?? Date.now();
+      if (isCancelled()) {
+        return;
+      }
+    }
+    const item = items[index];
+    try {
+      await run(item, index);
+    } catch (error) {
+      await onError(item, error, index);
+    }
+  }
+}
+
 // src/command-controller.ts
 var import_obsidian2 = require("obsidian");
 
@@ -2558,6 +2582,151 @@ var ManagedFileRegistry = class {
   }
 };
 
+// src/managed-index-coordinator.ts
+var CANCELLED_MESSAGE = "Managed index coordinator was cancelled.";
+var ManagedIndexCoordinator = class {
+  constructor(options) {
+    this.options = options;
+    this.state = "cold";
+    this.generation = 0;
+    this.cancelled = false;
+    this.snapshot = null;
+    this.lastError = null;
+    this.activeBuild = null;
+    this.pendingEvents = [];
+  }
+  ensureReady() {
+    if (this.state === "ready" && this.snapshot) {
+      return Promise.resolve(this.snapshot);
+    }
+    if (this.state === "building" && this.activeBuild) {
+      return this.activeBuild;
+    }
+    return this.rebuild("ensure-ready");
+  }
+  rebuild(_reason) {
+    this.cancelled = false;
+    const generation = ++this.generation;
+    this.state = "building";
+    this.lastError = null;
+    let operation;
+    operation = this.performRebuild(generation).then(async (nextSnapshot) => {
+      if (nextSnapshot) {
+        return nextSnapshot;
+      }
+      const latestBuild = this.activeBuild;
+      if (latestBuild && latestBuild !== operation) {
+        return latestBuild;
+      }
+      if (this.snapshot) {
+        return this.snapshot;
+      }
+      throw new Error("Managed index rebuild was superseded before a snapshot was ready.");
+    });
+    this.activeBuild = operation;
+    return operation;
+  }
+  updateWord(file, markdown) {
+    return this.runOrQueue(() => this.options.updateWord(file, markdown));
+  }
+  removeWord(path) {
+    return this.runOrQueue(() => this.options.removeWord(path));
+  }
+  cancel() {
+    this.cancelled = true;
+    this.generation += 1;
+    this.state = "cold";
+    this.activeBuild = null;
+    const error = new Error(CANCELLED_MESSAGE);
+    for (const event of this.pendingEvents.splice(0)) {
+      event.reject(error);
+    }
+  }
+  getDiagnostics() {
+    return {
+      state: this.state,
+      generation: this.generation,
+      queuedEventCount: this.pendingEvents.length,
+      snapshot: this.snapshot ? { ...this.snapshot } : null,
+      lastError: this.lastError
+    };
+  }
+  async performRebuild(generation) {
+    const startedAt = this.options.now?.() ?? Date.now();
+    const isCurrent = () => !this.cancelled && generation === this.generation;
+    try {
+      this.options.rebuildRegistry();
+      const registryCounts = this.options.getRegistryCounts();
+      const vaultCounts = this.options.getVaultCounts();
+      if (registryCounts.wordCount !== vaultCounts.wordCount || registryCounts.referenceCount !== vaultCounts.referenceCount) {
+        this.options.rebuildRegistry();
+      }
+      const committed = await this.options.rebuildGraph(isCurrent);
+      if (!committed || !isCurrent()) {
+        return null;
+      }
+      await this.replayPendingEvents(generation);
+      if (!isCurrent()) {
+        return null;
+      }
+      const counts = this.options.getRegistryCounts();
+      const expectedCounts = this.options.getVaultCounts();
+      if (counts.wordCount !== expectedCounts.wordCount || counts.referenceCount !== expectedCounts.referenceCount) {
+        throw new Error(
+          `Managed registry count mismatch (registry ${counts.wordCount}/${counts.referenceCount}, vault ${expectedCounts.wordCount}/${expectedCounts.referenceCount}).`
+        );
+      }
+      const snapshot = {
+        ...counts,
+        generation,
+        builtAt: this.options.now?.() ?? Date.now(),
+        buildDurationMs: Math.max(0, (this.options.now?.() ?? Date.now()) - startedAt)
+      };
+      this.snapshot = snapshot;
+      this.state = "ready";
+      return snapshot;
+    } catch (error) {
+      if (!isCurrent()) {
+        return null;
+      }
+      this.state = "failed";
+      this.lastError = error instanceof Error ? error.message : String(error);
+      for (const event of this.pendingEvents.splice(0)) {
+        event.reject(error);
+      }
+      throw error;
+    }
+  }
+  runOrQueue(run) {
+    if (this.cancelled) {
+      return Promise.reject(new Error(CANCELLED_MESSAGE));
+    }
+    if (this.state !== "building") {
+      return Promise.resolve().then(run);
+    }
+    return new Promise((resolve, reject) => {
+      this.pendingEvents.push({
+        run,
+        resolve,
+        reject
+      });
+    });
+  }
+  async replayPendingEvents(generation) {
+    while (!this.cancelled && generation === this.generation && this.pendingEvents.length > 0) {
+      const event = this.pendingEvents.shift();
+      if (!event) {
+        continue;
+      }
+      try {
+        event.resolve(await event.run());
+      } catch (error) {
+        event.reject(error);
+      }
+    }
+  }
+};
+
 // src/path-scope.ts
 var import_obsidian5 = require("obsidian");
 function normalizeSegment(value) {
@@ -2792,9 +2961,6 @@ function usageNeedsRewrite(frontmatter, referenceId, referencedBy) {
 function readReferencedByWordPaths(frontmatter) {
   return readStringArray(frontmatter[FRONTMATTER_KEYS.referencedBy]);
 }
-function isMarkdownFilePath(path) {
-  return path.toLocaleLowerCase().endsWith(".md");
-}
 var ReferenceGraphService = class {
   constructor(options) {
     this.options = options;
@@ -2802,16 +2968,71 @@ var ReferenceGraphService = class {
     this.referenceToWords = /* @__PURE__ */ new Map();
     this.scannedReferencePaths = /* @__PURE__ */ new Set();
     this.isIndexBuilt = false;
+    this.fullRebuildCount = 0;
+    this.lastFullRebuildWordReads = 0;
+    this.targetedFullScanCount = 0;
+    this.lastTargetedScanWordReads = 0;
   }
-  async rebuildAll() {
-    this.isIndexBuilt = false;
-    this.wordToReferences.clear();
-    this.referenceToWords.clear();
-    this.scannedReferencePaths.clear();
-    for (const file of await this.getManagedWordFilesForScan()) {
-      await this.updateWord(file);
+  async rebuildAll(shouldCommit = () => true) {
+    const nextWordToReferences = /* @__PURE__ */ new Map();
+    const nextReferenceToWords = /* @__PURE__ */ new Map();
+    const files = await this.getManagedWordFilesForScan();
+    let readCount = 0;
+    let sliceStartedAt = globalThis.performance?.now?.() ?? Date.now();
+    for (let index = 0; index < files.length; index += 1) {
+      const now2 = globalThis.performance?.now?.() ?? Date.now();
+      if (index > 0 && (index % 50 === 0 || now2 - sliceStartedAt >= 8)) {
+        await new Promise((resolve) => globalThis.setTimeout(resolve, 0));
+        sliceStartedAt = globalThis.performance?.now?.() ?? Date.now();
+      }
+      const file = files[index];
+      const markdown = await this.options.app.vault.cachedRead(file);
+      readCount += 1;
+      this.options.onWordRead?.(file, markdown);
+      if (!shouldCommit()) {
+        return false;
+      }
+      if (isWordSyncDisabledForIndex(this.options.app, file, markdown)) {
+        continue;
+      }
+      const wordPath = normalizeGraphPath(file.path);
+      const referencePaths = new Set(
+        resolveManagedReferencePaths(this.options.app, this.options.pathScope, file, markdown)
+      );
+      if (referencePaths.size === 0) {
+        continue;
+      }
+      nextWordToReferences.set(wordPath, referencePaths);
+      for (const referencePath of referencePaths) {
+        let wordPaths = nextReferenceToWords.get(referencePath);
+        if (!wordPaths) {
+          wordPaths = /* @__PURE__ */ new Set();
+          nextReferenceToWords.set(referencePath, wordPaths);
+        }
+        wordPaths.add(wordPath);
+      }
     }
+    if (!shouldCommit()) {
+      return false;
+    }
+    this.wordToReferences = nextWordToReferences;
+    this.referenceToWords = nextReferenceToWords;
+    this.scannedReferencePaths = /* @__PURE__ */ new Set();
     this.isIndexBuilt = true;
+    this.fullRebuildCount += 1;
+    this.lastFullRebuildWordReads = readCount;
+    return true;
+  }
+  getDiagnostics() {
+    return {
+      ready: this.isIndexBuilt,
+      wordNodeCount: this.wordToReferences.size,
+      referenceNodeCount: this.referenceToWords.size,
+      fullRebuildCount: this.fullRebuildCount,
+      lastFullRebuildWordReads: this.lastFullRebuildWordReads,
+      targetedFullScanCount: this.targetedFullScanCount,
+      lastTargetedScanWordReads: this.lastTargetedScanWordReads
+    };
   }
   async updateWord(file, markdown) {
     const wordPath = normalizeGraphPath(file.path);
@@ -2900,6 +3121,8 @@ var ReferenceGraphService = class {
     }
     this.scannedReferencePaths.add(normalizedReferencePath);
     this.isIndexBuilt = true;
+    this.targetedFullScanCount += 1;
+    this.lastTargetedScanWordReads = scannedWordCount;
     return {
       referencePath: normalizedReferencePath,
       wordPaths: sortedStrings(wordPaths),
@@ -2913,7 +3136,7 @@ var ReferenceGraphService = class {
     }
     return this.repairReferenceMetadata(referencePaths, {
       write: this.getReferenceMetadataWriteMode() === "auto",
-      forceFreshScan: true
+      forceFreshScan: false
     });
   }
   async rebuildLegacyReferenceMetadata() {
@@ -2943,13 +3166,19 @@ var ReferenceGraphService = class {
       targetReferencePaths = sortedStrings(referencePaths).filter(
         (referencePath) => this.options.pathScope.isReferencePath(referencePath)
       );
+      if (forceFreshScan) {
+        await this.rebuildAll();
+        scannedWordCount = (await this.getManagedWordFilesForScan()).length;
+      }
       for (const referencePath of targetReferencePaths) {
         const existingReferencedBy = this.readReferencePropertyWordPaths(referencePath);
         for (const wordPath of existingReferencedBy) {
           affectedWordPaths.add(wordPath);
         }
-        const lookup = forceFreshScan ? await this.scanWordsReferencingReference(referencePath) : await this.findWordsReferencingWithFallback(referencePath, { forceScan: true });
-        scannedWordCount += lookup.scannedWordCount;
+        const lookup = await this.findWordsReferencingWithFallback(referencePath);
+        if (!forceFreshScan) {
+          scannedWordCount += lookup.scannedWordCount;
+        }
         for (const wordPath of lookup.wordPaths) {
           repairedWordPaths.add(wordPath);
           affectedWordPaths.add(wordPath);
@@ -3167,73 +3396,11 @@ var ReferenceGraphService = class {
     return this.getManagedFilesForScan("reference");
   }
   async getManagedFilesForScan(kind) {
-    const filesByPath = /* @__PURE__ */ new Map();
-    const addFile = (file) => {
-      if (!file || file.extension !== "md") {
-        return;
-      }
-      const normalizedPath = normalizeGraphPath(file.path);
-      const matchesScope = kind === "word" ? this.options.pathScope.isWordPath(normalizedPath) : this.options.pathScope.isReferencePath(normalizedPath);
-      if (matchesScope) {
-        filesByPath.set(normalizedPath, file);
-      }
-    };
     const registryFiles = kind === "word" ? this.options.managedFiles.getWordFiles() : this.options.managedFiles.getReferenceFiles();
-    for (const file of registryFiles) {
-      addFile(file);
+    if (registryFiles.length > 0) {
+      return registryFiles;
     }
-    for (const file of this.options.app.vault.getMarkdownFiles()) {
-      addFile(file);
-    }
-    const folderPath = kind === "word" ? this.getWordFolderPath() : this.getReferenceFolderPath();
-    if (folderPath) {
-      for (const file of await this.listMarkdownFilesFromFolder(folderPath)) {
-        addFile(file);
-      }
-    }
-    return Array.from(filesByPath.values()).sort((left, right) => left.path.localeCompare(right.path));
-  }
-  getWordFolderPath() {
-    return this.options.pathScope.getWordFolderPath?.() ?? "";
-  }
-  getReferenceFolderPath() {
-    return this.options.pathScope.getReferenceFolderPath?.() ?? "";
-  }
-  async listMarkdownFilesFromFolder(folderPath) {
-    const adapter = this.options.app.vault.adapter;
-    if (!adapter?.list) {
-      return [];
-    }
-    const files = [];
-    const seenFolders = /* @__PURE__ */ new Set();
-    const visit = async (folder) => {
-      const normalizedFolder = normalizeGraphPath(folder).replace(/^\/+|\/+$/g, "");
-      if (!normalizedFolder || seenFolders.has(normalizedFolder)) {
-        return;
-      }
-      seenFolders.add(normalizedFolder);
-      let listed;
-      try {
-        listed = await adapter.list(normalizedFolder);
-      } catch {
-        return;
-      }
-      for (const path of listed.files) {
-        const normalizedPath = normalizeGraphPath(path);
-        if (!isMarkdownFilePath(normalizedPath)) {
-          continue;
-        }
-        const file = this.getMarkdownFileByPath(normalizedPath);
-        if (file) {
-          files.push(file);
-        }
-      }
-      for (const childFolder of listed.folders) {
-        await visit(childFolder);
-      }
-    };
-    await visit(folderPath);
-    return files;
+    return this.options.app.vault.getMarkdownFiles().filter((file) => kind === "word" ? this.options.pathScope.isWordPath(file.path) : this.options.pathScope.isReferencePath(file.path)).sort((left, right) => left.path.localeCompare(right.path));
   }
 };
 
@@ -3896,6 +4063,39 @@ function getStudylistSelectionSummary(selected) {
   return `${selected.length} selected: ${visibleNames.join(", ")}${remaining > 0 ? ` +${remaining} more` : ""}`;
 }
 
+// src/settings-update-queue.ts
+var DebouncedSettingsCommitter = class {
+  constructor(options) {
+    this.options = options;
+    this.pending = {};
+    this.timer = null;
+    this.commitQueue = Promise.resolve();
+  }
+  schedule(partial) {
+    Object.assign(this.pending, partial);
+    if (this.timer !== null) {
+      globalThis.clearTimeout(this.timer);
+    }
+    this.timer = globalThis.setTimeout(() => {
+      this.timer = null;
+      void this.flush();
+    }, this.options.delayMs);
+  }
+  flush() {
+    if (this.timer !== null) {
+      globalThis.clearTimeout(this.timer);
+      this.timer = null;
+    }
+    if (Object.keys(this.pending).length === 0) {
+      return this.commitQueue;
+    }
+    const batch = this.pending;
+    this.pending = {};
+    this.commitQueue = this.commitQueue.then(() => this.options.commit(batch));
+    return this.commitQueue;
+  }
+};
+
 // src/settings.ts
 function normalizePathInput(value) {
   const normalized = normalizeFolderPath2(value);
@@ -4085,6 +4285,18 @@ var EudicSyncSettingTab = class extends import_obsidian8.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
+    this.settingsCommitter = new DebouncedSettingsCommitter({
+      delayMs: 400,
+      commit: (partial) => this.plugin.updateSettings(partial)
+    });
+  }
+  hide() {
+    void this.settingsCommitter.flush();
+  }
+  flushDraftOnBlur(input) {
+    input.addEventListener("blur", () => {
+      void this.settingsCommitter.flush();
+    });
   }
   exportSettingsBackup() {
     const payload = buildExportSettingsPayload(this.plugin.settings);
@@ -4159,30 +4371,47 @@ var EudicSyncSettingTab = class extends import_obsidian8.PluginSettingTab {
       "\u5148\u786E\u8BA4\u63D2\u4EF6\u7BA1\u7406\u54EA\u4E9B\u7B14\u8BB0\uFF0C\u4EE5\u53CA\u5982\u4F55\u8FDE\u63A5\u6B27\u8DEF\u8BCD\u5178 OpenAPI\u3002"
     );
     new import_obsidian8.Setting(basicSection).setName("Word notes folder").setDesc("Vault-relative path for word notes. Any vault-relative path can be used.").addText((text) => {
-      new FolderInputSuggest(this.app, text.inputEl, async (value) => {
+      const commit = async (value) => {
         const normalizedValue = normalizePathInput(value) || "Eudic/Words";
         text.setValue(normalizedValue);
         await this.plugin.updateSettings({ wordFolder: normalizedValue });
+      };
+      new FolderInputSuggest(this.app, text.inputEl, async (value) => {
+        await commit(value);
       });
-      text.setPlaceholder("Eudic/Words").setValue(settings.wordFolder).onChange(async (value) => {
-        await this.plugin.updateSettings({ wordFolder: normalizePathInput(value) || "Eudic/Words" });
+      text.setPlaceholder("Eudic/Words").setValue(settings.wordFolder);
+      text.inputEl.addEventListener("blur", () => void commit(text.getValue()));
+      text.inputEl.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          void commit(text.getValue());
+        }
       });
     });
     new import_obsidian8.Setting(basicSection).setName("Reference notes folder").setDesc("Vault-relative path for reference notes. Any vault-relative path can be used.").addText((text) => {
-      new FolderInputSuggest(this.app, text.inputEl, async (value) => {
+      const commit = async (value) => {
         const normalizedValue = normalizePathInput(value) || "Eudic/References";
         text.setValue(normalizedValue);
         await this.plugin.updateSettings({ referenceFolder: normalizedValue });
+      };
+      new FolderInputSuggest(this.app, text.inputEl, async (value) => {
+        await commit(value);
       });
-      text.setPlaceholder("Eudic/References").setValue(settings.referenceFolder).onChange(async (value) => {
-        await this.plugin.updateSettings({ referenceFolder: normalizePathInput(value) || "Eudic/References" });
+      text.setPlaceholder("Eudic/References").setValue(settings.referenceFolder);
+      text.inputEl.addEventListener("blur", () => void commit(text.getValue()));
+      text.inputEl.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          void commit(text.getValue());
+        }
       });
     });
     new import_obsidian8.Setting(basicSection).setName("Eudic Authorization").setDesc("Authorization header value for the Eudic OpenAPI.").addText((text) => {
-      text.setPlaceholder("NIS xxxx").setValue(settings.authorizationToken).onChange(async (value) => {
-        await this.plugin.updateSettings({ authorizationToken: value.trim() });
+      text.setPlaceholder("NIS xxxx").setValue(settings.authorizationToken).onChange((value) => {
+        this.settingsCommitter.schedule({ authorizationToken: value.trim() });
       });
       text.inputEl.type = "password";
+      this.flushDraftOnBlur(text.inputEl);
     });
     const syncOutputSection = createSection(
       containerEl,
@@ -4229,10 +4458,11 @@ var EudicSyncSettingTab = class extends import_obsidian8.PluginSettingTab {
       });
     });
     new import_obsidian8.Setting(writingHelpersSection).setName("Bold markers").setDesc("Literal markers to bold in managed notes. Enter one marker per line; regular expressions are not supported.").addTextArea((text) => {
-      text.setPlaceholder("n.\ne.g.\nSyn.\nCog.\nP.S.").setValue(settings.boldMarkers.join("\n")).onChange(async (value) => {
-        await this.plugin.updateSettings({ boldMarkers: parseLines(value) });
+      text.setPlaceholder("n.\ne.g.\nSyn.\nCog.\nP.S.").setValue(settings.boldMarkers.join("\n")).onChange((value) => {
+        this.settingsCommitter.schedule({ boldMarkers: parseLines(value) });
       });
       configureTextarea(text, 6);
+      this.flushDraftOnBlur(text.inputEl);
     });
     new import_obsidian8.Setting(writingHelpersSection).setName("Auto-extract pending references on save").setDesc(
       "When enabled, saving a word note converts ```eudic-reference``` blocks into shared reference notes before the note is written. Legacy ```eudic-example``` blocks are still recognized."
@@ -4249,10 +4479,11 @@ var EudicSyncSettingTab = class extends import_obsidian8.PluginSettingTab {
     new import_obsidian8.Setting(semanticBlockSection).setName("Semantic block kind presets").setDesc(
       "Enter one semantic block kind per line. These presets are used by Insert Eudic block, Wrap selection as Eudic block, and save/sync kind auto-detection."
     ).addTextArea((text) => {
-      text.setPlaceholder("n.\nv.\na.\nCog.\nSyn.\nSyn./Cog.\nAnt.\nP.S.").setValue(settings.semanticBlockKindPresets.join("\n")).onChange(async (value) => {
-        await this.plugin.updateSettings({ semanticBlockKindPresets: parseLines(value) });
+      text.setPlaceholder("n.\nv.\na.\nCog.\nSyn.\nSyn./Cog.\nAnt.\nP.S.").setValue(settings.semanticBlockKindPresets.join("\n")).onChange((value) => {
+        this.settingsCommitter.schedule({ semanticBlockKindPresets: parseLines(value) });
       });
       configureTextarea(text, 8);
+      this.flushDraftOnBlur(text.inputEl);
     });
     new import_obsidian8.Setting(semanticBlockSection).setName("Auto-bold word in semantic blocks").setDesc(
       "Automatically bold the current word inside matching semantic block kinds during preview and sync rendering. Can combine with auto-link as a bold link; manually bolded word text keeps its source styling."
@@ -4269,10 +4500,11 @@ var EudicSyncSettingTab = class extends import_obsidian8.PluginSettingTab {
       });
     });
     new import_obsidian8.Setting(semanticBlockSection).setName("Semantic block kinds for word bolding").setDesc("Enter one semantic block kind per line. Matching kinds bold the whole word when it starts with the current word, such as absent -> **absently**.").addTextArea((text) => {
-      text.setPlaceholder("n.\nv.\na.\nadj.\nadv.").setValue(settings.semanticBlockWordBoldKinds.join("\n")).onChange(async (value) => {
-        await this.plugin.updateSettings({ semanticBlockWordBoldKinds: parseLines(value) });
+      text.setPlaceholder("n.\nv.\na.\nadj.\nadv.").setValue(settings.semanticBlockWordBoldKinds.join("\n")).onChange((value) => {
+        this.settingsCommitter.schedule({ semanticBlockWordBoldKinds: parseLines(value) });
       });
       configureTextarea(text, 6);
+      this.flushDraftOnBlur(text.inputEl);
     });
     new import_obsidian8.Setting(semanticBlockSection).setName("Auto-link word in semantic blocks").setDesc(
       "Automatically add managed Obsidian URL Scheme links inside matching semantic block kinds. Manually bolded words can still be linked, and partial bold styling is preserved. Word-note blocks link the current word; reference blocks link all words that reference that note."
@@ -4282,10 +4514,11 @@ var EudicSyncSettingTab = class extends import_obsidian8.PluginSettingTab {
       });
     });
     new import_obsidian8.Setting(semanticBlockSection).setName("Semantic block kinds for word links").setDesc("Enter one semantic block kind per line. Matching kinds link only full current-word occurrences, such as absent but not absence.").addTextArea((text) => {
-      text.setPlaceholder("Cog.\nSyn.\nSyn./Cog.\nAnt.").setValue(settings.semanticBlockWordLinkKinds.join("\n")).onChange(async (value) => {
-        await this.plugin.updateSettings({ semanticBlockWordLinkKinds: parseLines(value) });
+      text.setPlaceholder("Cog.\nSyn.\nSyn./Cog.\nAnt.").setValue(settings.semanticBlockWordLinkKinds.join("\n")).onChange((value) => {
+        this.settingsCommitter.schedule({ semanticBlockWordLinkKinds: parseLines(value) });
       });
       configureTextarea(text, 6);
+      this.flushDraftOnBlur(text.inputEl);
     });
     const obsidianUiSection = createSection(
       containerEl,
@@ -4319,10 +4552,55 @@ var EudicSyncSettingTab = class extends import_obsidian8.PluginSettingTab {
   }
 };
 
+// src/settings-impact.ts
+var SCOPE_KEYS = /* @__PURE__ */ new Set([
+  "wordFolder",
+  "referenceFolder"
+]);
+var RENDER_KEYS = /* @__PURE__ */ new Set([
+  "noteOutputMode",
+  "noteOutputFormatVersion",
+  "boldMarkers",
+  "enableSemanticBlockMarkerBold",
+  "enableSemanticBlockWordBold",
+  "enableSemanticBlockWordLinks",
+  "semanticBlockKindPresets",
+  "semanticBlockWordBoldKinds",
+  "semanticBlockWordLinkKinds"
+]);
+var UI_KEYS = /* @__PURE__ */ new Set([
+  "enableHeaderSyncButton",
+  "enableStatusBarSyncButton",
+  "newWordDefaultStudylists",
+  "studylistCache"
+]);
+function valuesEqual(left, right) {
+  if (Object.is(left, right)) {
+    return true;
+  }
+  if (typeof left !== "object" || left === null || typeof right !== "object" || right === null) {
+    return false;
+  }
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+function classifySettingsImpact(previous, next) {
+  const changedKeys = Object.keys(next).filter((key) => !valuesEqual(previous[key], next[key]));
+  const has = (key) => changedKeys.includes(key);
+  return {
+    changedKeys,
+    rebuildManagedIndex: changedKeys.some((key) => SCOPE_KEYS.has(key)),
+    invalidateRenderCache: changedKeys.some((key) => RENDER_KEYS.has(key)),
+    markAllWordsDirty: has("noteOutputMode"),
+    refreshStudylistSnapshots: changedKeys.some((key) => SCOPE_KEYS.has(key)),
+    clearAutoSyncTimers: has("enableAutoSyncWordOnLeave") && previous.enableAutoSyncWordOnLeave && !next.enableAutoSyncWordOnLeave,
+    refreshUi: changedKeys.some((key) => UI_KEYS.has(key))
+  };
+}
+
 // src/serial-task-queue.ts
 var SerialTaskQueue = class {
   constructor() {
-    this.tails = /* @__PURE__ */ new WeakMap();
+    this.tails = /* @__PURE__ */ new Map();
   }
   enqueue(key, task) {
     const previous = this.tails.get(key) ?? Promise.resolve();
@@ -4332,6 +4610,11 @@ var SerialTaskQueue = class {
       () => void 0
     );
     this.tails.set(key, tail);
+    void tail.finally(() => {
+      if (this.tails.get(key) === tail) {
+        this.tails.delete(key);
+      }
+    });
     return current;
   }
 };
@@ -4549,7 +4832,11 @@ async function withRetry(run, options) {
       if (attempt >= options.attempts || !options.shouldRetry(error, attempt)) {
         throw error;
       }
-      await delay(delayMs);
+      const overrideDelayMs = options.getDelayMs?.(error, attempt, delayMs);
+      const baseDelayMs = overrideDelayMs === null || overrideDelayMs === void 0 ? delayMs : overrideDelayMs;
+      const jitterRatio = Math.max(0, options.jitterRatio ?? 0);
+      const jitter = jitterRatio > 0 ? baseDelayMs * jitterRatio * Math.random() : 0;
+      await delay(Math.max(0, Math.round(baseDelayMs + jitter)));
       delayMs = Math.min(options.maxDelayMs, delayMs * 2);
     }
   }
@@ -4563,12 +4850,32 @@ var MCP_RETRY_ATTEMPTS = 3;
 var MCP_RETRY_INITIAL_DELAY_MS = 500;
 var MCP_RETRY_MAX_DELAY_MS = 2e3;
 var EudicMcpHttpError = class extends Error {
-  constructor(message, status) {
+  constructor(message, status, retryAfterMs = null) {
     super(message);
     this.status = status;
+    this.retryAfterMs = retryAfterMs;
     this.name = "EudicMcpHttpError";
   }
 };
+function isEudicMcpReadTool(toolName) {
+  return toolName.startsWith("get_");
+}
+function readRetryAfterMs(headers) {
+  if (!headers || typeof headers !== "object") {
+    return null;
+  }
+  const record = headers;
+  const rawValue = record["retry-after"] ?? record["Retry-After"];
+  if (typeof rawValue !== "string") {
+    return null;
+  }
+  const seconds = Number(rawValue.trim());
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return seconds * 1e3;
+  }
+  const retryAt = Date.parse(rawValue);
+  return Number.isFinite(retryAt) ? Math.max(0, retryAt - Date.now()) : null;
+}
 var EudicMcpNetworkError = class extends Error {
   constructor(message) {
     super(message);
@@ -4599,26 +4906,56 @@ async function withTimeout(promise, timeoutMs, message) {
   }
 }
 var EudicMcpClient = class {
-  constructor(getAuthorizationToken) {
+  constructor(getAuthorizationToken, options = {}) {
     this.getAuthorizationToken = getAuthorizationToken;
+    this.options = options;
+    this.mutationTail = Promise.resolve();
   }
   async callTool(toolName, args, language) {
+    if (!isEudicMcpReadTool(toolName)) {
+      return this.callMutationTool(toolName, args, language);
+    }
     return withRetry(
       () => this.callToolOnce(toolName, args, language),
       {
-        attempts: MCP_RETRY_ATTEMPTS,
-        initialDelayMs: MCP_RETRY_INITIAL_DELAY_MS,
-        maxDelayMs: MCP_RETRY_MAX_DELAY_MS,
+        attempts: this.options.retryAttempts ?? MCP_RETRY_ATTEMPTS,
+        initialDelayMs: this.options.retryInitialDelayMs ?? MCP_RETRY_INITIAL_DELAY_MS,
+        maxDelayMs: this.options.retryMaxDelayMs ?? MCP_RETRY_MAX_DELAY_MS,
+        jitterRatio: this.options.retryJitterRatio ?? 0.1,
+        getDelayMs: (error) => error instanceof EudicMcpHttpError ? error.retryAfterMs : null,
         shouldRetry: (error) => {
           if (error instanceof EudicMcpHttpError) {
-            return error.status >= 500;
+            return error.status === 429 || error.status >= 500;
           }
           return error instanceof EudicMcpNetworkError;
         }
       }
     );
   }
-  async callToolOnce(toolName, args, language) {
+  callMutationTool(toolName, args, language) {
+    const previousMutation = this.mutationTail;
+    let resolveVisible;
+    let rejectVisible;
+    const visibleResult = new Promise((resolve, reject) => {
+      resolveVisible = resolve;
+      rejectVisible = reject;
+    });
+    this.mutationTail = previousMutation.then(async () => {
+      let underlyingRequestSettled = Promise.resolve();
+      try {
+        const result = await this.callToolOnce(toolName, args, language, (request) => {
+          underlyingRequestSettled = request.then(() => void 0, () => void 0);
+        });
+        resolveVisible(result);
+      } catch (error) {
+        rejectVisible(error);
+      } finally {
+        await underlyingRequestSettled;
+      }
+    }).catch(() => void 0);
+    return visibleResult;
+  }
+  async callToolOnce(toolName, args, language, trackUnderlyingRequest) {
     const token = this.getAuthorizationToken().trim();
     if (!token) {
       throw new Error("Missing Eudic Authorization token. Set it in Eudic Sync settings.");
@@ -4627,37 +4964,45 @@ var EudicMcpClient = class {
     const url = `${EUDIC_MCP_API_BASE_URL}/${encodeURIComponent(normalizedLanguage)}/mcp`;
     let response;
     try {
-      response = await withTimeout(
-        (0, import_obsidian10.requestUrl)({
-          url,
-          method: "POST",
-          contentType: "application/json",
-          headers: {
-            Authorization: token,
-            language: normalizedLanguage,
-            Accept: "application/json, text/event-stream",
-            "MCP-Protocol-Version": MCP_PROTOCOL_VERSION
-          },
-          body: JSON.stringify({
-            jsonrpc: "2.0",
-            id: Date.now(),
-            method: "tools/call",
-            params: {
-              name: toolName,
-              arguments: args
-            }
-          }),
-          throw: false
+      const request = (this.options.request ?? import_obsidian10.requestUrl)({
+        url,
+        method: "POST",
+        contentType: "application/json",
+        headers: {
+          Authorization: token,
+          language: normalizedLanguage,
+          Accept: "application/json, text/event-stream",
+          "MCP-Protocol-Version": MCP_PROTOCOL_VERSION
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: Date.now(),
+          method: "tools/call",
+          params: {
+            name: toolName,
+            arguments: args
+          }
         }),
-        MCP_REQUEST_TIMEOUT_MS,
-        `Eudic MCP request timed out after ${MCP_REQUEST_TIMEOUT_MS}ms.`
+        throw: false
+      });
+      trackUnderlyingRequest?.(request);
+      response = await withTimeout(
+        request,
+        this.options.timeoutMs ?? MCP_REQUEST_TIMEOUT_MS,
+        `Eudic MCP request timed out after ${this.options.timeoutMs ?? MCP_REQUEST_TIMEOUT_MS}ms.`
       );
     } catch (error) {
-      throw new EudicMcpNetworkError(`Eudic MCP request failed: ${toErrorMessage3(error)}`);
+      const message = toErrorMessage3(error);
+      throw new EudicMcpNetworkError(
+        /timed out/i.test(message) ? message : "Eudic MCP request failed."
+      );
     }
     if (response.status >= 400) {
-      const detail = response.text.trim() ? `: ${response.text.trim()}` : ".";
-      throw new EudicMcpHttpError(`Eudic MCP error (${response.status})${detail}`, response.status);
+      throw new EudicMcpHttpError(
+        `Eudic MCP request returned HTTP ${response.status}.`,
+        response.status,
+        readRetryAfterMs(response.headers)
+      );
     }
     const messages = parseMcpSseJsonMessages(response.text);
     if (messages.length === 0) {
@@ -7793,6 +8138,8 @@ function buildFinalWordNoteHtml(rendered, mode, word, href, linkResolver) {
 }
 
 // src/sync-render-cache.ts
+var DEFAULT_MAX_ENTRIES = 128;
+var DEFAULT_MAX_CHARACTERS = 5e6;
 function stableJson(value) {
   if (Array.isArray(value)) {
     return `[${value.map(stableJson).join(",")}]`;
@@ -7818,27 +8165,64 @@ function keysEqual(left, right) {
   return left.wordPath === right.wordPath && left.wordSignature === right.wordSignature && left.noteOutputMode === right.noteOutputMode && left.noteOutputFormatVersion === right.noteOutputFormatVersion && left.semanticSettingsSignature === right.semanticSettingsSignature && left.referenceDependencySignature === right.referenceDependencySignature;
 }
 var SyncRenderCache = class {
-  constructor() {
+  constructor(limits = {}) {
     this.entries = /* @__PURE__ */ new Map();
+    this.totalCharacters = 0;
+    this.maxEntries = Math.max(0, Math.floor(limits.maxEntries ?? DEFAULT_MAX_ENTRIES));
+    this.maxCharacters = Math.max(0, Math.floor(limits.maxCharacters ?? DEFAULT_MAX_CHARACTERS));
   }
   get(key) {
     const entry = this.entries.get(key.wordPath);
     if (!entry || !keysEqual(entry.key, key)) {
       return null;
     }
+    this.entries.delete(key.wordPath);
+    this.entries.set(key.wordPath, entry);
     return entry.finalNoteHtml;
   }
   set(key, finalNoteHtml) {
+    this.removeEntry(key.wordPath);
+    if (finalNoteHtml.length > this.maxCharacters || this.maxEntries === 0) {
+      return;
+    }
     this.entries.set(key.wordPath, {
       key: { ...key },
       finalNoteHtml
     });
+    this.totalCharacters += finalNoteHtml.length;
+    this.evictOverLimits();
   }
   invalidateWord(path) {
-    this.entries.delete(path);
+    this.removeEntry(path);
   }
   invalidateAll() {
     this.entries.clear();
+    this.totalCharacters = 0;
+  }
+  getDiagnostics() {
+    return {
+      entryCount: this.entries.size,
+      totalCharacters: this.totalCharacters,
+      maxEntries: this.maxEntries,
+      maxCharacters: this.maxCharacters
+    };
+  }
+  removeEntry(path) {
+    const entry = this.entries.get(path);
+    if (!entry) {
+      return;
+    }
+    this.entries.delete(path);
+    this.totalCharacters -= entry.finalNoteHtml.length;
+  }
+  evictOverLimits() {
+    while (this.entries.size > this.maxEntries || this.totalCharacters > this.maxCharacters) {
+      const oldestPath = this.entries.keys().next().value;
+      if (oldestPath === void 0) {
+        return;
+      }
+      this.removeEntry(oldestPath);
+    }
   }
 };
 
@@ -7955,7 +8339,22 @@ var SyncService = class {
   }
   invalidateSemanticBlockReferenceCache(referencePaths) {
     this.semanticBlockAutomation.invalidateReferenceLinkTargets(referencePaths);
-    this.renderCache.invalidateAll();
+    const referenceIndex = this.options.referenceIndex;
+    if (!referencePaths || !referenceIndex) {
+      this.renderCache.invalidateAll();
+      return;
+    }
+    for (const referencePath of referencePaths) {
+      for (const wordPath of referenceIndex.findWordsReferencing(referencePath)) {
+        this.renderCache.invalidateWord(wordPath);
+      }
+    }
+  }
+  invalidateWordRenderCache(path) {
+    this.renderCache.invalidateWord(path);
+  }
+  getRenderCacheDiagnostics() {
+    return this.renderCache.getDiagnostics();
   }
   async collectDirtyWords() {
     const dirtyWords = [];
@@ -7990,82 +8389,96 @@ var SyncService = class {
    * and only upload when it differs from last_synced_hash.
    */
   async syncWord(file, options = {}) {
-    const wordLinkId = await this.options.ensureWordLinkId(file);
     const context = this.getWordContext(file);
     if (!context) {
       throw new Error(`File is not an eligible Eudic word note: ${file.path}`);
     }
     try {
-      if (!context.lang) {
-        throw new Error(`Missing '${FRONTMATTER_KEYS.lang}' in ${file.path}.`);
-      }
-      await this.ensureEudicUrlBeforeFirstSync(file, context);
-      const frontmatter = getFrontmatter(this.options.app, file);
-      const storedAliasHash = readNullableString(frontmatter[FRONTMATTER_KEYS.lastSyncedAliasesHash]);
-      const settings = this.options.getSettings();
-      const rawMarkdown = await this.options.app.vault.cachedRead(file);
-      const { finalNoteHtml } = await this.renderFinalWordNoteHtml(file, context, wordLinkId, settings, rawMarkdown);
-      const currentHash = await sha256Hex(finalNoteHtml);
-      let uploaded = false;
-      if (options.force || context.lastSyncedHash !== currentHash) {
-        await this.apiClient.overwriteNotePreservingAttachments({
-          word: context.word,
-          language: context.lang,
-          note: finalNoteHtml
-        });
-        uploaded = true;
-      }
-      const aliasResult = await this.aliasSyncService.syncAliasesForWord(file, context.lang, storedAliasHash, {
-        force: options.force,
-        wordLinkId
-      });
-      if (aliasResult.error) {
-        await this.writeDirtyStateAfterMainConfirmation(file, currentHash, aliasResult.error);
-        return {
-          file,
-          word: context.word,
-          status: "dirty",
-          uploaded,
-          skipped: false,
-          aliasCount: aliasResult.aliasCount,
-          aliasUploaded: 0,
-          aliasSkipped: false,
-          aliasError: aliasResult.error,
-          error: aliasResult.error
-        };
-      }
-      const status = await this.writeSyncedState(file, currentHash, aliasResult.hash);
-      return {
-        file,
-        word: context.word,
-        status,
-        uploaded: uploaded || aliasResult.uploaded,
-        skipped: !uploaded && !aliasResult.uploaded && aliasResult.skipped,
-        aliasCount: aliasResult.aliasCount,
-        aliasUploaded: aliasResult.uploaded ? aliasResult.aliasCount : 0,
-        aliasSkipped: aliasResult.skipped || aliasResult.aliasCount === 0
-      };
+      const prepared = await this.prepareWordSync(file, options);
+      return await this.commitPreparedWordSync(prepared);
     } catch (error) {
-      const message = toErrorMessage6(error);
-      try {
-        await this.options.writeSyncFrontmatter(file, {
-          syncStatus: "dirty",
-          lastError: message
-        });
-      } catch {
+      return this.writeFailedSyncResult(file, context.word, error);
+    }
+  }
+  async prepareWordSync(file, options = {}) {
+    const wordLinkId = await this.options.ensureWordLinkId(file);
+    const context = this.getWordContext(file);
+    if (!context) {
+      throw new Error(`File is not an eligible Eudic word note: ${file.path}`);
+    }
+    if (!context.lang) {
+      throw new Error(`Missing '${FRONTMATTER_KEYS.lang}' in ${file.path}.`);
+    }
+    await this.ensureEudicUrlBeforeFirstSync(file, context);
+    const frontmatter = getFrontmatter(this.options.app, file);
+    const storedAliasHash = readNullableString(frontmatter[FRONTMATTER_KEYS.lastSyncedAliasesHash]);
+    const settings = this.options.getSettings();
+    const rawMarkdown = await this.options.app.vault.cachedRead(file);
+    const localContentSignature = getWordSyncSignature(rawMarkdown);
+    const { finalNoteHtml } = await this.renderFinalWordNoteHtml(file, context, wordLinkId, settings, rawMarkdown);
+    const currentHash = await sha256Hex(finalNoteHtml);
+    return {
+      file,
+      word: context.word,
+      language: context.lang,
+      wordLinkId,
+      localContentSignature,
+      finalNoteHtml,
+      currentHash,
+      storedAliasHash,
+      shouldUpload: options.force === true || context.lastSyncedHash !== currentHash,
+      force: options.force === true
+    };
+  }
+  async commitPreparedWordSync(prepared) {
+    const latestMarkdown = await this.options.app.vault.cachedRead(prepared.file);
+    if (getWordSyncSignature(latestMarkdown) !== prepared.localContentSignature) {
+      throw new Error(`Word note changed during sync preparation; upload skipped for ${prepared.file.path}.`);
+    }
+    let uploaded = false;
+    if (prepared.shouldUpload) {
+      await this.apiClient.overwriteNotePreservingAttachments({
+        word: prepared.word,
+        language: prepared.language,
+        note: prepared.finalNoteHtml
+      });
+      uploaded = true;
+    }
+    const aliasResult = await this.aliasSyncService.syncAliasesForWord(
+      prepared.file,
+      prepared.language,
+      prepared.storedAliasHash,
+      {
+        force: prepared.force,
+        wordLinkId: prepared.wordLinkId
       }
+    );
+    if (aliasResult.error) {
+      await this.writeDirtyStateAfterMainConfirmation(prepared.file, prepared.currentHash, aliasResult.error);
       return {
-        file,
-        word: context.word,
+        file: prepared.file,
+        word: prepared.word,
         status: "dirty",
-        uploaded: false,
+        uploaded,
         skipped: false,
-        aliasCount: 0,
+        aliasCount: aliasResult.aliasCount,
         aliasUploaded: 0,
         aliasSkipped: false,
-        error: message
+        aliasError: aliasResult.error,
+        error: aliasResult.error
       };
     }
+    const status = await this.writeSyncedState(prepared.file, prepared.currentHash, aliasResult.hash);
+    return {
+      file: prepared.file,
+      word: prepared.word,
+      status,
+      uploaded: uploaded || aliasResult.uploaded,
+      skipped: !uploaded && !aliasResult.uploaded && aliasResult.skipped,
+      aliasCount: aliasResult.aliasCount,
+      aliasUploaded: aliasResult.uploaded ? aliasResult.aliasCount : 0,
+      aliasSkipped: aliasResult.skipped || aliasResult.aliasCount === 0
+    };
   }
   async ensureEudicUrlBeforeFirstSync(file, context) {
     const frontmatter = getFrontmatter(this.options.app, file);
@@ -8194,10 +8607,46 @@ var SyncService = class {
       matchedAliasOwnerFiles
     };
   }
-  async syncWords(files) {
+  async syncWords(files, options = {}) {
     const results = [];
-    for (const file of files) {
-      results.push(await this.syncWord(file));
+    for (let index = 0; index < files.length; index += 2) {
+      if (options.signal?.aborted) {
+        break;
+      }
+      const chunk = files.slice(index, index + 2);
+      const preparedChunk = await Promise.all(chunk.map(async (file) => {
+        const context = this.getWordContext(file);
+        if (!context) {
+          return {
+            result: await this.writeFailedSyncResult(
+              file,
+              file.basename,
+              new Error(`File is not an eligible Eudic word note: ${file.path}`)
+            )
+          };
+        }
+        try {
+          return { prepared: await this.prepareWordSync(file) };
+        } catch (error) {
+          return { result: await this.writeFailedSyncResult(file, context.word, error) };
+        }
+      }));
+      for (const item of preparedChunk) {
+        if (options.signal?.aborted) {
+          break;
+        }
+        if (item.result) {
+          results.push(item.result);
+          options.onProgress?.(results.length, files.length);
+          continue;
+        }
+        try {
+          results.push(await this.commitPreparedWordSync(item.prepared));
+        } catch (error) {
+          results.push(await this.writeFailedSyncResult(item.prepared.file, item.prepared.word, error));
+        }
+        options.onProgress?.(results.length, files.length);
+      }
     }
     return {
       total: results.length,
@@ -8205,7 +8654,8 @@ var SyncService = class {
       skipped: results.filter((result) => result.skipped).length,
       failed: results.filter((result) => result.error).length,
       aliasUploaded: results.reduce((sum, result) => sum + result.aliasUploaded, 0),
-      results
+      results,
+      canceled: files.length - results.length
     };
   }
   getAvailableWordLanguages() {
@@ -8302,6 +8752,27 @@ var SyncService = class {
       lastSyncedHash: hash,
       lastError: error
     });
+  }
+  async writeFailedSyncResult(file, word, error) {
+    const message = toErrorMessage6(error);
+    try {
+      await this.options.writeSyncFrontmatter(file, {
+        syncStatus: "dirty",
+        lastError: message
+      });
+    } catch {
+    }
+    return {
+      file,
+      word,
+      status: "dirty",
+      uploaded: false,
+      skipped: false,
+      aliasCount: 0,
+      aliasUploaded: 0,
+      aliasSkipped: false,
+      error: message
+    };
   }
   async writeSyncedState(file, hash, aliasesHash) {
     await this.options.writeSyncFrontmatter(file, {
@@ -8996,7 +9467,7 @@ async function ensureManagedWordProperties(options) {
   const { app, file, writeFrontmatter } = options;
   const reconciled = reconcileManagedWordMarkdown({
     file,
-    markdown: await app.vault.cachedRead(file),
+    markdown: options.markdown ?? await app.vault.cachedRead(file),
     ensureEudicUri: options.ensureEudicUri,
     trigger: options.trigger,
     defaultStudylists: options.defaultStudylists,
@@ -9135,6 +9606,8 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
     this.settings = DEFAULT_SETTINGS;
     this.pathScope = new PathScope(DEFAULT_SETTINGS);
     this.managedFiles = new ManagedFileRegistry(this.app, this.pathScope);
+    this.startupWordMarkdown = /* @__PURE__ */ new Map();
+    this.captureStartupWordMarkdown = false;
     this.perf = new PerformanceMonitor();
     this.referenceIndex = new ReferenceGraphService({
       app: this.app,
@@ -9143,7 +9616,34 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
       writeFrontmatter: async (file, mutate) => {
         await this.writeFrontmatter(file, mutate);
       },
-      getReferenceMetadataWriteMode: () => this.settings.referenceMetadataWriteMode
+      getReferenceMetadataWriteMode: () => this.settings.referenceMetadataWriteMode,
+      onWordRead: (file, markdown) => {
+        if (this.captureStartupWordMarkdown) {
+          this.startupWordMarkdown.set((0, import_obsidian17.normalizePath)(file.path), markdown);
+        }
+      }
+    });
+    this.managedIndexCoordinator = new ManagedIndexCoordinator({
+      rebuildRegistry: () => this.managedFiles.rebuild(),
+      getRegistryCounts: () => ({
+        wordCount: this.managedFiles.getWordFiles().length,
+        referenceCount: this.managedFiles.getReferenceFiles().length
+      }),
+      getVaultCounts: () => {
+        let wordCount = 0;
+        let referenceCount = 0;
+        for (const file of this.app.vault.getMarkdownFiles()) {
+          if (this.pathScope.isWordPath(file.path)) {
+            wordCount += 1;
+          } else if (this.pathScope.isReferencePath(file.path)) {
+            referenceCount += 1;
+          }
+        }
+        return { wordCount, referenceCount };
+      },
+      rebuildGraph: (shouldCommit) => this.perf.measure("reference.rebuildAll", () => this.referenceIndex.rebuildAll(shouldCommit)),
+      updateWord: (file, markdown) => this.referenceIndex.updateWord(file, markdown),
+      removeWord: (path) => this.referenceIndex.removeWord(path)
     });
     this.startupCoordinator = new StartupCoordinator({
       isUnloaded: () => this.isUnloaded,
@@ -9178,12 +9678,12 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
     this.lastActiveWordPath = null;
     this.startupKnownPathClearTimer = null;
     this.isUnloaded = false;
+    this.settingsSaveQueue = Promise.resolve();
+    this.activeBatchAbortController = null;
   }
   async onload() {
     this.isUnloaded = false;
     await this.loadSettings();
-    this.managedFiles.rebuild();
-    this.captureStartupKnownPaths();
     this.referenceNoteService = new ReferenceNoteService(this.app, this.pathScope);
     this.syncService = new SyncService({
       app: this.app,
@@ -9241,16 +9741,7 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
       plugin: this,
       isUnloaded: () => this.isUnloaded,
       onLayoutReady: () => {
-        this.lastActiveWordPath = this.getActiveWordPath();
-        const activeFile = this.getActiveMarkdownFile();
-        if (activeFile && this.pathScope.isWordPath(activeFile.path)) {
-          void this.enqueueWordLifecycle(
-            activeFile,
-            () => this.ensureManagedWordProperties(activeFile, { ensureEudicUri: false, trigger: "touch" })
-          ).catch((error) => this.reportWordReconcileError("layout-ready", activeFile, error));
-        }
-        this.scheduleStartupKnownPathClear();
-        this.runStartupTasks();
+        void this.initializeAfterLayoutReady();
       },
       onEditorChange: (file, markdown, editor) => this.handleEditorChange(file, markdown, editor),
       onModify: (file) => this.handleModify(file),
@@ -9319,6 +9810,10 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
   }
   onunload() {
     this.isUnloaded = true;
+    this.activeBatchAbortController?.abort();
+    this.activeBatchAbortController = null;
+    this.managedIndexCoordinator.cancel();
+    this.startupWordMarkdown.clear();
     this.clearStartupKnownPathTimer();
     this.clearAutoSyncTimers();
     this.clearEditorChangeTimers();
@@ -9328,23 +9823,37 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
   }
   async updateSettings(partial) {
     const previousSettings = this.settings;
-    this.settings = Object.assign({}, this.settings, partial);
-    this.pathScope.updateSettings(this.settings);
-    this.managedFiles.rebuild();
-    this.invalidateSemanticReferenceCaches();
-    await this.saveData(this.settings);
-    await this.rebuildReferenceIndex();
-    this.studylistService.captureAllLocalSnapshots();
-    if (previousSettings.enableAutoSyncWordOnLeave && !this.settings.enableAutoSyncWordOnLeave) {
+    const nextSettings = Object.assign({}, this.settings, partial);
+    const impact = classifySettingsImpact(previousSettings, nextSettings);
+    if (impact.changedKeys.length === 0) {
+      return;
+    }
+    this.settings = nextSettings;
+    if (impact.rebuildManagedIndex) {
+      this.pathScope.updateSettings(this.settings);
+    }
+    await this.enqueueSettingsSave(nextSettings);
+    if (impact.invalidateRenderCache) {
+      this.invalidateSemanticReferenceCaches();
+    }
+    if (impact.rebuildManagedIndex) {
+      await this.managedIndexCoordinator.rebuild("settings-scope-change");
+    }
+    if (impact.refreshStudylistSnapshots) {
+      this.studylistService.captureAllLocalSnapshots();
+    }
+    if (impact.clearAutoSyncTimers) {
       this.clearAutoSyncTimers();
     }
-    if (previousSettings.noteOutputMode !== this.settings.noteOutputMode) {
+    if (impact.markAllWordsDirty) {
       const markedCount = await this.markAllSyncWordsDirty();
       new import_obsidian17.Notice(
         `${PLUGIN_NAME}: note output mode changed to ${this.settings.noteOutputMode}. Marked ${markedCount} word(s) dirty.`
       );
     }
-    this.refreshUi();
+    if (impact.refreshUi) {
+      this.refreshUi();
+    }
   }
   registerMarkdownProcessors() {
     this.registerMarkdownCodeBlockProcessor(EUDIC_BLOCK_LANGUAGE, async (source, el, ctx) => {
@@ -9418,6 +9927,47 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
   registerVaultEventsOnLayoutReady() {
     this.vaultEventController.registerOnLayoutReady();
   }
+  getManagedIndexDiagnostics() {
+    return this.managedIndexCoordinator.getDiagnostics();
+  }
+  getOptimizationDiagnostics() {
+    return {
+      managedIndex: this.managedIndexCoordinator.getDiagnostics(),
+      referenceGraph: this.referenceIndex.getDiagnostics(),
+      renderCache: this.syncService ? this.syncService.getRenderCacheDiagnostics() : null
+    };
+  }
+  async initializeAfterLayoutReady() {
+    this.startupWordMarkdown.clear();
+    this.captureStartupWordMarkdown = true;
+    try {
+      await this.managedIndexCoordinator.rebuild("layout-ready");
+    } catch (error) {
+      if (this.isUnloaded) {
+        return;
+      }
+      this.startupWordMarkdown.clear();
+      console.error(`${PLUGIN_NAME}: failed to initialize managed index`, error);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: managed index initialization failed: ${toErrorMessage7(error)}`, 8e3);
+      return;
+    } finally {
+      this.captureStartupWordMarkdown = false;
+    }
+    if (this.isUnloaded) {
+      return;
+    }
+    this.captureStartupKnownPaths();
+    this.lastActiveWordPath = this.getActiveWordPath();
+    const activeFile = this.getActiveMarkdownFile();
+    if (activeFile && this.pathScope.isWordPath(activeFile.path)) {
+      void this.enqueueWordLifecycle(
+        activeFile,
+        () => this.ensureManagedWordProperties(activeFile, { ensureEudicUri: false, trigger: "touch" })
+      ).catch((error) => this.reportWordReconcileError("layout-ready", activeFile, error));
+    }
+    this.scheduleStartupKnownPathClear();
+    this.runStartupTasks();
+  }
   runStartupTasks() {
     void this.startupCoordinator.run(this.getStartupTasks()).then(() => {
       if (this.isUnloaded) {
@@ -9448,10 +9998,6 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
       {
         label: "startup.captureWordSyncSignatures",
         run: () => this.captureWordSyncSignatures()
-      },
-      {
-        label: "startup.rebuildReferenceIndex",
-        run: () => this.rebuildReferenceIndex()
       }
     ];
   }
@@ -9479,19 +10025,10 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
     window.clearTimeout(this.startupKnownPathClearTimer);
     this.startupKnownPathClearTimer = null;
   }
-  async rebuildReferenceIndex() {
-    try {
-      this.invalidateSemanticReferenceCaches();
-      await this.perf.measure("reference.rebuildAll", () => this.referenceIndex.rebuildAll());
-    } catch (error) {
-      console.error(`${PLUGIN_NAME}: failed to rebuild reference index`, error);
-      new import_obsidian17.Notice(`${PLUGIN_NAME}: failed to rebuild Reference index: ${toErrorMessage7(error)}`, 8e3);
-    }
-  }
   async rebuildReferenceIndexManually() {
     try {
       this.invalidateSemanticReferenceCaches();
-      await this.perf.measure("reference.rebuildAll.manual", () => this.referenceIndex.rebuildAll());
+      await this.perf.measure("reference.rebuildAll.manual", () => this.managedIndexCoordinator.rebuild("manual"));
       new import_obsidian17.Notice(`${PLUGIN_NAME}: rebuilt Reference graph.`);
       this.refreshUi();
     } catch (error) {
@@ -9576,13 +10113,22 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
       await this.saveData(this.settings);
     }
   }
+  enqueueSettingsSave(settings) {
+    const snapshot = JSON.parse(JSON.stringify(settings));
+    const save = this.settingsSaveQueue.then(() => this.saveData(snapshot));
+    this.settingsSaveQueue = save.catch((error) => {
+      console.error(`${PLUGIN_NAME}: failed to save settings`, error);
+      new import_obsidian17.Notice(`${PLUGIN_NAME}: failed to save settings: ${toErrorMessage7(error)}`, 8e3);
+    });
+    return save;
+  }
   async setStudylistCache(cache) {
     const newWordDefaultStudylists = refreshSelectedStudylistSnapshots(
       this.settings.newWordDefaultStudylists,
       cache
     );
     this.settings = Object.assign({}, this.settings, { studylistCache: cache, newWordDefaultStudylists });
-    await this.saveData(this.settings);
+    await this.enqueueSettingsSave(this.settings);
   }
   async ensureCurrentNoteOutputFormatVersion() {
     if (this.settings.noteOutputFormatVersion >= NOTE_OUTPUT_FORMAT_VERSION) {
@@ -9592,7 +10138,7 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
     this.settings = Object.assign({}, this.settings, {
       noteOutputFormatVersion: NOTE_OUTPUT_FORMAT_VERSION
     });
-    await this.saveData(this.settings);
+    await this.enqueueSettingsSave(this.settings);
     this.startupNotices.push(
       `${PLUGIN_NAME}: final note output format upgraded to v${NOTE_OUTPUT_FORMAT_VERSION}. Marked ${markedCount} word(s) dirty.`
     );
@@ -9601,14 +10147,15 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
     this.wordSyncSignatures.clear();
     this.wordCleanSyncSignatures.clear();
     for (const file of this.managedFiles.getWordFiles()) {
-      const markdown = await this.app.vault.cachedRead(file);
-      const signature = getWordSyncSignature(markdown);
       const normalizedPath = (0, import_obsidian17.normalizePath)(file.path);
+      const markdown = this.startupWordMarkdown.get(normalizedPath) ?? await this.app.vault.cachedRead(file);
+      const signature = getWordSyncSignature(markdown);
       this.wordSyncSignatures.set(normalizedPath, signature);
       if (this.syncService.getWordContext(file)?.bodyStatus === "synced") {
         this.wordCleanSyncSignatures.set(normalizedPath, signature);
       }
     }
+    this.startupWordMarkdown.clear();
   }
   async captureWordCleanSignatureIfSynced(file) {
     if (!this.pathScope.isWordPath(file.path)) {
@@ -9744,12 +10291,13 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
       return;
     }
     if (this.pathScope.isWordPath(file.path)) {
+      this.syncService.invalidateWordRenderCache(file.path);
       const markdown = await this.app.vault.cachedRead(file);
       const normalizedPath = (0, import_obsidian17.normalizePath)(file.path);
       const isOpenWord = this.isMarkdownFileOpen(file);
       const nextWordSyncSignature = getWordSyncSignature(markdown);
       await this.studylistService.handleWordModify(file, markdown);
-      const result = await this.referenceIndex.updateWord(file, markdown);
+      const result = await this.managedIndexCoordinator.updateWord(file, markdown);
       this.scheduleReferenceUsageRefresh(result.affectedReferencePaths);
       if (result.disabled) {
         this.clearPendingOpenWordStatusWrite(file.path);
@@ -9775,11 +10323,12 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
       return;
     }
     if (this.pathScope.isReferencePath(file.path)) {
+      await this.managedIndexCoordinator.ensureReady();
       const isOpenReference = this.isMarkdownFileOpen(file);
       if (!isOpenReference) {
         await this.ensureReferenceManagedFrontmatter(file);
       }
-      const lookup = await this.referenceIndex.findWordsReferencingWithFallback(file.path, { forceScan: true });
+      const lookup = await this.referenceIndex.findWordsReferencingWithFallback(file.path);
       await this.markWordsDirtyByPaths(lookup.wordPaths);
       this.invalidateSemanticReferenceCaches(lookup.affectedReferencePaths);
       this.refreshUi();
@@ -9830,14 +10379,15 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
       return;
     }
     if (this.pathScope.isWordPath(file.path)) {
+      this.syncService.invalidateWordRenderCache(file.path);
       const ensured = await this.ensureManagedWordProperties(file, { trigger: "create" });
       if (ensured.skipped) {
-        const affectedReferencePaths = this.referenceIndex.removeWord(file.path);
+        const affectedReferencePaths = await this.managedIndexCoordinator.removeWord(file.path);
         this.scheduleReferenceUsageRefresh(affectedReferencePaths);
         this.refreshUi();
         return;
       }
-      const result = await this.referenceIndex.updateWord(file, ensured.markdown);
+      const result = await this.managedIndexCoordinator.updateWord(file, ensured.markdown);
       await this.studylistService.handleWordModify(file, ensured.markdown);
       this.scheduleReferenceUsageRefresh(result.affectedReferencePaths);
       await this.syncService.markWordDirty(file);
@@ -9847,8 +10397,9 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
       return;
     }
     if (this.pathScope.isReferencePath(file.path)) {
+      await this.managedIndexCoordinator.ensureReady();
       await this.ensureReferenceManagedFrontmatter(file);
-      const lookup = await this.referenceIndex.findWordsReferencingWithFallback(file.path, { forceScan: true });
+      const lookup = await this.referenceIndex.findWordsReferencingWithFallback(file.path);
       await this.markWordsDirtyByPaths(lookup.wordPaths);
       this.invalidateSemanticReferenceCaches(lookup.affectedReferencePaths);
       this.refreshUi();
@@ -9876,7 +10427,8 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
       return;
     }
     if (this.pathScope.isWordPath(normalizedPath)) {
-      const affectedReferencePaths = this.referenceIndex.removeWord(normalizedPath);
+      this.syncService.invalidateWordRenderCache(normalizedPath);
+      const affectedReferencePaths = await this.managedIndexCoordinator.removeWord(normalizedPath);
       await this.refreshReferenceUsage(affectedReferencePaths);
       this.clearWordStatusOverride(normalizedPath);
       if (this.lastActiveWordPath === normalizedPath) {
@@ -9898,6 +10450,7 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
     const affectedReferencePaths = /* @__PURE__ */ new Set();
     let shouldRepairAffectedReferenceMetadata = false;
     if (this.pathScope.isReferencePath(normalizedOldPath)) {
+      await this.managedIndexCoordinator.ensureReady();
       const lookup = await this.referenceIndex.findWordsReferencingWithFallback(normalizedOldPath);
       for (const wordPath of lookup.wordPaths) {
         impactedWordPaths.add(wordPath);
@@ -9907,7 +10460,8 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
       }
     }
     if (this.pathScope.isWordPath(normalizedOldPath)) {
-      for (const referencePath of this.referenceIndex.removeWord(normalizedOldPath)) {
+      this.syncService.invalidateWordRenderCache(normalizedOldPath);
+      for (const referencePath of await this.managedIndexCoordinator.removeWord(normalizedOldPath)) {
         affectedReferencePaths.add(referencePath);
       }
       shouldRepairAffectedReferenceMetadata = true;
@@ -9919,9 +10473,10 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
     this.wordCleanSyncSignatures.delete(normalizedOldPath);
     this.clearPendingOpenWordStatusWrite(normalizedOldPath);
     if (isMarkdownFile3(file) && this.pathScope.isWordPath(normalizedNewPath)) {
+      this.syncService.invalidateWordRenderCache(normalizedNewPath);
       const openView = this.getOpenMarkdownViewForFile(file);
       const markdown = openView?.editor.getValue() ?? await this.app.vault.cachedRead(file);
-      const result = await this.referenceIndex.updateWord(file, markdown);
+      const result = await this.managedIndexCoordinator.updateWord(file, markdown);
       if (!result.disabled) {
         for (const referencePath of result.affectedReferencePaths) {
           affectedReferencePaths.add(referencePath);
@@ -9929,7 +10484,7 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
         shouldRepairAffectedReferenceMetadata = true;
         this.wordSyncSignatures.set((0, import_obsidian17.normalizePath)(file.path), getWordSyncSignature(markdown));
       } else {
-        for (const referencePath of this.referenceIndex.removeWord(normalizedNewPath)) {
+        for (const referencePath of await this.managedIndexCoordinator.removeWord(normalizedNewPath)) {
           affectedReferencePaths.add(referencePath);
         }
         shouldRepairAffectedReferenceMetadata = true;
@@ -9939,8 +10494,9 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
       this.lastActiveWordPath = isMarkdownFile3(file) && this.pathScope.isWordPath(normalizedNewPath) ? normalizedNewPath : null;
     }
     if (this.pathScope.isReferencePath(normalizedNewPath)) {
+      await this.managedIndexCoordinator.ensureReady();
       await this.ensureReferenceManagedFrontmatter(file);
-      const lookup = await this.referenceIndex.findWordsReferencingWithFallback(normalizedNewPath, { forceScan: true });
+      const lookup = await this.referenceIndex.findWordsReferencingWithFallback(normalizedNewPath);
       for (const wordPath of lookup.wordPaths) {
         impactedWordPaths.add(wordPath);
       }
@@ -9967,6 +10523,7 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
     }
   }
   async markAllSyncWordsDirty() {
+    await this.managedIndexCoordinator.ensureReady();
     let markedCount = 0;
     for (const file of this.managedFiles.getWordFiles()) {
       await this.ensureWordManagedFrontmatterForSync(file);
@@ -10441,14 +10998,14 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
       const execution = await this.runWordSyncBatch(finalSelection.runnableFiles, "sync.currentReferenceWords");
       const batchResult = execution.batchResult;
       new import_obsidian17.Notice(
-        getReferenceSyncCompletionNotice({
+        `${getReferenceSyncCompletionNotice({
           checked: batchResult?.total ?? 0,
           uploaded: batchResult?.uploaded ?? 0,
           unchanged: batchResult?.skipped ?? 0,
           failed: batchResult?.failed ?? 0,
           unavailable: finalSelection.unavailable,
           alreadySyncing: finalSelection.alreadySyncing + execution.alreadySyncing
-        }),
+        })}${batchResult?.canceled ? ` Canceled before start: ${batchResult.canceled}.` : ""}`,
         8e3
       );
     } catch (error) {
@@ -10471,8 +11028,27 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
       return { batchResult: null, alreadySyncing };
     }
     this.refreshUi();
+    const abortController = new AbortController();
+    this.activeBatchAbortController = abortController;
+    const progressFragment = document.createDocumentFragment();
+    const progressText = document.createElement("span");
+    progressText.textContent = `${PLUGIN_NAME}: preparing ${batchFiles.length} word(s)\u2026 `;
+    const cancelButton = document.createElement("button");
+    cancelButton.textContent = "Cancel remaining";
+    cancelButton.addEventListener("click", () => {
+      abortController.abort();
+      cancelButton.disabled = true;
+      progressText.textContent = `${PLUGIN_NAME}: stopping after the current item\u2026 `;
+    });
+    progressFragment.append(progressText, cancelButton);
+    const progressNotice = new import_obsidian17.Notice(progressFragment, 0);
     try {
-      const batchResult = await this.perf.measure(performanceLabel, () => this.syncService.syncWords(batchFiles));
+      const batchResult = await this.perf.measure(performanceLabel, () => this.syncService.syncWords(batchFiles, {
+        signal: abortController.signal,
+        onProgress: (completed, total) => {
+          progressText.textContent = `${PLUGIN_NAME}: synced ${completed}/${total} word(s)\u2026 `;
+        }
+      }));
       for (const result of batchResult.results) {
         if (result.error) {
           this.setWordBodyDirtyOverride(result.file, result.error);
@@ -10483,6 +11059,10 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
       }
       return { batchResult, alreadySyncing };
     } finally {
+      progressNotice.hide();
+      if (this.activeBatchAbortController === abortController) {
+        this.activeBatchAbortController = null;
+      }
       for (const file of batchFiles) {
         this.syncOrchestrator.endSync(file);
       }
@@ -10508,7 +11088,8 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
       return;
     }
     const aliasSummary = batchResult.aliasUploaded > 0 ? ` aliases updated ${batchResult.aliasUploaded}.` : " aliases unchanged.";
-    const summary = `${PLUGIN_NAME}: processed ${batchResult.total} dirty word(s), uploaded ${batchResult.uploaded}, unchanged ${batchResult.skipped}, failed ${batchResult.failed}.${aliasSummary}`;
+    const canceledSummary = batchResult.canceled ? ` canceled before start ${batchResult.canceled}.` : "";
+    const summary = `${PLUGIN_NAME}: processed ${batchResult.total} dirty word(s), uploaded ${batchResult.uploaded}, unchanged ${batchResult.skipped}, failed ${batchResult.failed}.${aliasSummary}${canceledSummary}`;
     new import_obsidian17.Notice(summary, 8e3);
   }
   async createReferenceFromSelection() {
@@ -10891,7 +11472,7 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
     this.flushingOpenWordStatusWritePaths.add(normalizedPath);
     try {
       const markdown = await this.app.vault.cachedRead(file);
-      const result = await this.referenceIndex.updateWord(file, markdown);
+      const result = await this.managedIndexCoordinator.updateWord(file, markdown);
       this.scheduleReferenceUsageRefresh(result.affectedReferencePaths);
       if (result.disabled) {
         this.clearPendingOpenWordStatusWrite(normalizedPath);
@@ -10970,7 +11551,7 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
         this.refreshUi();
         return;
       }
-      const result = await this.referenceIndex.updateWord(file, markdown);
+      const result = await this.managedIndexCoordinator.updateWord(file, markdown);
       await this.refreshReferenceUsage(result.affectedReferencePaths);
       await this.syncService.markWordDirty(file);
       this.setWordBodyDirtyOverride(file, null);
@@ -11023,7 +11604,7 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
     await this.referenceIndex.refreshReferenceUsage(paths);
   }
   enqueueWordLifecycle(file, task) {
-    return this.wordLifecycleQueue.enqueue(file, task);
+    return this.wordLifecycleQueue.enqueue((0, import_obsidian17.normalizePath)(file.path), task);
   }
   isStaleMissingWordFileError(file, error) {
     return this.app.vault.getAbstractFileByPath(file.path) !== file && /(?:ENOENT|no such file|not found)/i.test(toErrorMessage7(error));
@@ -11157,6 +11738,7 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
       trigger: options.trigger,
       defaultStudylists: this.settings.newWordDefaultStudylists,
       studylistCatalog: this.settings.studylistCache.categories,
+      markdown: options.markdown,
       writeFrontmatter: async (targetFile, mutate) => {
         await this.writeFrontmatter(targetFile, mutate);
       }
@@ -11182,12 +11764,28 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
     }
   }
   async ensureAllWordManagedFrontmatter() {
+    await this.managedIndexCoordinator.ensureReady();
     const openPaths = this.getOpenMarkdownFilePaths();
-    for (const file of this.managedFiles.getWordFiles()) {
-      if (openPaths.has((0, import_obsidian17.normalizePath)(file.path))) {
-        continue;
+    const failures = [];
+    await forEachIsolated(this.managedFiles.getWordFiles(), async (file) => {
+      if (!openPaths.has((0, import_obsidian17.normalizePath)(file.path))) {
+        const normalizedPath = (0, import_obsidian17.normalizePath)(file.path);
+        const reconciled = await this.ensureManagedWordProperties(file, {
+          ensureEudicUri: false,
+          trigger: "startup",
+          markdown: this.startupWordMarkdown.get(normalizedPath)
+        });
+        this.startupWordMarkdown.set(normalizedPath, reconciled.markdown);
       }
-      await this.ensureManagedWordProperties(file, { ensureEudicUri: false, trigger: "startup" });
+    }, (file) => {
+      failures.push(file.path);
+      console.warn(`${PLUGIN_NAME}: skipped startup Word reconciliation for ${file.path}.`);
+    }, () => this.isUnloaded);
+    if (failures.length > 0 && !this.isUnloaded) {
+      new import_obsidian17.Notice(
+        `${PLUGIN_NAME}: skipped ${failures.length} Word note(s) with unreadable or malformed properties during startup. First: ${failures[0]}`,
+        8e3
+      );
     }
   }
   async ensureWordManagedFrontmatter(file, options = {}) {
@@ -11223,12 +11821,22 @@ var EudicSyncPlugin = class extends import_obsidian17.Plugin {
     return nextLinkId;
   }
   async ensureAllReferenceManagedFrontmatter() {
+    await this.managedIndexCoordinator.ensureReady();
     const openPaths = this.getOpenMarkdownFilePaths();
-    for (const file of this.managedFiles.getReferenceFiles()) {
-      if (openPaths.has((0, import_obsidian17.normalizePath)(file.path))) {
-        continue;
+    const failures = [];
+    await forEachIsolated(this.managedFiles.getReferenceFiles(), async (file) => {
+      if (!openPaths.has((0, import_obsidian17.normalizePath)(file.path))) {
+        await this.ensureReferenceManagedFrontmatter(file);
       }
-      await this.ensureReferenceManagedFrontmatter(file);
+    }, (file) => {
+      failures.push(file.path);
+      console.warn(`${PLUGIN_NAME}: skipped startup Reference reconciliation for ${file.path}.`);
+    }, () => this.isUnloaded);
+    if (failures.length > 0 && !this.isUnloaded) {
+      new import_obsidian17.Notice(
+        `${PLUGIN_NAME}: skipped ${failures.length} Reference note(s) with unreadable or malformed properties during startup. First: ${failures[0]}`,
+        8e3
+      );
     }
   }
   async getManagedUrlForFile(file) {

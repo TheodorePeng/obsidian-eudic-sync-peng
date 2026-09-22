@@ -22,6 +22,7 @@ interface ReferenceIndexServiceOptions {
   managedFiles: ManagedFileRegistry;
   writeFrontmatter: (file: TFile, mutate: FrontmatterMutator) => Promise<void>;
   getReferenceMetadataWriteMode?: () => ReferenceMetadataWriteMode;
+  onWordRead?: (file: TFile, markdown: string) => void;
 }
 
 function normalizeGraphPath(path: string): string {
@@ -66,6 +67,16 @@ export interface ReferenceScanResult {
   wordPaths: string[];
   affectedReferencePaths: string[];
   scannedWordCount: number;
+}
+
+export interface ReferenceGraphDiagnostics {
+  ready: boolean;
+  wordNodeCount: number;
+  referenceNodeCount: number;
+  fullRebuildCount: number;
+  lastFullRebuildWordReads: number;
+  targetedFullScanCount: number;
+  lastTargetedScanWordReads: number;
 }
 
 export function formatUsageUpdatedAt(date = new Date()): string {
@@ -172,29 +183,83 @@ function readReferencedByWordPaths(frontmatter: Record<string, unknown>): string
   return readStringArray(frontmatter[FRONTMATTER_KEYS.referencedBy]);
 }
 
-function isMarkdownFilePath(path: string): boolean {
-  return path.toLocaleLowerCase().endsWith(".md");
-}
-
 export class ReferenceGraphService {
-  private readonly wordToReferences = new Map<string, Set<string>>();
-  private readonly referenceToWords = new Map<string, Set<string>>();
-  private readonly scannedReferencePaths = new Set<string>();
+  private wordToReferences = new Map<string, Set<string>>();
+  private referenceToWords = new Map<string, Set<string>>();
+  private scannedReferencePaths = new Set<string>();
   private isIndexBuilt = false;
+  private fullRebuildCount = 0;
+  private lastFullRebuildWordReads = 0;
+  private targetedFullScanCount = 0;
+  private lastTargetedScanWordReads = 0;
 
   constructor(private readonly options: ReferenceIndexServiceOptions) {}
 
-  async rebuildAll(): Promise<void> {
-    this.isIndexBuilt = false;
-    this.wordToReferences.clear();
-    this.referenceToWords.clear();
-    this.scannedReferencePaths.clear();
+  async rebuildAll(shouldCommit: () => boolean = () => true): Promise<boolean> {
+    const nextWordToReferences = new Map<string, Set<string>>();
+    const nextReferenceToWords = new Map<string, Set<string>>();
+    const files = await this.getManagedWordFilesForScan();
+    let readCount = 0;
+    let sliceStartedAt = globalThis.performance?.now?.() ?? Date.now();
+    for (let index = 0; index < files.length; index += 1) {
+      const now = globalThis.performance?.now?.() ?? Date.now();
+      if (index > 0 && (index % 50 === 0 || now - sliceStartedAt >= 8)) {
+        await new Promise<void>((resolve) => globalThis.setTimeout(resolve, 0));
+        sliceStartedAt = globalThis.performance?.now?.() ?? Date.now();
+      }
+      const file = files[index];
+      const markdown = await this.options.app.vault.cachedRead(file);
+      readCount += 1;
+      this.options.onWordRead?.(file, markdown);
+      if (!shouldCommit()) {
+        return false;
+      }
+      if (isWordSyncDisabledForIndex(this.options.app, file, markdown)) {
+        continue;
+      }
 
-    for (const file of await this.getManagedWordFilesForScan()) {
-      await this.updateWord(file);
+      const wordPath = normalizeGraphPath(file.path);
+      const referencePaths = new Set(
+        resolveManagedReferencePaths(this.options.app, this.options.pathScope, file, markdown),
+      );
+      if (referencePaths.size === 0) {
+        continue;
+      }
+
+      nextWordToReferences.set(wordPath, referencePaths);
+      for (const referencePath of referencePaths) {
+        let wordPaths = nextReferenceToWords.get(referencePath);
+        if (!wordPaths) {
+          wordPaths = new Set<string>();
+          nextReferenceToWords.set(referencePath, wordPaths);
+        }
+        wordPaths.add(wordPath);
+      }
+
     }
 
+    if (!shouldCommit()) {
+      return false;
+    }
+    this.wordToReferences = nextWordToReferences;
+    this.referenceToWords = nextReferenceToWords;
+    this.scannedReferencePaths = new Set<string>();
     this.isIndexBuilt = true;
+    this.fullRebuildCount += 1;
+    this.lastFullRebuildWordReads = readCount;
+    return true;
+  }
+
+  getDiagnostics(): ReferenceGraphDiagnostics {
+    return {
+      ready: this.isIndexBuilt,
+      wordNodeCount: this.wordToReferences.size,
+      referenceNodeCount: this.referenceToWords.size,
+      fullRebuildCount: this.fullRebuildCount,
+      lastFullRebuildWordReads: this.lastFullRebuildWordReads,
+      targetedFullScanCount: this.targetedFullScanCount,
+      lastTargetedScanWordReads: this.lastTargetedScanWordReads,
+    };
   }
 
   async updateWord(file: TFile, markdown?: string): Promise<ReferenceGraphUpdate> {
@@ -300,6 +365,8 @@ export class ReferenceGraphService {
     }
     this.scannedReferencePaths.add(normalizedReferencePath);
     this.isIndexBuilt = true;
+    this.targetedFullScanCount += 1;
+    this.lastTargetedScanWordReads = scannedWordCount;
 
     return {
       referencePath: normalizedReferencePath,
@@ -316,7 +383,7 @@ export class ReferenceGraphService {
 
     return this.repairReferenceMetadata(referencePaths, {
       write: this.getReferenceMetadataWriteMode() === "auto",
-      forceFreshScan: true,
+      forceFreshScan: false,
     });
   }
 
@@ -357,15 +424,19 @@ export class ReferenceGraphService {
       targetReferencePaths = sortedStrings(referencePaths).filter((referencePath) =>
         this.options.pathScope.isReferencePath(referencePath),
       );
+      if (forceFreshScan) {
+        await this.rebuildAll();
+        scannedWordCount = (await this.getManagedWordFilesForScan()).length;
+      }
       for (const referencePath of targetReferencePaths) {
         const existingReferencedBy = this.readReferencePropertyWordPaths(referencePath);
         for (const wordPath of existingReferencedBy) {
           affectedWordPaths.add(wordPath);
         }
-        const lookup = forceFreshScan
-          ? await this.scanWordsReferencingReference(referencePath)
-          : await this.findWordsReferencingWithFallback(referencePath, { forceScan: true });
-        scannedWordCount += lookup.scannedWordCount;
+        const lookup = await this.findWordsReferencingWithFallback(referencePath);
+        if (!forceFreshScan) {
+          scannedWordCount += lookup.scannedWordCount;
+        }
         for (const wordPath of lookup.wordPaths) {
           repairedWordPaths.add(wordPath);
           affectedWordPaths.add(wordPath);
@@ -627,89 +698,18 @@ export class ReferenceGraphService {
   }
 
   private async getManagedFilesForScan(kind: "word" | "reference"): Promise<TFile[]> {
-    const filesByPath = new Map<string, TFile>();
-    const addFile = (file: TFile | null | undefined) => {
-      if (!file || file.extension !== "md") {
-        return;
-      }
-      const normalizedPath = normalizeGraphPath(file.path);
-      const matchesScope = kind === "word"
-        ? this.options.pathScope.isWordPath(normalizedPath)
-        : this.options.pathScope.isReferencePath(normalizedPath);
-      if (matchesScope) {
-        filesByPath.set(normalizedPath, file);
-      }
-    };
-
     const registryFiles = kind === "word"
       ? this.options.managedFiles.getWordFiles()
       : this.options.managedFiles.getReferenceFiles();
-    for (const file of registryFiles) {
-      addFile(file);
+    if (registryFiles.length > 0) {
+      return registryFiles;
     }
 
-    for (const file of this.options.app.vault.getMarkdownFiles()) {
-      addFile(file);
-    }
-
-    const folderPath = kind === "word" ? this.getWordFolderPath() : this.getReferenceFolderPath();
-    if (folderPath) {
-      for (const file of await this.listMarkdownFilesFromFolder(folderPath)) {
-        addFile(file);
-      }
-    }
-
-    return Array.from(filesByPath.values()).sort((left, right) => left.path.localeCompare(right.path));
-  }
-
-  private getWordFolderPath(): string {
-    return (this.options.pathScope as { getWordFolderPath?: () => string }).getWordFolderPath?.() ?? "";
-  }
-
-  private getReferenceFolderPath(): string {
-    return (this.options.pathScope as { getReferenceFolderPath?: () => string }).getReferenceFolderPath?.() ?? "";
-  }
-
-  private async listMarkdownFilesFromFolder(folderPath: string): Promise<TFile[]> {
-    const adapter = this.options.app.vault.adapter;
-    if (!adapter?.list) {
-      return [];
-    }
-
-    const files: TFile[] = [];
-    const seenFolders = new Set<string>();
-    const visit = async (folder: string): Promise<void> => {
-      const normalizedFolder = normalizeGraphPath(folder).replace(/^\/+|\/+$/g, "");
-      if (!normalizedFolder || seenFolders.has(normalizedFolder)) {
-        return;
-      }
-      seenFolders.add(normalizedFolder);
-
-      let listed;
-      try {
-        listed = await adapter.list(normalizedFolder);
-      } catch {
-        return;
-      }
-
-      for (const path of listed.files) {
-        const normalizedPath = normalizeGraphPath(path);
-        if (!isMarkdownFilePath(normalizedPath)) {
-          continue;
-        }
-        const file = this.getMarkdownFileByPath(normalizedPath);
-        if (file) {
-          files.push(file);
-        }
-      }
-
-      for (const childFolder of listed.folders) {
-        await visit(childFolder);
-      }
-    };
-
-    await visit(folderPath);
-    return files;
+    return this.options.app.vault.getMarkdownFiles()
+      .filter((file) => kind === "word"
+        ? this.options.pathScope.isWordPath(file.path)
+        : this.options.pathScope.isReferencePath(file.path))
+      .sort((left, right) => left.path.localeCompare(right.path));
   }
 }
 
